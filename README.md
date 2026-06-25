@@ -2,7 +2,10 @@
 
 
 ##colony_state.py
+
+
 ###AgentNode (Dataclass)
+
 The blueprint for an individual agent's state. It tracks localized data and tree pointers:
 agent_id: Unique identifier for the agent.
 role: The agent's specialized function (e.g., commander, miner, scout).
@@ -13,6 +16,7 @@ task: The current specific objective the agent is executing.
 energy_spent: Accumulated energy consumed by this specific node.
 
 ###ColonyState (Coordinator)
+
 The global state manager that handles the registry database and global metrics:
 Tracks total remaining initial_budget.
 Holds the goal_embedding vector for agent alignment.
