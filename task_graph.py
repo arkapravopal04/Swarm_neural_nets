@@ -30,7 +30,7 @@ from dataclasses import dataclass , field
 class TaskNode:
     task_id: str
     description : str
-    agent_id : str #only when the task has one incoming or outgoing or both...is an agent assigned
+    agent_id : str | None = None #only when the task has one incoming or outgoing or both...is an agent assigned
     # if the task needs to be split up, we dont assign an agent to it, also agent is assigned only after sort
     status : int = 0 # 0 for pending , 1 for running , 2 for completed , 3 for failed
     dependencies : list = field(default_factory = list)
@@ -64,15 +64,16 @@ class TaskGraph:
 
         task.status = 2
         newly_unblocked = []
-        for dependent_id in task.dependencies:
+        for dependent_id in task.dependents:
             dep_task = self.tasks.get(dependent_id)
             if dep_task:
                 dep_task.in_degree -= 1  
-            
                 if dep_task.in_degree == 0:
                     newly_unblocked.append(dependent_id)
+                    
         return newly_unblocked
     
+
 # if a task was worked on and failed it needs to be broken down into more atomic tasks, will be done by some other function...this 
 # one needs to somehow handle the consequences of faliure 
     def fail_task(self , task_id : str):
@@ -88,6 +89,7 @@ class TaskGraph:
             current_id = queue.pop(0)
             current_task = self.tasks.get(current_id)
             if current_task and current_task.status != 3:
+                current_task.status = 3
                 doomed_tasks.append(current_id)
                 queue.extend(current_task.dependents)
         return doomed_tasks
@@ -95,8 +97,26 @@ class TaskGraph:
 
 # return all tasks with in_degree 0 and status 0
     def get_ready_tasks(self):
+        ready_tasks = []
         for task_id in self.tasks:
             task = self.tasks[task_id]
             if task.in_degree == 0 and task.status == 0:
-                # have to return something...onto dinner
-                pass
+                ready_tasks.append(task)
+        return ready_tasks
+    
+# needs to assign agent to the task , add change the status and link the agent to the task
+    def assign_agent(self, task_id : str , agent_id : str = None):
+        task = self.tasks[task_id]
+        if task:
+            task.status = 1
+            task.agent_id = agent_id
+        else:
+            print(f"Warning: {task_id} not found for assignment.")
+
+    def get_snapshot(self):
+        task_status = {
+            "tasks" : self.tasks
+# any other shape requirements
+        }
+        return task_status
+    
