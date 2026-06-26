@@ -61,6 +61,7 @@ class TaskGraph:
         task = self.tasks[task_id]
         if not task:
             print(f"{task_id} invalid")
+            return []
 
         task.status = 2
         newly_unblocked = []
@@ -80,6 +81,7 @@ class TaskGraph:
         task = self.tasks[task_id]
         if not task:
             print(f"{task_id} invalid")
+            return []
         
         task.status = 3
         doomed_tasks = []
