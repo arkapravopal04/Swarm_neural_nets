@@ -15,11 +15,19 @@ import time
 
 @dataclass
 class Event:
-    type : str
-    from_agent : str # this is like the agent id
-    timestamp : float = field(default_factory=time.time)
-    payload : dict = field(default_factory = dict)
-
+    type: str
+    from_agent: str
+    timestamp: float = field(default_factory=time.time)
+    payload: dict = field(default_factory=lambda: {
+        "agent_id": None,
+        "parent_id": None,
+        "task_id": None,
+        "role": None,
+        "result": None,
+        "tool_name": None,
+        "args": None,
+        "subtasks": None
+    })
 
 # this is going to be like the messenger between agents, agents can drop in thier messag in mailbox and out it goes ig
 class Messenger:
