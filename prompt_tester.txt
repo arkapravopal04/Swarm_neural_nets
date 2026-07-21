@@ -1,0 +1,70 @@
+This is just the set of prompts on which the system is being tested on 
+
+These prompts are made difficult on purpose to check if the system can handle complex and challenging senarios
+They dont have actual answers for these reasons and span several fields
+
+
+
+PROMPT 1:
+Design a turbine blade for a jet engine operating at sustained gas-path temperatures above 1400°C,
+withstanding centrifugal and thermal stress at operating RPM. Specify and justify a material class 
+(nickel superalloy vs. ceramic matrix composite) against the thermal load. Design an internal cooling 
+scheme (film or convective) since the base alloy cannot survive 1400°C alone. Specify a thermal barrier
+coating strategy. Estimate fatigue life under cyclic takeoff-cruise-landing thermal loading. Blade
+must fit standard axial-flow turbine geometry, minimize weight without compromising fatigue life, 
+and remain manufacturable via investment casting or additive manufacturing. Show reasoning and 
+calculations, not just a final answer.
+
+
+
+PROMPT 2:
+Design a low-power analog front-end for a wearable single-lead ECG monitor targeting a 6-month battery
+life on a 100mAh cell. Specify ADC resolution and sampling rate sufficient to resolve QRS complexes
+without aliasing. Design an input-referred noise budget below 5µVrms including instrumentation
+amplifier and filter stage choices. Specify a bandpass filter strategy that rejects baseline wander
+and 50/60Hz mains interference without distorting the QRS waveform. Justify a power budget breakdown 
+across analog and digital blocks against the battery life target. Address motion artifact tolerance 
+for a chest-strap form factor. Recommend a process node and package suitable for a coin-cell-class 
+wearable. Show reasoning and calculations, not just a final part selection.
+
+
+PROMPT 3:
+Design a distributed rate limiter for a multi-region API gateway handling 500K requests/sec with
+per-tenant quotas. Choose and justify a consistency model (strict vs. eventual) for shared quota
+state across regions, given cross-region latency of 50-150ms. Specify a sharding/partitioning strategy
+for quota counters that avoids hot-key contention. Design a failure-handling strategy for a region 
+losing connectivity to the quota store, including fallback behavior and reconciliation on recovery.
+Bound the worst-case over-admission a tenant could achieve during a network partition. Specify a
+data structure and eviction strategy for the counters that fits a sub-millisecond per-request 
+latency budget. Show reasoning and complexity/latency estimates, not just a final architecture name.
+
+
+PROMPT 4:
+Analyze the convergence behavior of a stochastic gradient method with adaptive per-coordinate step 
+sizes on a non-convex, L-smooth objective with bounded gradient variance. Derive a bound on expected 
+gradient norm after T iterations in terms of learning rate schedule, smoothness constant, and variance. 
+Identify conditions on the step-size decay under which the bound guarantees convergence to a stationary 
+point. Compare the resulting rate against vanilla SGD and explain where the adaptive step size helps or 
+hurts asymptotically. Discuss what changes under a non-i.i.d. (e.g. mini-batch correlated) sampling 
+assumption. Show full derivations, not just stated results.
+
+
+PROMPT 5:
+Design an attitude determination and control system (ADCS) for a 3U CubeSat in a 500km sun-synchronous 
+LEO orbit, required to point a payload camera to within 0.5° pointing accuracy. Specify sensor suite 
+(sun sensors, magnetometer, star tracker, gyros) and justify against the accuracy requirement and a 
+2W power budget. Size reaction wheels against the spacecraft's moment of inertia and worst-case 
+disturbance torques (gravity gradient, aerodynamic drag, solar pressure) at this altitude. Specify a 
+desaturation strategy (magnetorquers) given the wheel sizing. Estimate settling time for a 90° slew 
+maneuver. Address single-point-of-failure risk in the sensor suite. Show reasoning and calculations, not 
+just a component list.
+
+
+PROMPT 6:
+Design the wing structure for a tailless supersonic UAV cruising at Mach 1.8, 15,000m altitude. Select 
+and justify a wing planform (delta vs. swept) against supersonic wave drag and low-speed handling during 
+launch/recovery. Specify a structural layout (spar/rib arrangement, skin material) that survives peak 
+aerodynamic loading at max-Q while minimizing weight. Analyze aeroelastic flutter margin at the design 
+speed and identify the governing stiffness constraint. Specify a thermal protection approach for 
+aerodynamic heating at sustained supersonic cruise. Address manufacturability via composite layup vs. 
+machined aluminum. Show reasoning and calculations, not just a final wing geometry.
