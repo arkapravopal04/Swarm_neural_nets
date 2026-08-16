@@ -108,7 +108,7 @@ text level.
 - **Sandboxed tool use** (`tools.py`) — agents can execute Python, verify
   math symbolically, read/write files, and query tabular data, all through
   a registry with argument validation and timeout/concurrency limits.
-- **QLoRA fine-tuning pipeline** (`train_lora.py`) — trains Qwen3-4B on
+- **QLoRA fine-tuning pipeline** (`fine_tuning.py`) — trains Qwen3-4B on
   ~800 validated examples of the colony's own decision format, on a single
   T4, producing a small (~50MB) adapter rather than a duplicated model.
 
@@ -145,12 +145,13 @@ propagation engine don't get the same budget — and shouldn't.
 
 ## Status
 
-This is Phase 1 of a longer-term plan 
 Phase 1 — text-based agents with real
 orchestration, verification, and a fine-tuned decision model — is
-functional end to end. Later phases (outlined in the original design doc)
-move toward full latent inter-agent communication via KV-cache sharing
-rather than text, closer to true [LatentMAS](https://arxiv.org/abs/2511.20639).
+functional end to end: the colony decomposes, delegates, verifies, learns
+from failure, and answers as one voice. Later phases (outlined in the
+original design doc) move toward full latent inter-agent communication
+via KV-cache sharing rather than text, closer to true
+[LatentMAS](https://arxiv.org/abs/2511.20639).
 
 **Known limitations, stated plainly:** interdependent subtasks (task A
 depends on both B and C) aren't fully wired up yet — the task graph
