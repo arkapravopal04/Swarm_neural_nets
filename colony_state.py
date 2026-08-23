@@ -2,31 +2,8 @@
 general tree with hashing ids
 '''
 
-import torch 
-import torch.nn as nn
-import numpy as np
-# torch and numpy needed when goal_embedding is a real tensor
 from dataclasses import dataclass, field 
-import time  # Changed from 'from time import time' to avoid AttributeError in default_factory
-
-'''
-agent - node data class, used to store and generate the things from like an agent which ever is called
-this should store
-    {agent id
-    role
-    status
-    parent_id: points up
-    children: list, points down, grows dynamically
-    task: what is this agent working on
-    energy_spent:  how much has this agent consumed}
-
-ColonyState : registry, energy budget, and goal embedding
-register_agent()
-update_status()
-debit_energy()
-get_snapshot()
-
-'''
+import time
 
 @dataclass
 class AgentNode:
@@ -37,18 +14,25 @@ class AgentNode:
     task: str
     children: list = field(default_factory=list)
     energy_spent: int = 0
-    ghost_context: dict = None # Added for smarter respawns
+    ghost_context: dict = None
     last_active: float = field(default_factory=time.time)
+    fail_reason: str = None
+    think_cycle: int = 0
+    warning_count: int = 0
+    task_id: str = ""
+    requirements: list = field(default_factory=list)
+    awaiting: str | None = None
+    tool_call_count: int = 0
+    generation: int = 0
 
 
 class ColonyState:
     def __init__(self, initial_budget: int, goal_embedding):
-        self.agents = {} #empty dict for all the agents that need to be here
+        self.agents = {}
         self.budget_remaining = initial_budget
         self.goal_embedding = goal_embedding
-        self.results = {} # Added separated result storage
+        self.results = {}
 
-# needs to add in a new agent, and to append itself in the children of the parent...we have to make sure that the parent is registered first
     def register_agent(self, agent: AgentNode):
         self.agents[agent.agent_id] = agent
         parent = agent.parent_id
@@ -57,8 +41,7 @@ class ColonyState:
                 self.agents[parent].children.append(agent.agent_id)
             else:
                 print(f"Warning: Parent agent {parent} not registered yet.")
-        
-# just updates the status and task if assigned
+
     def update_status(self, agent_id: str, new_status: str, new_task: str = None):
         agent = self.agents.get(agent_id)
         if agent:
@@ -68,7 +51,6 @@ class ColonyState:
         else:
             print(f"Warning: {agent_id} invalid for status update.")
 
-# tracks the energy of the whole system
     def debit_energy(self, agent_id: str, amount: int):
         agent = self.agents.get(agent_id)
         if agent:
@@ -77,48 +59,103 @@ class ColonyState:
         else:
             print(f"Warning: {agent_id} invalid for energy debit.")
 
-# the orchestrator calls this one
     def can_spawn(self, cost: int) -> bool:
         return self.budget_remaining >= cost
 
     def get_snapshot(self):
-        system_status = {
+        return {
             "budget": self.budget_remaining,
             "goal": self.goal_embedding,
             "goal_shape": self.goal_embedding.shape if self.goal_embedding is not None else None,
             "agents": self.agents,
         }
-        return system_status
     
     def get_agent(self, agent_id: str) -> AgentNode:
         return self.agents.get(agent_id)
 
     def store_result(self, task_id: str, result: any):
-        """Stores a task result decoupled from the graph."""
         self.results[task_id] = result
 
     def extract_agent_ghost(self, agent_id: str) -> dict:
-        """Extracts context, memory, and failure reason before agent death."""
+        """Extracts context, memory, and failure reason before agent death.
+
+        NOTE (flagged, not patched): this captures last_task, energy_spent,
+        role, and fail_reason -- but not the agent's own ghost_context. If
+        an agent that already had a ghost context (e.g. a second-generation
+        respawn) dies again, that earlier context is dropped rather than
+        carried forward or merged with the new fail_reason -- each death
+        only ever hands the next respawn ITS OWN immediate failure reason,
+        never the accumulated history across multiple respawns of the same
+        task. Left as-is for now (matches the "Phase 1 honesty" scoping
+        used elsewhere), but worth revisiting if repeated respawns on a
+        stubborn task look like each one has amnesia about the ones before
+        it. A fix would look like:
+            "ghost_context": agent.ghost_context,
+        added to the returned dict, with the caller (orchestrator._kill_and_respawn)
+        deciding how to merge it with the new fail_reason rather than overwrite.
+        """
         agent = self.agents.get(agent_id)
         if not agent:
             return {}
-        # Returns relevant state info needed to inform the respawn
-        return {"last_task": agent.task, "energy_spent": agent.energy_spent, "role": agent.role}
+        return {
+            "last_task": agent.task,
+            "energy_spent": agent.energy_spent,
+            "role": agent.role,
+            "fail_reason": agent.fail_reason,
+        }
 
     def unregister_agent(self, agent_id: str):
-        """Deletes an agent permanently and cleans up parent children registries."""
+        """Deletes an agent permanently and cleans up parent/children registries.
+
+        FIX: previously any live children of the unregistered agent were left
+        pointing at a parent_id key that no longer exists in self.agents --
+        orphaned from tree traversal. They are now reparented one level up.
+        """
         if agent_id in self.agents:
             agent = self.agents[agent_id]
             parent_id = agent.parent_id
+
+            for child_id in list(agent.children):
+                child = self.agents.get(child_id)
+                if child:
+                    child.parent_id = parent_id
+                    if parent_id and parent_id in self.agents:
+                        self.agents[parent_id].children.append(child_id)
+
             if parent_id and parent_id in self.agents:
                 if agent_id in self.agents[parent_id].children:
                     self.agents[parent_id].children.remove(agent_id)
             del self.agents[agent_id]
 
-    def consolidate_idle_agents(self) -> int:
-        """Finds idle agents, unregisters them, and returns some energy to the budget."""
+    def consolidate_idle_agents(self) -> list:
+        """Finds idle agents, unregisters them, and returns some energy to the budget.
+
+        FIX NEEDED (flagged, NOT patched -- needs a design decision before
+        touching): confirmed this is now a permanent no-op. Nothing in the
+        system ever sets agent.status = "idle" anymore -- orchestrator.
+        spawn_agent() sets "running" unconditionally at creation (the
+        deliberate fix for the earlier "everything looks idle" bug), and
+        update_status() is only ever called with "completed". So
+        idle_agents below is always [], and merge_agents() -- the whole
+        MERGE mechanism for surviving energy stress -- silently does
+        nothing except print "Consolidated 0 idle agents" every time the
+        colony hits the stressed threshold. That's a second energy-budget
+        relief mechanism (alongside the fan-out cap and per-role costs)
+        that is quietly disabled.
+
+        The real invariant this should be checking is closer to "genuinely
+        not doing anything" -- e.g. agent.awaiting is not None for longer
+        than some threshold, or a task sitting at status==1 whose
+        last_active is stale beyond a threshold that ISN'T already covered
+        by handle_deadlock's own scaled-timeout logic. Deliberately left
+        unpatched here rather than guessed at, since a wrong guess risks
+        this mechanism fighting handle_deadlock's watchdog over the same
+        agent (one flagging "stuck, respawn" while this flags "idle,
+        cull") -- needs to be designed together with that logic, not
+        patched in isolation.
+        """
         idle_agents = [aid for aid, a in self.agents.items() if a.status == "idle"]
         for aid in idle_agents:
-            self.budget_remaining += 2  # Reclaim some energy
+            self.budget_remaining += 2
             self.unregister_agent(aid)
-        return len(idle_agents)
+        return idle_agents
