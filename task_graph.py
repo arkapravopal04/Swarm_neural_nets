@@ -24,6 +24,7 @@ get_snapshot(): full graph state for the orchestrator
 '''
 
 from dataclasses import dataclass , field
+from typing import Any
 
 
 @dataclass
@@ -36,7 +37,17 @@ class TaskNode:
     dependencies : list = field(default_factory = list)
     dependents : list = field(default_factory=list)
     in_degree : int = 0
-    result : bool = False
+    result : Any = None  # NOTE: was annotated `bool` but actually holds arbitrary
+                          # str/dict results (synthesizer.py reads it as text) --
+                          # `Any` reflects real usage. Must keep a type annotation or
+                          # this silently stops being a dataclass field at all.
+    required_role : str = "worker"  # orchestrator.py constructs TaskNode(required_role=...)
+                                     # in several places; this field was previously missing
+                                     # entirely, which would raise a TypeError at runtime.
+    requirements : list = field(default_factory=list)  # constraint strings threaded down
+                                                         # from Problem_Phaser's spec so a
+                                                         # subtask can carry its relevant
+                                                         # slice of the parent's constraints
 
 
 class TaskGraph:
@@ -52,13 +63,43 @@ class TaskGraph:
             parent_task = self.tasks.get(parent_id)
             if parent_task:
                 parent_task.dependents.append(task.task_id)
+            else:
+                print(
+                    f"WARNING: Task '{task.task_id}' depends on unknown "
+                    f"task_id '{parent_id}' -- this dependency will never "
+                    f"resolve and '{task.task_id}' may never become ready."
+                )
 
-        pass
+        # Lightweight cycle check: walk dependents from this task and see if we
+        # ever loop back to task.task_id. A cyclic graph means in_degree can
+        # never reach 0 for something in the cycle, which would hang the colony
+        # forever with no diagnostic -- surface it immediately instead.
+        if self._creates_cycle(task.task_id):
+            print(
+                f"WARNING: Task '{task.task_id}' introduces a dependency cycle. "
+                f"This task graph may never fully resolve."
+            )
+
+    def _creates_cycle(self, start_id: str) -> bool:
+        """BFS over dependents from start_id; True if we loop back to start_id."""
+        visited = set()
+        queue = list(self.tasks.get(start_id).dependents) if start_id in self.tasks else []
+        while queue:
+            current = queue.pop(0)
+            if current == start_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            current_task = self.tasks.get(current)
+            if current_task:
+                queue.extend(current_task.dependents)
+        return False
 
 # should return the list of tasks that we can begin now , should also be able to change the task status to 1 of the task we just completed
 # when we loop thru the unblocked we reduce their in dregree as one of them is done
     def complete_task(self, task_id : str):
-        task = self.tasks[task_id]
+        task = self.tasks.get(task_id)
         if not task:
             print(f"{task_id} invalid")
             return []
@@ -71,6 +112,23 @@ class TaskGraph:
                 dep_task.in_degree -= 1  
                 if dep_task.in_degree == 0:
                     newly_unblocked.append(dependent_id)
+                    # FIX (#5, dependency-gating bug): a dependent task that
+                    # already has an agent_id (assigned eagerly at spawn time
+                    # -- see assign_agent's fix below) needs its status
+                    # actually flipped to "running" the moment it becomes
+                    # unblocked, or its already-created live Agent will sit
+                    # forever un-ticked (orchestrator._run_live_agents only
+                    # ticks status==1 tasks). Previously assign_agent set
+                    # status=1 unconditionally at spawn time regardless of
+                    # in_degree, so this was never needed; now that
+                    # assign_agent withholds status=1 until in_degree==0,
+                    # this is the other half of that fix -- the transition
+                    # has to happen somewhere once the last dependency
+                    # actually completes, and this is the natural place
+                    # since it's already iterating dependents whose
+                    # in_degree just changed.
+                    if dep_task.agent_id is not None:
+                        dep_task.status = 1
                     
         return newly_unblocked
     
@@ -78,7 +136,7 @@ class TaskGraph:
 # if a task was worked on and failed it needs to be broken down into more atomic tasks, will be done by some other function...this 
 # one needs to somehow handle the consequences of faliure 
     def fail_task(self , task_id : str):
-        task = self.tasks[task_id]
+        task = self.tasks.get(task_id)
         if not task:
             print(f"{task_id} invalid")
             return []
@@ -108,10 +166,41 @@ class TaskGraph:
     
 # needs to assign agent to the task , add change the status and link the agent to the task
     def assign_agent(self, task_id : str , agent_id : str = None):
-        task = self.tasks[task_id]
+        """
+        FIX (#5, dependency-gating bug -- confirmed): this previously set
+        status=1 ("running") unconditionally the instant an agent was
+        assigned, with zero check on in_degree. Since orchestrator.
+        _spawn_child_task calls spawn_agent() -> assign_agent() immediately
+        after creating every child (dependencies or not), a child declared
+        to depend on a sibling from the same SPAWN batch started reasoning
+        the same tick it was created, regardless of whether that sibling
+        had finished -- meaning _build_dependency_context's "shared state"
+        block (built specifically for the TBC-Thickness -> Cooling-Layout
+        case) was normally still empty exactly when it was supposed to
+        matter, and _process_unblocked_tasks (whose whole job is dispatching
+        tasks once their dependencies clear) never got a chance to act on
+        any dependency-gated child at all.
+
+        Now: only flip status to "running" here if the task's dependencies
+        are already satisfied (in_degree == 0). A dependency-gated task
+        keeps its agent_id (so orchestrator._process_unblocked_tasks won't
+        try to double-spawn it) but stays at status=0 (pending) until
+        complete_task() flips it to running once its last dependency
+        finishes -- see the matching fix there.
+
+        NOTE: orchestrator.spawn_agent() still eagerly creates a live Agent
+        object and debits its spawn energy cost regardless of this gate --
+        that live Agent simply sits un-ticked in orchestrator.live_agents
+        (guarded by _run_live_agents' existing `task_node.status != 1: continue`
+        check) until this task's status actually becomes 1. That's a
+        deliberate smaller-footprint choice rather than deferring agent
+        creation itself -- see orchestrator.py's spawn_agent docstring.
+        """
+        task = self.tasks.get(task_id)
         if task:
-            task.status = 1
             task.agent_id = agent_id
+            if task.in_degree == 0:
+                task.status = 1
         else:
             print(f"Warning: {task_id} not found for assignment.")
 
@@ -121,4 +210,3 @@ class TaskGraph:
 # any other shape requirements
         }
         return task_status
-    

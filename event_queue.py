@@ -26,7 +26,13 @@ class Event:
         "result": None,
         "tool_name": None,
         "args": None,
-        "subtasks": None
+        "subtasks": None,
+        "requirements": None,  # constraint strings threaded down from the spec
+        "judge_verdict": None,  # judge.decide() result dict, when a failure_request
+                                 # originates from a judge "execute" verdict rather
+                                 # than a self-reported DIE -- lets ghost_extractor
+                                 # distinguish TIER_1_CRASH/SEMANTIC_DRIFT from
+                                 # SELF_REPORTED correctly.
     })
 
 # this is going to be like the messenger between agents, agents can drop in thier messag in mailbox and out it goes ig
