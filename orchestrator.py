@@ -20,7 +20,7 @@ from typing import Optional, Dict, Any, List
 from colony_state import ColonyState, AgentNode
 from task_graph import TaskGraph, TaskNode
 from event_queue import Messenger, Event
-from agent_node import Agent
+from agent_node import Agent, _dedupe_repeated_sentences
 from tools import ToolRegistry
 import ghost_extractor
 
