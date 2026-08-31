@@ -27,7 +27,7 @@ SUCCESS_CACHE_THRESHOLD = 0.45
 
 class MemoryStore:
     def __init__(self, ghost_persist_path=None, embedding_dim=EMBEDDING_DIM, embed_model=None):
-        self.embedding_dim = embedding_dima
+        self.embedding_dim = embedding_dim
         self._lock = threading.Lock()
         self._embedder = embed_model or SentenceTransformer(EMBEDDING_MODEL_NAME)
 
