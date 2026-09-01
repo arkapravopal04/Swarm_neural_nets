@@ -13,6 +13,7 @@ RUN & TERMINATE: manages system lifespan, captures run traces, and retrieves exe
 import uuid
 import time
 import re
+import traceback
 from typing import Optional, Dict, Any, List
 
 
@@ -648,9 +649,10 @@ class Orchestrator:
                 goal_text = self.spec.get("goal", "") if self.spec else ""
                 try:
                     final_answer = self.synthesizer.run(self.colony, self.task_graph, goal_text)
-                except Exception as e:
-                    print(f"Warning: Synthesizer failed on root completion ({e}) -- "
-                          f"falling back to the raw agent result instead of crashing.")
+                except Exception:
+                    print(f"Warning: Synthesizer failed on root completion -- "
+                          f"falling back to the raw agent result instead of crashing.\n"
+                          f"{traceback.format_exc()}")
                     final_answer = result
             else:
                 final_answer = result
@@ -680,8 +682,9 @@ class Orchestrator:
                 self.memory_store.write(
                     "success", task_node.description, {"result": result, "task_id": task_id}
                 )
-            except Exception as e:
-                print(f"Warning: failed writing success cache for {task_id}: {e}")
+            except Exception:
+                print(f"Warning: failed writing success cache for {task_id}:\n"
+                      f"{traceback.format_exc()}")
 
     def handle_failure(self, event: Event):
         """EXECUTE: Harvest context, kill agent, and respawn a smarter version."""
@@ -712,10 +715,11 @@ class Orchestrator:
             try:
                 ghost_source = live_agent if live_agent is not None else self.colony.get_agent(agent_id)
                 if ghost_source is not None:
-                    record = extract(ghost_source, verdict)
+                    record = ghost_extractor.extract(ghost_source, verdict)
                     self.memory_store.write("ghost", record.get("task", task_id or ""), record)
-            except Exception as e:
-                print(f"Warning: failed writing ghost record for {agent_id}: {e}")
+            except Exception:
+                print(f"Warning: failed writing ghost record for {agent_id}:\n"
+                      f"{traceback.format_exc()}")
 
         if live_agent is not None:
             live_agent.KV_Cache = None
@@ -962,8 +966,9 @@ class Orchestrator:
         if not best_result and not is_successful and self.synthesizer is not None:
             try:
                 partial_results = self.synthesizer.collect_results(self.colony, self.task_graph)
-            except Exception as e:
-                print(f"Warning: failed collecting partial results for synthesis: {e}")
+            except Exception:
+                print(f"Warning: failed collecting partial results for synthesis:\n"
+                      f"{traceback.format_exc()}")
                 partial_results = []
 
             if partial_results:
