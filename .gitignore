@@ -1,3 +1,19 @@
+# Model outputs / artifacts
 fine_tune/
 fine_tuned_params_v1/
 fine_tuning.py
+
+# Research-only folders
+outreach/
+paper/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
