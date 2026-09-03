@@ -15,7 +15,9 @@ import traceback
 import tempfile
 import threading
 import time
+import difflib
 from typing import Dict, Any, Union, Tuple
+from text_utils import normalize_identifier
 
 # Optional heavy domain imports - handled gracefully if missing or during environment boot
 try:
@@ -719,6 +721,16 @@ class ToolRegistry:
 
     @staticmethod
     def execute(tool_name: str, args: Dict[str, Any], domain: str = "General Discourse", agent_id: str = None) -> Dict[str, Any]:
+        # FIX: an agent occasionally wraps/mangles a tool name (e.g.
+        # "__run_code__") rather than emitting it bare. Resolve against the
+        # allowlist BEFORE the blocked-domain and allowlist checks below, so
+        # both gates -- and the handler dispatch further down -- see the
+        # real tool the agent meant, instead of bouncing a call that would
+        # have reached the sandbox under its canonical name.
+        normalized_tool_name = normalize_identifier(tool_name, TOOL_ALLOWLIST, cutoff=0.75)
+        if normalized_tool_name:
+            tool_name = normalized_tool_name
+
         blocked = BLOCKED_TOOLS_BY_DOMAIN.get(domain, set())
         if tool_name in blocked:
             return {
@@ -742,11 +754,22 @@ class ToolRegistry:
         logger.info(f"Concurrently executing tool '{tool_name}' for domain '{domain}'.")
         try:
             if tool_name not in TOOL_ALLOWLIST:
+                # normalize_identifier above already tried (and failed) to
+                # resolve this confidently at cutoff=0.75. Still surface the
+                # closest allowlist entry here, uncapped, purely as a "did
+                # you mean" hint -- so the agent has something concrete to
+                # self-correct toward on its next attempt, instead of only
+                # a flat list of every valid tool name.
+                folded_allowlist = {t.casefold(): t for t in TOOL_ALLOWLIST}
+                nearest = difflib.get_close_matches(
+                    str(tool_name).casefold(), list(folded_allowlist.keys()), n=1, cutoff=0.0
+                )
+                hint = f" Did you mean '{folded_allowlist[nearest[0]]}'?" if nearest else ""
                 return {
                     "status": "error",
                     "message": (
                         f"Tool '{tool_name}' not found. Available tools: "
-                        f"{', '.join(TOOL_ALLOWLIST)}."
+                        f"{', '.join(TOOL_ALLOWLIST)}.{hint}"
                     ),
                 }
 
