@@ -23,6 +23,7 @@ from task_graph import TaskGraph, TaskNode
 from event_queue import Messenger, Event
 from agent_node import Agent, _dedupe_repeated_sentences
 from tools import ToolRegistry
+from text_utils import normalize_identifier
 import ghost_extractor
 
 class Orchestrator:
@@ -334,13 +335,22 @@ class Orchestrator:
 
     @classmethod
     def _normalize_subtask_keys(cls, sub: dict) -> dict:
-        """Returns a copy of sub with keys cleaned up: whitespace stripped
-        and known synonyms mapped to their canonical name."""
+        """Returns a copy of sub with keys cleaned up: whitespace stripped,
+        known synonyms mapped to their canonical name, and anything left
+        over (a typo like "rolle"/"taask") fuzzy-matched against the valid
+        key set."""
         normalized = {}
         for key, value in sub.items():
             clean_key = key.strip() if isinstance(key, str) else key
             if clean_key in cls._SUBTASK_KEY_SYNONYMS:
+                # Exact synonyms are checked first and win outright -- a
+                # known synonym like "depends_on" must never fall through
+                # to the fuzzy pass below and risk resolving to some other
+                # valid key instead of its intended canonical name.
                 normalized[cls._SUBTASK_KEY_SYNONYMS[clean_key]] = value
+            elif isinstance(clean_key, str) and clean_key not in cls._SUBTASK_VALID_KEYS:
+                fuzzy_key = normalize_identifier(clean_key, cls._SUBTASK_VALID_KEYS, cutoff=0.75)
+                normalized[fuzzy_key or clean_key] = value
             else:
                 normalized[clean_key] = value
         return normalized
@@ -367,7 +377,13 @@ class Orchestrator:
         kept = [r for r in requirements if task_words & self._significant_words(r)]
         return kept if kept else list(requirements)
 
+    _VALID_ROLES = ("decomposer", "executor", "verifier")
+
     def _enforce_child_role(self, requested_role: str, parent_id: Optional[str]) -> str:
+        normalized_role = normalize_identifier(requested_role, self._VALID_ROLES, cutoff=0.75)
+        if normalized_role:
+            requested_role = normalized_role
+
         parent_node = self.colony.get_agent(parent_id) if parent_id else None
         if parent_node is None or parent_node.role != "decomposer":
             return requested_role
@@ -542,6 +558,20 @@ class Orchestrator:
                 resolved_deps = []
                 for dep in deps_raw:
                     dep_id = label_to_id.get(str(dep))
+                    if dep_id is None:
+                        # FIX: a dependency label can arrive slightly mangled
+                        # relative to how it was declared (e.g.
+                        # "__coating_thicknes__" vs "__coating_thickness__").
+                        # strip_chars="" here deliberately -- unlike an
+                        # action/role/tool name, underscores in a label are
+                        # part of its identity, not LLM decoration, so both
+                        # sides are normalized (whitespace + casefold only)
+                        # and compared as-is rather than trimmed.
+                        normalized_dep = normalize_identifier(
+                            str(dep), list(label_to_id.keys()), cutoff=0.75, strip_chars=""
+                        )
+                        if normalized_dep:
+                            dep_id = label_to_id.get(normalized_dep)
                     if dep_id:
                         resolved_deps.append(dep_id)
                     else:

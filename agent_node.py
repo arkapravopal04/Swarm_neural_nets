@@ -17,7 +17,7 @@ role_caps = {
 from event_queue import Event, Messenger
 from colony_state import AgentNode
 from tools import ToolRegistry
-from text_utils import dedupe_and_cap as _dedupe_repeated_sentences
+from text_utils import dedupe_and_cap as _dedupe_repeated_sentences, normalize_identifier
 import torch
 import ast
 import re
@@ -626,6 +626,16 @@ Your next action:"""
             parsed_action = action_match.group(1).strip().upper()
             if parsed_action in self.action_tokens:
                 action = parsed_action
+            else:
+                normalized_action = normalize_identifier(parsed_action, self.action_tokens, cutoff=0.75)
+                if normalized_action:
+                    action = normalized_action
+                else:
+                    print(
+                        f"  [decide() action-match] unrecognized action "
+                        f"'{parsed_action}' -- no exact or fuzzy match against "
+                        f"{self.action_tokens}; defaulting to REPORT."
+                    )
 
         payload = ""
         payload_match = re.search(r"PAYLOAD:\s*(.*)", generated_text, re.DOTALL | re.IGNORECASE)

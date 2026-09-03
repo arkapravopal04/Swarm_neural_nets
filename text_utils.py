@@ -21,6 +21,68 @@ transitive dependencies just to clean a string) can import it too.
 """
 
 import re
+import difflib
+
+
+def normalize_identifier(raw, candidates, cutoff: float = 0.75, strip_chars: str = "_*-/."):
+    """
+    Best-effort match of a possibly mistyped/mis-formatted LLM-generated
+    identifier (an action token, tool name, role, dict key, dependency
+    label, ...) against a known set of valid ones.
+
+    Pipeline, applied identically to `raw` AND to every candidate (so
+    "normalize both sides" holds even when a candidate itself came from
+    another noisy LLM payload rather than a hardcoded constant):
+        1. strip ALL whitespace, not just leading/trailing -- catches a
+           decode artifact like "rol e" -> "role".
+        2. strip leading/trailing characters in `strip_chars` -- the
+           dashes/asterisks/bullets/underscores a model tends to wrap an
+           identifier in (e.g. "__run_code__" -> "run_code"). Pass
+           strip_chars="" for identifiers where such characters are
+           semantically part of the value rather than decoration -- a
+           dependency label like "__coating_thickness__" would collapse
+           into a different, wrong label if its underscores were
+           stripped instead of compared as-is.
+        3. casefold.
+        4. exact match against the cleaned candidates.
+        5. else difflib.get_close_matches (n=1) as a fuzzy fallback.
+
+    Returns None on no match (including empty/non-string raw, or an
+    empty candidates collection) so the caller keeps its own fallback --
+    this never silently guesses past the cutoff. Logs whenever step 5 is
+    what actually produced the match (an exact hit after cleanup doesn't
+    log -- that's normal formatting noise, not a typo worth tracking),
+    so the fuzzy-match rate is visible in the log.
+    """
+    if not raw or not isinstance(raw, str) or not candidates:
+        return None
+
+    def _clean(s):
+        s = re.sub(r"\s+", "", s)
+        if strip_chars:
+            s = s.strip(strip_chars)
+        return s.casefold()
+
+    cleaned_raw = _clean(raw)
+    if not cleaned_raw:
+        return None
+
+    folded_map = {}
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        folded_map[_clean(candidate)] = candidate
+
+    if cleaned_raw in folded_map:
+        return folded_map[cleaned_raw]
+
+    close = difflib.get_close_matches(cleaned_raw, list(folded_map.keys()), n=1, cutoff=cutoff)
+    if close:
+        matched = folded_map[close[0]]
+        print(f"[normalize_identifier] fuzzy match: {raw!r} -> {matched!r} (cutoff={cutoff})")
+        return matched
+
+    return None
 
 
 def dedupe_and_cap(text, max_chars: int = 500):
