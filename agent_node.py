@@ -17,39 +17,11 @@ role_caps = {
 from event_queue import Event, Messenger
 from colony_state import AgentNode
 from tools import ToolRegistry
+from text_utils import dedupe_and_cap as _dedupe_repeated_sentences
 import torch
 import ast
 import re
 import json
-
-
-def _dedupe_repeated_sentences(text: str, max_chars: int = 300) -> str:
-    """
-    Collapses consecutive repeated sentences and caps overall length.
-
-    FIX: confirmed via testing -- a DIE reason that degenerates into the
-    same sentence repeated many times (e.g. "The task is impossible."
-    x5, a known failure mode of greedy decoding once a model locks onto a
-    conclusion) was being stored verbatim into fail_reason. That text then
-    became the NEXT respawn's ghost context -- and being maximally
-    repetitive and definitive, it primed that respawn's greedy decode to
-    just echo the same conclusion back rather than attempt something
-    different. Ghost context is meant to INFORM a respawn, not hand it an
-    echo chamber. This collapses immediate sentence-level repetition down
-    to one occurrence and caps total length, so a degenerate response
-    still conveys its point without amplifying itself forward indefinitely.
-    """
-    if not text:
-        return text
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    deduped = []
-    for s in sentences:
-        if not deduped or s.strip() != deduped[-1].strip():
-            deduped.append(s)
-    result = " ".join(deduped)
-    if len(result) > max_chars:
-        result = result[:max_chars].rsplit(" ", 1)[0] + "..."
-    return result
 
 
 class Agent:
@@ -900,7 +872,7 @@ Your next action:"""
         self.KV_Cache = None
         self.last_hidden_state = None
 
-        self.fail_reason = f"Previous attempt DIED with reason: {_dedupe_repeated_sentences(str(payload))}"
+        self.fail_reason = f"Previous attempt DIED with reason: {_dedupe_repeated_sentences(str(payload), max_chars=300)}"
 
         event = Event(type="failure_request", from_agent=self.agent_id)
         event.payload.update({

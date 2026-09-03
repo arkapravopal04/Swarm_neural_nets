@@ -1,8 +1,11 @@
 """
 ghost_extractor.py
 
-Autopsies a dead agent into a ghost record. Pure function, zero dependencies --
-takes an agent, returns a dict. Does NOT write to memory_store itself (see
+Autopsies a dead agent into a ghost record. Pure function -- takes an
+agent, returns a dict; its only import is text_utils, which is itself
+dependency-free (see that module's docstring for why the dedupe/cap
+logic now lives there instead of as a local copy). Does NOT write to
+memory_store itself (see
 project discussion): the orchestrator is the only thing that decides when a
 ghost gets committed, so it can reconcile judge/agent disagreement or inspect
 the record before writing. Same boundary discipline as judge.py not owning an
@@ -18,60 +21,14 @@ Two ghost mechanisms exist in the system and this is the second one:
        before a new agent on a similar task even starts thinking.
 """
 
-import re
 import time
+
+from text_utils import dedupe_and_cap as _dedupe_and_cap
 
 
 TIER_1_CRASH = "TIER_1_CRASH"
 SEMANTIC_DRIFT = "SEMANTIC_DRIFT"
 SELF_REPORTED = "SELF_REPORTED"
-
-
-def _dedupe_and_cap(text, max_chars: int = 500):
-    """
-    FIX (confirmed via a real run): verdict["reason"] -- Judge's
-    deep_critique output -- was being written into the persistent ghost
-    record completely raw. Confirmed via two separate deep_critique calls
-    in one run: both degenerated into runaway repetition after their real
-    critique content ("The response is entirely fabricated. The
-    simulation claim is entirely absent..." repeated 6x verbatim; a chain
-    of ~25 unrelated "The X must be Y." bureaucratic filler sentences with
-    no connection to the actual critique). agent_node.py's
-    _dedupe_repeated_sentences already exists for exactly this failure
-    shape and orchestrator.py already applies it before this same
-    verdict["reason"] value becomes the NEXT respawn's fail_reason -- but
-    ghost_extractor.extract() had no equivalent protection before writing
-    it into memory_store's PERSISTENT, cross-session ghost index (see this
-    module's own docstring: the whole point of a ghost record is to
-    survive across sessions and get surfaced to a FUTURE agent via
-    query_ghosts() before it even starts thinking). A degenerate,
-    repetition-amplified critique baked permanently into that index is a
-    worse, longer-lived version of the exact problem
-    _dedupe_repeated_sentences was built to prevent for the in-session
-    case.
-
-    This module's docstring states "Pure function, zero dependencies" --
-    reusing agent_node.py's helper across files (even via the shared
-    notebook-namespace convention other files in this project rely on)
-    would quietly violate that stated contract, so this is a small,
-    self-contained local equivalent rather than a cross-file reach.
-    max_chars defaults higher (500 vs agent_node's 300) since a ghost
-    record is meant to be a richer, more informative artifact for a
-    FUTURE session (per this module's own docstring) than an immediate
-    in-run fail_reason snippet -- it should hold more real signal before
-    the cap kicks in.
-    """
-    if not text:
-        return text
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    deduped = []
-    for s in sentences:
-        if not deduped or s.strip() != deduped[-1].strip():
-            deduped.append(s)
-    result = " ".join(deduped)
-    if len(result) > max_chars:
-        result = result[:max_chars].rsplit(" ", 1)[0] + "..."
-    return result
 
 
 def _derive_failure_type(dead_agent, verdict: dict = None) -> str:
