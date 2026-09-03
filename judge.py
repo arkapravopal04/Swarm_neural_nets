@@ -8,8 +8,10 @@ Three tiers, run in escalating order, each gated behind the previous passing:
     Tier 1 -- fast_check     : sub-10ms syntax/execution check, runs on every output
     Tier 2 -- semantic_check : cosine similarity vs the colony's master target
                                embedding, runs only if tier 1 passed
-    Tier 3 -- deep_critique  : full LLM call, runs only when an agent is
-                               attempting to promote its result to its parent
+    Tier 3 -- deep_critique  : full LLM call, runs only when the caller flags
+                               the output as needing a deep check (a child
+                               promoting a result to its parent, or the root
+                               task's final answer)
 
 Energy-conservation principle: a tier 1 failure short-circuits immediately --
 tiers 2 and 3 never run on broken output. Running an expensive check to
@@ -272,7 +274,7 @@ class Judge:
         output_type: str,
         output_embedding=None,
         target_embedding=None,
-        is_promotion_attempt: bool = False,
+        needs_deep_check: bool = False,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
@@ -355,13 +357,13 @@ class Judge:
                 return {"verdict": "warn", "reason": correction, "tier": 2}
 
         # tier 2 passed cleanly (or was skipped) -> agent continues normally
-        # unless this call is a promotion attempt
+        # unless this call needs the deep tier-3 critique
 
         # ---------------- Tier 3 ----------------
-        if not is_promotion_attempt:
+        if not needs_deep_check:
             return {
                 "verdict": "pass",
-                "reason": "tier 1/2 clear, not a promotion attempt",
+                "reason": "tier 1/2 clear, deep check not required",
                 "tier": 2,
             }
 

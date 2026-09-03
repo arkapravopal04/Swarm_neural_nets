@@ -36,7 +36,7 @@ class Synthesizer:
     # Collection
     # ------------------------------------------------------------------
 
-    def collect_results(self, colony_state, task_graph) -> list:
+    def collect_results(self, colony_state, task_graph, root_task_id=None) -> list:
         """
         Gather results from all completed task nodes, in dependency order.
 
@@ -51,6 +51,12 @@ class Synthesizer:
         there's no partial result to synthesize from a task that never
         finished.
 
+        root_task_id, if given, is excluded from the results: it's the final
+        answer being assembled, not a subtask contributing to it. Without
+        this exclusion, a root task with zero real subtask results still
+        shows up as one "result" (its own REPORT), making an empty
+        decomposition indistinguishable from a real one.
+
         Returns a list of {"task_id": str, "description": str, "result": str}
         dicts, ordered so that a task never appears before any task it
         depends on.
@@ -59,7 +65,8 @@ class Synthesizer:
 
         completed = {
             tid: t for tid, t in tasks.items()
-            if getattr(t, "status", None) == 2 and getattr(t, "result", None) is not None
+            if tid != root_task_id
+            and getattr(t, "status", None) == 2 and getattr(t, "result", None) is not None
         }
 
         ordered_ids = []
@@ -148,9 +155,17 @@ class Synthesizer:
     # Entry point
     # ------------------------------------------------------------------
 
-    def run(self, colony_state, task_graph, problem_spec: str) -> str:
+    def run(self, colony_state, task_graph, problem_spec: str, root_task_id=None) -> str:
         """
         The orchestrator's one call site: gather everything, decode once.
+
+        FIX (root-acceptance bug): if no non-root subtask produced a result,
+        there is nothing to synthesize -- calling the LLM anyway on an empty
+        results_block let it fabricate a plausible-looking answer from the
+        problem_spec alone, indistinguishable from a real synthesis. Return
+        an explicit failure string instead of ever making that call.
         """
-        results = self.collect_results(colony_state, task_graph)
+        results = self.collect_results(colony_state, task_graph, root_task_id=root_task_id)
+        if not results:
+            return "No subtask results were produced -- there is nothing to synthesize."
         return self.format_output(results, problem_spec)
