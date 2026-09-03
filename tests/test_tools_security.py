@@ -363,16 +363,10 @@ def test_write_file_size_cap(isolated_roots, monkeypatch):
 # ── write_file: agent_id sanitization ─────────────────────────────────────
 
 def test_write_file_rejects_traversal_agent_id(isolated_roots):
-    """agent_id "../../../etc" must raise (surfaces as a tool error via execute)."""
-    with pytest.raises(ValueError):
-        ToolRegistry.write_file("out.txt", "payload", agent_id="../../../etc")
-
-
-def test_write_file_traversal_agent_id_surfaces_as_tool_error(isolated_roots):
-    result = ToolRegistry.execute(
-        "write_file",
-        {"filepath": "out.txt", "content": "payload", "agent_id": "../../../etc"},
-    )
+    """agent_id "../../../etc" must be rejected as an error dict, like every
+    other failure in write_file -- direct calls (bypassing execute()) no
+    longer raise."""
+    result = ToolRegistry.write_file("out.txt", "payload", agent_id="../../../etc")
     assert result["status"] == "error"
     assert "agent_id" in result["message"]
 
@@ -380,15 +374,17 @@ def test_write_file_traversal_agent_id_surfaces_as_tool_error(isolated_roots):
 def test_write_file_rejects_separator_agent_id(isolated_roots):
     """os.sep / os.altsep variants -- covers POSIX "/" and Windows "\" and "/"."""
     for bad in ("a/b", "a\\b", "..\\..\\etc"):
-        with pytest.raises(ValueError):
-            ToolRegistry.write_file("out.txt", "payload", agent_id=bad)
+        result = ToolRegistry.write_file("out.txt", "payload", agent_id=bad)
+        assert result["status"] == "error"
+        assert "agent_id" in result["message"]
 
 
 def test_write_file_rejects_invalid_chars_agent_id(isolated_roots):
     """Anything outside [A-Za-z0-9_-] is rejected (spaces, dots, unicode, ...)."""
     for bad in ("agent id", "agent.id", "agent:1", "агент", "agent\u0000"):
-        with pytest.raises(ValueError):
-            ToolRegistry.write_file("out.txt", "payload", agent_id=bad)
+        result = ToolRegistry.write_file("out.txt", "payload", agent_id=bad)
+        assert result["status"] == "error"
+        assert "agent_id" in result["message"]
 
 
 def test_write_file_prefixes_valid_agent_id(isolated_roots):
@@ -407,6 +403,150 @@ def test_write_file_agent_id_fallback_to_anon(isolated_roots):
         assert result["status"] == "success"
         assert result["path"] == os.path.join(str(write_root), "anon_output.txt")
         assert not (write_root / "output.txt").exists()
+
+
+# ── execute(): dispatch allowlist + argument validation ────────────────────
+
+def test_list_tools_matches_allowlist():
+    """list_tools() is the explicit allowlist, not dir()-based introspection:
+    a new public helper on ToolRegistry must NOT become agent-callable."""
+    assert ToolRegistry.list_tools() == list(tools.TOOL_ALLOWLIST)
+    assert set(ToolRegistry.list_tools()) == {
+        "run_code", "safe_read_file", "write_file", "verify_math", "query_dataframe",
+    }
+
+
+def test_list_tools_ignores_new_public_helper(monkeypatch):
+    """The regression the allowlist exists for: adding a public method to
+    ToolRegistry must not expose it to agents, via list_tools or execute."""
+    monkeypatch.setattr(
+        ToolRegistry, "future_helper", staticmethod(lambda: {"status": "success"}), raising=False
+    )
+    assert "future_helper" not in ToolRegistry.list_tools()
+    result = ToolRegistry.execute("future_helper", {})
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+
+
+def test_execute_blocks_private_and_dunder_names():
+    """Neither internal helpers nor object dunders are dispatchable."""
+    for name in ("_extract_rng_seed", "__init__", "execute", "list_tools"):
+        result = ToolRegistry.execute(name, {})
+        assert result["status"] == "error"
+        assert "not found" in result["message"]
+
+
+def test_execute_rejects_non_dict_args():
+    for bad in ("filepath=out.txt", ["out.txt"], None, 42):
+        result = ToolRegistry.execute("write_file", bad)
+        assert result["status"] == "error"
+        assert "dict" in result["message"]
+
+
+def test_execute_rejects_unknown_argument_with_actionable_message(isolated_roots):
+    """A misspelled key used to raise TypeError inside handler(**args) and be
+    swallowed as an opaque "Tool execution crashed"; it must now name the bad
+    key and list the valid ones."""
+    result = ToolRegistry.execute(
+        "write_file", {"filepath": "out.txt", "content": "x", "conttent": "x"}
+    )
+    assert result["status"] == "error"
+    assert "conttent" in result["message"]
+    assert "crashed" not in result["message"]
+    assert "filepath" in result["message"] and "content" in result["message"]
+
+
+def test_execute_valid_arguments_hint_hides_injected_params():
+    """The "valid arguments" hint must not advertise the orchestrator-injected
+    domain/agent_id -- listing them invites the model to pass values that are
+    discarded anyway."""
+    result = ToolRegistry.execute("run_code", {"bogus": 1})
+    assert result["status"] == "error"
+    assert "code_string" in result["message"]
+    assert "domain" not in result["message"]
+
+    result = ToolRegistry.execute("write_file", {"bogus": 1})
+    assert result["status"] == "error"
+    assert "agent_id" not in result["message"]
+
+
+def test_execute_missing_required_argument_still_reported():
+    """A missing (as opposed to unknown) required arg still surfaces as an
+    error rather than an exception escaping execute()."""
+    result = ToolRegistry.execute("write_file", {"content": "x"})
+    assert result["status"] == "error"
+
+
+def test_execute_forces_trusted_domain(monkeypatch):
+    """domain is injected from the caller, so an agent cannot smuggle in a
+    different one to change sandbox policy."""
+    seen = {}
+
+    def fake_run_code(code_string, domain="General Discourse", timeout=15):
+        seen["domain"] = domain
+        return {"status": "success"}
+
+    monkeypatch.setattr(ToolRegistry, "run_code", staticmethod(fake_run_code))
+    result = ToolRegistry.execute(
+        "run_code", {"code_string": "pass", "domain": "Data Engineering"},
+        domain="General Discourse",
+    )
+    assert result["status"] == "success"
+    assert seen["domain"] == "General Discourse"
+
+
+# ── execute(): agent_id is trusted, never taken from the tool call's own
+#    arguments (impersonation fix) ──────────────────────────────────────────
+
+def test_execute_ignores_agent_supplied_agent_id(isolated_roots, caplog):
+    """An agent stuffing "agent_id" into its own tool args must not be able
+    to claim another agent's identity for namespacing -- execute() force-
+    overwrites it with the trusted id derived from the requesting event's
+    sender, and logs the attempt."""
+    read_root, write_root = isolated_roots
+    with caplog.at_level("WARNING", logger="Hive.Tools"):
+        result = ToolRegistry.execute(
+            "write_file",
+            {"filepath": "output.txt", "content": "payload", "agent_id": "victim-agent"},
+            agent_id="real-agent",
+        )
+    assert result["status"] == "success"
+    assert result["path"] == os.path.join(str(write_root), "real-agent_output.txt")
+    assert not (write_root / "victim-agent_output.txt").exists()
+    assert any(
+        "real-agent" in rec.message and "victim-agent" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_execute_write_file_two_agents_distinct_files(isolated_roots):
+    """Two different agents writing the same generic filename must land in
+    distinct, per-agent-namespaced files rather than clobbering each other."""
+    read_root, write_root = isolated_roots
+    result_a = ToolRegistry.execute(
+        "write_file",
+        {"filepath": "output.txt", "content": "from agent A"},
+        agent_id="agent-a",
+    )
+    result_b = ToolRegistry.execute(
+        "write_file",
+        {"filepath": "output.txt", "content": "from agent B"},
+        agent_id="agent-b",
+    )
+    assert result_a["status"] == "success"
+    assert result_b["status"] == "success"
+    assert result_a["path"] != result_b["path"]
+    assert (write_root / "agent-a_output.txt").read_text() == "from agent A"
+    assert (write_root / "agent-b_output.txt").read_text() == "from agent B"
+
+
+def test_execute_does_not_mutate_caller_args_dict(isolated_roots):
+    """execute() must operate on a copy of args -- the caller's dict (e.g.
+    orchestrator's live event.payload["args"]) must not gain an injected
+    "agent_id"/"domain" key as a side effect of the call."""
+    original_args = {"filepath": "output.txt", "content": "payload"}
+    ToolRegistry.execute("write_file", original_args, agent_id="agent-x")
+    assert original_args == {"filepath": "output.txt", "content": "payload"}
 
 
 # ── verify_math ─────────────────────────────────────────────────────────────

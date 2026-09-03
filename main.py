@@ -27,14 +27,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 from peft import PeftModel
 
-# from colony_state import ColonyState
-# from task_graph import TaskGraph
-# from event_queue import Messenger
-# from problem_phaser import Problem_Phaser
-# from judge import Judge
-# from memory_state import MemoryStore
-# from synthesizer import Synthesizer
-# from orchestrator import Orchestrator
+from colony_state import ColonyState
+from task_graph import TaskGraph
+from event_queue import Messenger
+from problem_phaser import Problem_Phaser
+from judge import Judge
+from memory_state import MemoryStore
+from synthesizer import Synthesizer
+from orchestrator import Orchestrator
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HUGGINGFACE_HUB_DISABLE_UPDATE_CHECK", "1")
@@ -162,7 +162,11 @@ def build_orchestrator() -> Orchestrator:
     memory_store = MemoryStore(ghost_persist_path=GHOST_PERSIST_PATH, embed_model=shared_embedder)
     synthesizer = Synthesizer(llm_call_fn=llm_call_fn)
 
-    colony_state = ColonyState(initial_budget=0, goal_embedding=None)
+    # Real fallback, not 0 -- initialize_colony() overwrites this with the
+    # phaser's computed colony_budget, but if parse_problem/estimate_complexity
+    # ever fails to supply one, a 0-budget colony dies on tick 1 with no
+    # actionable error. 100 matches the phaser's own minimum (tier S) budget.
+    colony_state = ColonyState(initial_budget=100, goal_embedding=None)
     task_graph = TaskGraph()
     messenger = Messenger()
 

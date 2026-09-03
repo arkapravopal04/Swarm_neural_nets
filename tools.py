@@ -10,6 +10,7 @@ import signal
 import subprocess
 import json
 import logging
+import inspect
 import traceback
 import tempfile
 import threading
@@ -694,6 +695,18 @@ except Exception:
         return "\n".join(assembled_parts)
 
 
+# Explicit allowlist of agent-callable tools. FIX: list_tools() used to
+# derive this via dir(cls) -- any future public staticmethod added to
+# ToolRegistry (a helper, a refactor artifact) would silently become
+# agent-callable with zero review. Both list_tools() and execute()'s
+# dispatch gate now read from this single source of truth instead.
+TOOL_ALLOWLIST = ("run_code", "safe_read_file", "write_file", "verify_math", "query_dataframe")
+
+# Handler parameters the orchestrator injects with trusted values and that an
+# agent may never set for itself. See ToolRegistry.execute().
+INJECTED_PARAMS = frozenset({"domain", "agent_id"})
+
+
 class ToolRegistry:
     """
     Highly secure, concurrency-limited Tool interface for Project Hive.
@@ -702,16 +715,10 @@ class ToolRegistry:
 
     @classmethod
     def list_tools(cls) -> list:
-        excluded = {"execute", "list_tools"}
-        return [
-            name for name in dir(cls)
-            if not name.startswith("_")
-            and name not in excluded
-            and callable(getattr(cls, name))
-        ]
+        return list(TOOL_ALLOWLIST)
 
     @staticmethod
-    def execute(tool_name: str, args: Dict[str, Any], domain: str = "General Discourse") -> Dict[str, Any]:
+    def execute(tool_name: str, args: Dict[str, Any], domain: str = "General Discourse", agent_id: str = None) -> Dict[str, Any]:
         blocked = BLOCKED_TOOLS_BY_DOMAIN.get(domain, set())
         if tool_name in blocked:
             return {
@@ -734,24 +741,84 @@ class ToolRegistry:
 
         logger.info(f"Concurrently executing tool '{tool_name}' for domain '{domain}'.")
         try:
-            handler = getattr(ToolRegistry, tool_name, None)
-            if not handler:
-                return {"status": "error", "message": f"Tool '{tool_name}' not found."}
+            if tool_name not in TOOL_ALLOWLIST:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Tool '{tool_name}' not found. Available tools: "
+                        f"{', '.join(TOOL_ALLOWLIST)}."
+                    ),
+                }
 
-            if tool_name == "run_code":
-                args["domain"] = domain
-            elif tool_name == "verify_math":
-                # FIX: verify_math now needs domain too -- see its docstring
-                # for why (it's routed through the same sandboxed subprocess
-                # run_code uses, rather than calling sympy.sympify directly
-                # in-process).
-                args["domain"] = domain
-            elif tool_name == "query_dataframe":
-                # FIX (T16): query_dataframe needs domain too -- its "query"
-                # action is routed through the same sandboxed subprocess
-                # run_code uses (see its docstring), and the domain feeds
-                # run_code's per-domain timeout scaling.
-                args["domain"] = domain
+            if not isinstance(args, dict):
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Tool '{tool_name}' expected its arguments as a dict, "
+                        f"got {type(args).__name__}."
+                    ),
+                }
+
+            handler = getattr(ToolRegistry, tool_name)
+
+            # Work on a copy: args is the caller's live event payload (e.g.
+            # orchestrator's event.payload["args"]), and the domain/agent_id
+            # injection below must not mutate it out from under the caller.
+            args = dict(args)
+
+            # FIX: a wrong/misspelled argument name used to fall through as a
+            # plain kwarg to handler(**args), raising a TypeError that the
+            # broad except below swallowed into an opaque "Tool execution
+            # crashed" message -- indistinguishable from a real internal
+            # failure. Given the role/task-name garbling already seen from
+            # agents, a wrong key is the common case, not the exception, so
+            # it gets its own clean, actionable message instead.
+            allowed_params = set(inspect.signature(handler).parameters)
+
+            # INJECTED_PARAMS are supplied by the caller (orchestrator), not
+            # by the agent: "domain" comes from the colony's problem spec
+            # (it gates BLOCKED_TOOLS_BY_DOMAIN above and scales the sandbox
+            # timeout) and "agent_id" comes from the requesting event's
+            # sender. They're excluded from the "valid arguments" hint so
+            # the model isn't invited to pass them, and force-overwritten
+            # below so it can't.
+            agent_settable = allowed_params - INJECTED_PARAMS
+            # Note: unknown_keys is measured against the FULL signature, not
+            # agent_settable -- an agent that does pass domain/agent_id gets
+            # the value silently overwritten below (and logged), which is
+            # more useful than a hard error on an argument it shouldn't have
+            # been thinking about in the first place.
+            unknown_keys = set(args) - allowed_params
+            if unknown_keys:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Tool '{tool_name}' does not accept argument(s): "
+                        f"{', '.join(sorted(unknown_keys))}. Valid arguments: "
+                        f"{', '.join(sorted(agent_settable))}."
+                    ),
+                }
+
+            # Force-set every injected parameter this handler accepts.
+            # Previously this was a hardcoded `if tool_name == "run_code" /
+            # elif verify_math / elif query_dataframe` chain -- a new tool
+            # taking `domain` would have silently run with the default
+            # "General Discourse" until someone remembered to extend the
+            # chain. Driving it off the signature keeps it in sync by
+            # construction. An agent that supplied one of these itself has
+            # it discarded, and the attempt logged: for agent_id that's an
+            # impersonation attempt (it namespaces write_file's output),
+            # for domain an attempt to escape its own domain's policy.
+            trusted_values = {"domain": domain, "agent_id": agent_id}
+            for param in sorted(INJECTED_PARAMS & allowed_params):
+                if param in args:
+                    logger.warning(
+                        f"Agent '{agent_id}' supplied its own '{param}' "
+                        f"({args[param]!r}) in the arguments to tool "
+                        f"'{tool_name}'; ignoring it in favor of the trusted "
+                        f"value {trusted_values[param]!r}."
+                    )
+                args[param] = trusted_values[param]
 
             result = handler(**args)
             return result
@@ -1123,12 +1190,18 @@ class ToolRegistry:
         defeating the basename jail that only protected the filepath half
         of the call. agent_id is now strictly validated: any id containing
         os.sep, os.altsep, "..", or characters outside [A-Za-z0-9_-] is
-        rejected outright -- the raise surfaces as a tool error via
-        ToolRegistry.execute's catch-all. Missing or empty agent_id falls
-        back to "anon" so every write stays namespaced even before the
-        orchestrator threads agent_id through ToolRegistry.execute() /
-        handle_tool_request (same as domain already is for
-        run_code/verify_math).
+        rejected outright, returned as an error like every other failure
+        in this function. Missing or empty agent_id falls back to "anon"
+        so every write stays namespaced.
+
+        FIX (agent_id impersonation): agent_id is no longer trusted from
+        the tool call's own arguments -- ToolRegistry.execute() now force-
+        overwrites it with the value derived from the requesting event's
+        sender (same pattern already used for domain) before handler(**args)
+        is called, so this validation only ever sees a value the caller
+        couldn't have forged. It's kept here regardless, since write_file
+        is also reachable directly (e.g. from tests) without going through
+        execute().
         """
         if not isinstance(content, str):
             return {
@@ -1149,12 +1222,10 @@ class ToolRegistry:
                 ),
             }
 
-        # agent_id is agent-supplied and lands verbatim in the output
-        # filename, so it gets the full containment treatment: fall back to
-        # "anon" when absent, and hard-reject anything that could escape
-        # SAFE_WRITE_ROOT (path separators, "..", or any character outside
-        # [A-Za-z0-9_-]). Raising here surfaces as a tool error through
-        # ToolRegistry.execute's catch-all.
+        # agent_id lands verbatim in the output filename, so it gets the
+        # full containment treatment: fall back to "anon" when absent, and
+        # hard-reject anything that could escape SAFE_WRITE_ROOT (path
+        # separators, "..", or any character outside [A-Za-z0-9_-]).
         if not agent_id:
             agent_id = "anon"
         elif (
@@ -1163,11 +1234,14 @@ class ToolRegistry:
             or ".." in agent_id
             or not AGENT_ID_RE.fullmatch(agent_id)
         ):
-            raise ValueError(
-                f"Write rejected: invalid agent_id {agent_id!r}. "
-                f"agent_id must contain only [A-Za-z0-9_-] and must not "
-                f"contain path separators or '..'."
-            )
+            return {
+                "status": "error",
+                "message": (
+                    f"Write rejected: invalid agent_id {agent_id!r}. "
+                    f"agent_id must contain only [A-Za-z0-9_-] and must not "
+                    f"contain path separators or '..'."
+                ),
+            }
 
         normalized_filename = f"{agent_id}_{os.path.basename(filepath)}"
         safe_path = os.path.join(SAFE_WRITE_ROOT, normalized_filename)

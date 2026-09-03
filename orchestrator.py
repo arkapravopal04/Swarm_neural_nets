@@ -76,6 +76,14 @@ class Orchestrator:
         self.energy_threshold_death = 5
         self.timeout_threshold = 30.0  # Seconds an agent can remain silent before being killed/probed
 
+        # A crashing agent.run() is debited the same flat cost as spawning a
+        # fresh agent of its role (energy_when_new_by_role) -- crashing isn't
+        # free just because no tokens were produced. After this many
+        # *consecutive* crashes (reset on any successful tick), the agent is
+        # routed through the normal kill/respawn path (failure_request)
+        # instead of being retried forever on the same broken state.
+        self.MAX_CONSECUTIVE_CRASHES = 3
+
         self.SHORT_ANSWER_WORD_THRESHOLD = 12
 
         self.MAX_SUBTASKS_ROOT = 3
@@ -163,16 +171,55 @@ class Orchestrator:
             if live_agent.awaiting is not None:
                 continue
 
+            agent_node = self.colony.get_agent(agent_id)
             prev_len = len(live_agent.thought_process)
             try:
                 live_agent.run(available_roles, available_tools, requirements=None)
             except Exception as e:
                 print(f"Agent {agent_id} crashed during run(): {e}")
+                print(traceback.format_exc())
+
+                fail_reason = f"CRASH in run(): {e}"
+                give_up = True
+
+                if agent_node:
+                    # A crash still counts as activity -- without this the
+                    # deadlock watchdog sees a stale last_active and piles a
+                    # second, conflicting kill/respawn on top of this one.
+                    agent_node.last_active = time.time()
+
+                    crash_cost = self.energy_when_new_by_role.get(live_agent.role, self.energy_when_new)
+                    self.colony.debit_energy(agent_id, crash_cost)
+
+                    agent_node.fail_reason = fail_reason
+                    agent_node.crash_count += 1
+                    give_up = agent_node.crash_count >= self.MAX_CONSECUTIVE_CRASHES
+                    crash_label = f"{agent_node.crash_count} times in a row"
+                else:
+                    # No colony node: debit_energy is a no-op for an
+                    # unregistered id and there's nowhere to keep a crash
+                    # count, so a live_agent in this state would crash-loop
+                    # for free, forever. Route it out on the first crash.
+                    crash_label = "with no registered colony node"
+
+                if give_up:
+                    print(f"Agent {agent_id} crashed {crash_label} -- "
+                          f"routing through kill/respawn instead of retrying every tick.")
+                    self.messenger.push_event(
+                        "failure_request",
+                        agent_id,
+                        {
+                            "task_id": task_id,
+                            "role": live_agent.role,
+                            "parent_id": live_agent.parent_id,
+                            "result": fail_reason,
+                        }
+                    )
                 continue
 
-            agent_node = self.colony.get_agent(agent_id)
             if agent_node:
                 agent_node.last_active = time.time()
+                agent_node.crash_count = 0
 
             new_chars = len(live_agent.thought_process) - prev_len
             cost = max(1, new_chars // 100)
@@ -779,7 +826,7 @@ class Orchestrator:
 
         print(f"Executing tool '{tool_name}' for agent {agent_id}...")
 
-        result = ToolRegistry.execute(tool_name, args, domain=domain)
+        result = ToolRegistry.execute(tool_name, args, domain=domain, agent_id=agent_id)
 
         output_type = "text"
         if tool_name == "run_code":

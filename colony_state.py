@@ -24,6 +24,7 @@ class AgentNode:
     awaiting: str | None = None
     tool_call_count: int = 0
     generation: int = 0
+    crash_count: int = 0
 
 
 class ColonyState:

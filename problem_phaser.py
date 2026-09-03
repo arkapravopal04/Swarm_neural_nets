@@ -423,10 +423,12 @@ Output:"""
             print(f"Error during problem parsing: {e}")
             return {
                 "raw_text": raw_text,
+                "goal": raw_text,
                 "requirement": [],
                 "context_vector": np.zeros(self.embed_dim),
                 "goal_vector": np.zeros(self.embed_dim),
-                "domain": "General Discourse"
+                "domain": "General Discourse",
+                "colony_budget": 100,
             }
 
     def run_phaser(self):
