@@ -138,6 +138,52 @@ def dedupe_global_and_cap(text, max_chars: int = 400):
     return result
 
 
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^\s>]{0,40}\|>")
+_SCAFFOLD_LINE_RE = re.compile(
+    r"^[ \t]*(?:ACTION|PAYLOAD)\s*:.*$"
+    r"|^[ \t]*Your next action\s*:?.*$"
+    r"|^[ \t]*Available actions\s*:?.*$"
+    r"|^[ \t]*Your output must be.*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def strip_special_tokens(text):
+    """
+    Removes any literal "<|...|>" special-token marker from text.
+
+    Guards two distinct leak paths into a stored transcript: a decode
+    call that (unlike a sibling call elsewhere that passes
+    skip_special_tokens=True) leaves special tokens like <|endoftext|>
+    in the decoded string, and a model that has learned to emit a
+    special token's string form as ordinary text even when the decoder
+    would have suppressed the real token. Matches any <|...|> shape,
+    not just tokens seen so far, since a future tokenizer/adapter can
+    define different ones.
+    """
+    if not text:
+        return text
+    return _SPECIAL_TOKEN_RE.sub("", text)
+
+
+def strip_scaffolding_lines(text):
+    """
+    Drops lines that are re-emitted harness formatting -- an "ACTION:"
+    or "PAYLOAD:" label, "Your next action", "Available actions", or
+    "Your output must be..." -- rather than actual reasoning.
+
+    Free-form reasoning generation is meant to produce prose, but its
+    own prompt (and, across a multi-cycle KV-cache continuation, its
+    prior output) contains that formatting as instructional text, and
+    unconstrained decoding can echo it back verbatim instead of
+    reasoning in prose. A stored thought/reasoning transcript should
+    only ever contain the latter.
+    """
+    if not text:
+        return text
+    return _SCAFFOLD_LINE_RE.sub("", text)
+
+
 def dedupe_list_exact(items):
     """
     Removes exact (case/whitespace-insensitive) duplicate entries from a

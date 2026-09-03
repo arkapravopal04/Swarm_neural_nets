@@ -17,7 +17,12 @@ role_caps = {
 from event_queue import Event, Messenger
 from colony_state import AgentNode
 from tools import ToolRegistry
-from text_utils import dedupe_and_cap as _dedupe_repeated_sentences, normalize_identifier
+from text_utils import (
+    dedupe_and_cap as _dedupe_repeated_sentences,
+    normalize_identifier,
+    strip_special_tokens,
+    strip_scaffolding_lines,
+)
 import torch
 import ast
 import re
@@ -387,6 +392,7 @@ class Agent:
         _last_newline = _tail.rfind("\n")
         if _last_newline > 0:
             _tail = _tail[:_last_newline]
+        _tail = strip_special_tokens(_tail)
         thoughts_str = (
             f"Your Previous Thoughts (most recent):\n...{_tail}\n"
             if self.thought_process else ""
@@ -449,6 +455,7 @@ Your next action:"""
                 raise ValueError("KV_Cache is present, but missing last_token_id to continue generation.")
 
         hit_token_ceiling = False
+        generated_chunk = ""
 
         with torch.no_grad():
             for step in range(max_tokens):
@@ -475,11 +482,16 @@ Your next action:"""
                 self.last_token_id = next_token_tensor.item()
                 self._total_generated += 1
 
-                token_text = self.tokeniser.decode([self.last_token_id])
-                self.thought_process += token_text
+                token_text = self.tokeniser.decode([self.last_token_id], skip_special_tokens=True)
+                generated_chunk += token_text
 
                 input_ids = next_token_tensor.unsqueeze(0)
-        
+
+        # Sanitize the whole cycle's output before storing it -- scaffolding
+        # lines (ACTION:/PAYLOAD:/etc.) can only be recognized reliably once
+        # a full line has accumulated, not token-by-token mid-line.
+        self.thought_process += strip_scaffolding_lines(strip_special_tokens(generated_chunk))
+
         if self.think_cycle <= self.THINK_CYCLES_BEFORE_DECIDE and not hit_token_ceiling:
             return "THINK"
         else:
@@ -594,7 +606,7 @@ Your next action:"""
                 f"retrying with sampling."
             )
 
-        self.thought_process += f"\n{generated_text}\n"
+        self.thought_process += f"\n{strip_special_tokens(generated_text)}\n"
 
         action = "REPORT"  # Safe default fallback
         action_match = re.search(r"ACTION:\s*([A-Za-z]+)", generated_text, re.IGNORECASE)
