@@ -665,18 +665,53 @@ class Orchestrator:
 
         agent_node = self.colony.get_agent(agent_id)
 
+        # FIX (root-acceptance bug): a generation-0 decomposer's contract is
+        # to SPAWN, not to answer the goal itself. A REPORT on the root task
+        # with no completed children means it skipped decomposition entirely
+        # -- reject it structurally, before the judge (and its expensive
+        # tier-3 critique) ever sees it, and force a respawn instead of
+        # letting it fall through as a "result".
+        if (task_id == self.root_task_id and agent_node is not None
+                and agent_node.role == "decomposer" and agent_node.generation == 0):
+            has_completed_child = False
+            for child_id in agent_node.children:
+                child_agent = self.colony.get_agent(child_id)
+                if child_agent is None:
+                    continue
+                child_task = self.task_graph.tasks.get(child_agent.task_id)
+                if child_task is not None and child_task.status == 2:
+                    has_completed_child = True
+                    break
+            if not has_completed_child:
+                print(f"REJECT (structural) on {agent_id}/{task_id}: root decomposer "
+                      f"REPORTed with no completed children -- a generation-0 "
+                      f"decomposer must SPAWN, not answer the goal directly.")
+                agent_node.fail_reason = (
+                    "Previous attempt was REJECTED: you REPORTed a final answer "
+                    "directly instead of decomposing the task. As the ROOT "
+                    "decomposer (generation 0) your job is to SPAWN subtasks, "
+                    "not answer the question yourself."
+                )
+                self._kill_and_respawn(
+                    agent_id, task_id, agent_node.role, agent_node.parent_id,
+                    verdict={"verdict": "execute", "reason": agent_node.fail_reason},
+                )
+                return
+
         verdict = {"verdict": "promote", "reason": "no judge configured"}
         if self.judge is not None and agent_node is not None:
             output_embedding = None
             target_embedding = self.colony.goal_embedding
 
             word_count = len(str(result).split())
+            is_root = task_id == self.root_task_id
+            skip_tier2 = (not is_root) and word_count <= self.SHORT_ANSWER_WORD_THRESHOLD
             print(f"  [judge-bypass-check] word_count={word_count} "
                   f"threshold={self.SHORT_ANSWER_WORD_THRESHOLD} "
-                  f"will_skip_tier2={word_count <= self.SHORT_ANSWER_WORD_THRESHOLD} "
+                  f"will_skip_tier2={skip_tier2} "
                   f"result={str(result)!r}")
             if (self.embed_model is not None and target_embedding is not None
-                    and word_count > self.SHORT_ANSWER_WORD_THRESHOLD):
+                    and not skip_tier2):
                 try:
                     output_embedding = self.embed_model.encode(str(result), convert_to_numpy=True)
                 except Exception as e:
@@ -687,7 +722,7 @@ class Orchestrator:
                 output_type="text",
                 output_embedding=output_embedding,
                 target_embedding=target_embedding,
-                is_promotion_attempt=(task_id != self.root_task_id),
+                needs_deep_check=True,
             )
 
             if verdict.get("tier") == 3:
@@ -734,7 +769,9 @@ class Orchestrator:
             if self.synthesizer is not None:
                 goal_text = self.spec.get("goal", "") if self.spec else ""
                 try:
-                    final_answer = self.synthesizer.run(self.colony, self.task_graph, goal_text)
+                    final_answer = self.synthesizer.run(
+                        self.colony, self.task_graph, goal_text, root_task_id=self.root_task_id
+                    )
                 except Exception:
                     print(f"Warning: Synthesizer failed on root completion -- "
                           f"falling back to the raw agent result instead of crashing.\n"
@@ -1051,7 +1088,9 @@ class Orchestrator:
 
         if not best_result and not is_successful and self.synthesizer is not None:
             try:
-                partial_results = self.synthesizer.collect_results(self.colony, self.task_graph)
+                partial_results = self.synthesizer.collect_results(
+                    self.colony, self.task_graph, root_task_id=self.root_task_id
+                )
             except Exception:
                 print(f"Warning: failed collecting partial results for synthesis:\n"
                       f"{traceback.format_exc()}")
