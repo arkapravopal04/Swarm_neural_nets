@@ -246,13 +246,22 @@ class Orchestrator:
         self.colony.budget_remaining = spec.get("colony_budget", self.colony.budget_remaining)
         self.colony.goal_embedding = spec.get("goal_vector")
 
+        goal_text = spec.get("goal", problem_spec)
+        print(f"[initialize_colony] goal ({len(goal_text)} chars): {goal_text}")
+
         root_node = TaskNode(
             task_id=self.root_task_id,
-            description=spec.get("goal", problem_spec),
+            description=goal_text,
             required_role="decomposer",
             requirements=spec.get("requirement", []),
         )
         self.task_graph.add_task(root_node)
+        # Problem_Phaser dedupes/caps the goal before returning it in spec --
+        # the root task description (what the judge prints on WARN) must be
+        # that exact same string, not a re-derived one, since goal_vector
+        # was embedded from it. A mismatch here means a future edit split
+        # the description assignment from the phaser's cleaned goal again.
+        assert self.task_graph.tasks[self.root_task_id].description == goal_text
 
         print(f"Colony initialized. Bootstrapping root task: {self.root_task_id}")
         self.spawn_agent(role="decomposer", task_id=self.root_task_id)

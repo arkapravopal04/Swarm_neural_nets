@@ -24,45 +24,7 @@ keeps judge decoupled from any specific embedding backend.
 
 import re
 import numpy as np
-
-
-def _dedupe_and_cap(text, max_chars: int = 500):
-    """
-    FIX (confirmed via a real run): deep_critique's own output degenerated
-    into runaway repetition after its real content twice in one run --
-    "The response is entirely fabricated. The simulation claim is entirely
-    absent..." repeated 6x verbatim, and a chain of ~25 unrelated "The X
-    must be Y." filler sentences with no connection to the actual
-    critique. This is the same greedy-decoding degeneration pattern seen
-    elsewhere in this project (agent_node.py's _dedupe_repeated_sentences,
-    added for DIE payloads and ghost context). Fixing it HERE, at the
-    source, rather than only downstream (ghost_extractor.py independently
-    patches this same value before persisting it -- see that file's
-    _dedupe_and_cap) means every consumer of deep_critique's output
-    benefits: the verdict text printed to logs, the text that becomes the
-    next respawn's fail_reason, AND the persisted ghost record, instead of
-    relying on each caller to separately defend itself against the same
-    degenerate text. ghost_extractor's copy remains as defense-in-depth,
-    not the only protection.
-
-    Small and local rather than importing agent_node's version -- judge.py
-    already keeps its own boundaries deliberately (no embedding model, no
-    tool access, llm_call_fn injected rather than owned -- see this
-    module's docstring), and this mirrors the same "self-contained, don't
-    reach across files" choice ghost_extractor.py already made for its
-    own copy of this exact logic.
-    """
-    if not text:
-        return text
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-    deduped = []
-    for s in sentences:
-        if not deduped or s.strip() != deduped[-1].strip():
-            deduped.append(s)
-    result = " ".join(deduped)
-    if len(result) > max_chars:
-        result = result[:max_chars].rsplit(" ", 1)[0] + "..."
-    return result
+from text_utils import dedupe_and_cap as _dedupe_and_cap
 
 
 # --- Tier 2 thresholds -----------------------------------------------------

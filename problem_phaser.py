@@ -2,6 +2,7 @@ import re
 import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from text_utils import dedupe_global_and_cap, dedupe_list_exact
 
 class Problem_Phaser:
     """
@@ -100,9 +101,15 @@ class Problem_Phaser:
         if len(cleaned_items) == 1 and "," in cleaned_items[0]:
             comma_split = [item.strip() for item in cleaned_items[0].split(',') if item.strip()]
             if len(comma_split) > 1:
-                return comma_split
-                
-        return cleaned_items
+                return dedupe_list_exact(comma_split)
+
+        # FIX: greedy decoding can repeat an entire bullet verbatim (distinct
+        # from the sentence-level dedupe used for goal/context text above --
+        # here the unit of repetition is a whole list item). Duplicated
+        # bullets directly inflate num_reqs in _estimate_by_constraints,
+        # which drives the sqrt(num_reqs) budget multiplier -- an undeduped
+        # list silently overestimates task complexity.
+        return dedupe_list_exact(cleaned_items)
 
     def _cosine_sim(self, vec_a, vec_b):
         """Safe, pure-NumPy cosine similarity calculation preventing PyTorch tensor mismatch issues."""
@@ -136,11 +143,29 @@ Output:"""
             prompt_length = inputs.input_ids.shape[1]
             
             outputs = self.llm.generate(
-                **inputs, max_new_tokens=100, min_new_tokens=5, do_sample=False, 
-                pad_token_id=self.tokeniser.eos_token_id
+                **inputs, max_new_tokens=100, min_new_tokens=5, do_sample=False,
+                pad_token_id=self.tokeniser.eos_token_id,
+                repetition_penalty=1.15, no_repeat_ngram_size=4,
             )
             goal_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             goal_sentence = self._sanitize_generation(goal_sentence)
+
+            # FIX: greedy decoding here occasionally degenerates into a
+            # repeated clause/sentence, which then silently pushed real
+            # content past all-MiniLM-L6-v2's 256-wordpiece truncation
+            # window at encode() time below. Dedupe (non-adjacent, since a
+            # short goal sentence can interleave a repeat with other
+            # content) and cap BEFORE encoding, so goal_sentence (the root
+            # TaskNode.description the judge prints) and goal_vector (the
+            # tier-2 target) are guaranteed to agree on the same string.
+            cleaned_goal = dedupe_global_and_cap(goal_sentence, max_chars=400)
+            if goal_sentence and len(cleaned_goal) < 0.7 * len(goal_sentence):
+                print(
+                    f"[Problem_Phaser] WARNING: goal generation looked degenerate -- "
+                    f"dedupe removed {100 * (1 - len(cleaned_goal) / len(goal_sentence)):.0f}% "
+                    f"of the text ({len(goal_sentence)} -> {len(cleaned_goal)} chars)."
+                )
+            goal_sentence = cleaned_goal
             goal_vector = self.embed_model.encode(goal_sentence, convert_to_numpy=True)
 
         return goal_sentence, goal_vector
@@ -175,8 +200,9 @@ Output:"""
             prompt_length = inputs.input_ids.shape[1]
             
             outputs = self.llm.generate(
-                **inputs, max_new_tokens=100, min_new_tokens=2, do_sample=False, 
-                pad_token_id=self.tokeniser.eos_token_id
+                **inputs, max_new_tokens=100, min_new_tokens=2, do_sample=False,
+                pad_token_id=self.tokeniser.eos_token_id,
+                repetition_penalty=1.15, no_repeat_ngram_size=4,
             )
             context_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             context_sentence = self._sanitize_generation(context_sentence)
@@ -228,8 +254,9 @@ Output:
             prompt_length = inputs.input_ids.shape[1]
             
             outputs = self.llm.generate(
-                **inputs, max_new_tokens=120, min_new_tokens=2, do_sample=False, 
-                pad_token_id=self.tokeniser.eos_token_id
+                **inputs, max_new_tokens=120, min_new_tokens=2, do_sample=False,
+                pad_token_id=self.tokeniser.eos_token_id,
+                repetition_penalty=1.15, no_repeat_ngram_size=4,
             )
             req_output = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             req_output = self._sanitize_generation(req_output)
@@ -266,8 +293,9 @@ Output:"""
             inputs = self.tokeniser(domain_prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
             prompt_length = inputs.input_ids.shape[1]
             outputs = self.llm.generate(
-                **inputs, max_new_tokens=60, min_new_tokens=5, do_sample=False, 
-                pad_token_id=self.tokeniser.eos_token_id
+                **inputs, max_new_tokens=60, min_new_tokens=5, do_sample=False,
+                pad_token_id=self.tokeniser.eos_token_id,
+                repetition_penalty=1.15, no_repeat_ngram_size=4,
             )
             domain_str = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             
