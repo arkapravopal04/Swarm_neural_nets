@@ -434,6 +434,17 @@ class Orchestrator:
             required_role=role,
             requirements=requirements,
         )
+        # N2b: embed this task's own description once, at spawn time, so
+        # judge.decide's tier-2 check has a target that actually matches
+        # what this task's agent was asked to do -- not the colony's overall
+        # goal, which is what every child was being scored against before.
+        if self.embed_model is not None:
+            try:
+                child_node.description_embedding = self.embed_model.encode(
+                    description, convert_to_numpy=True
+                )
+            except Exception as e:
+                print(f"Warning: failed to embed task description for '{task_id}': {e}")
         self.task_graph.add_task(child_node)
 
         goal_text = (self.spec.get("goal") or self.spec.get("raw_text")) if self.spec else None
@@ -701,10 +712,25 @@ class Orchestrator:
         verdict = {"verdict": "promote", "reason": "no judge configured"}
         if self.judge is not None and agent_node is not None:
             output_embedding = None
-            target_embedding = self.colony.goal_embedding
+            is_root = task_id == self.root_task_id
+
+            # N2b: score against this task's OWN description, not the
+            # colony's overall goal -- a subtask several decomposition
+            # levels down was never going to read as semantically similar
+            # to the whole project goal even when it's doing exactly the
+            # right thing. The root task has no separate description to
+            # target (its description already IS the goal), so it alone
+            # keeps using colony.goal_embedding.
+            if is_root:
+                target_embedding = self.colony.goal_embedding
+            else:
+                completing_task_node = self.task_graph.tasks.get(task_id)
+                target_embedding = (
+                    completing_task_node.description_embedding
+                    if completing_task_node is not None else None
+                )
 
             word_count = len(str(result).split())
-            is_root = task_id == self.root_task_id
             skip_tier2 = (not is_root) and word_count <= self.SHORT_ANSWER_WORD_THRESHOLD
             print(f"  [judge-bypass-check] word_count={word_count} "
                   f"threshold={self.SHORT_ANSWER_WORD_THRESHOLD} "
