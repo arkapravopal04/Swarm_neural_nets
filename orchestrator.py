@@ -10,6 +10,7 @@ WATCHDOG: monitors agent response latency and resolves systemic lockups
 RUN & TERMINATE: manages system lifespan, captures run traces, and retrieves execution specs
 """
 
+import ast
 import uuid
 import time
 import re
@@ -59,15 +60,36 @@ class Orchestrator:
         # Populated by initialize_colony() once Problem_Phaser has run.
         self.spec: Optional[Dict[str, Any]] = None
 
-        # A1 observation only: task_id -> number of times _kill_and_respawn
-        # has respawned an agent for that task. No cap is enforced here --
-        # a task_id sitting at 14 respawns with no completion is the
-        # signature of the respawn loop, and seeing that number is the
-        # whole point before any control flow changes to react to it.
+        # task_id -> number of times _kill_and_respawn has respawned an
+        # agent for that task. A2: this is now enforcement, not just
+        # observation -- see MAX_TASK_ATTEMPTS below.
         self.respawn_counts: Dict[str, int] = {}
+
+        # task_id -> the last REPORT text seen for that task, whatever the
+        # judge made of it. The salvage value when a task is abandoned:
+        # eleven agents burned on one task_id still produced *something*,
+        # and handing the parent that plus an explicit abandonment marker
+        # beats handing it nothing.
+        self.last_partial_result: Dict[str, str] = {}
+
+        # Tasks abandoned by the attempt cap, so terminate() can say so.
+        self.abandoned_tasks: set = set()
+
+        # agent_id -> the exact REPORT text that last earned it a judge WARN.
+        # Used to short-circuit an agent that answers a WARN by resubmitting
+        # the identical string (see handle_completion's warn branch).
+        self.last_warned_report: Dict[str, str] = {}
 
         # High-water mark of len(self.live_agents), sampled once per tick.
         self.peak_live_agents = 0
+
+        # Ticks elapsed, and how often the energy ledger is printed mid-run.
+        # A run interrupted before terminate() used to leave nothing but
+        # thousands of heartbeat lines to read; one ledger every
+        # LEDGER_EVERY_TICKS puts the whole budget picture on a single screen
+        # while the run is still going.
+        self.tick_count = 0
+        self.LEDGER_EVERY_TICKS = 20
 
         # Live Agent objects (the think/decide/execute reasoning wrapper),
         # keyed by agent_id. Distinct from ColonyState.agents, which only
@@ -94,6 +116,17 @@ class Orchestrator:
         # routed through the normal kill/respawn path (failure_request)
         # instead of being retried forever on the same broken state.
         self.MAX_CONSECUTIVE_CRASHES = 3
+
+        # A2: how many times one task_id may be respawned before it is
+        # abandoned outright. Without this, a task that no agent can satisfy
+        # recycles until the colony hits energy death with nothing completed
+        # (observed: one task_id consuming eleven agents in a single run).
+        # Abandoning it converts that into a bounded failure that still
+        # returns a partial answer -- the task is marked failed, its best
+        # partial result is pushed to the parent with an explicit marker,
+        # and its dependents are released so the rest of the graph can
+        # finish.
+        self.MAX_TASK_ATTEMPTS = 3
 
         self.SHORT_ANSWER_WORD_THRESHOLD = 12
 
@@ -396,14 +429,94 @@ class Orchestrator:
         words = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", text.lower())
         return {w for w in words if w not in cls._REQ_FILTER_STOPWORDS}
 
+    @staticmethod
+    def _stems(words: set) -> set:
+        """Crude prefix stems, so 'cooling'/'cooled'/'coolant' can still meet."""
+        return {w[:5] for w in words if len(w) >= 5}
+
+    _CODE_HINT_RE = re.compile(
+        r"^\s*(def |class |import |from \w+ import |return |for \w+ in |if .+:|"
+        r"[\w\.\[\]]+\s*=\s*\S)",
+        re.MULTILINE,
+    )
+
+    @classmethod
+    def _looks_like_code(cls, output) -> bool:
+        """
+        True when this output is source code rather than prose, so tier 2's
+        prose-vs-prose similarity score can be skipped (see the call site in
+        handle_completion for why the score is meaningless on code).
+
+        Deliberately conservative: a fenced block or a clean ast.parse is
+        proof; otherwise several code-shaped lines are required, so an
+        English answer that happens to contain one `x = 3` is not mistaken
+        for a program.
+        """
+        text = str(output or "").strip()
+        if not text:
+            return False
+        if "```" in text:
+            return True
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            pass
+        else:
+            # A bare sentence parses as an Expr of a Name/Call chain often
+            # enough that "it parsed" alone is not evidence. Require at least
+            # one real statement.
+            if any(not isinstance(node, ast.Expr) for node in tree.body):
+                return True
+        return len(cls._CODE_HINT_RE.findall(text)) >= 3
+
     def _filter_requirements_for_task(self, description: str, requirements: list) -> list:
+        """
+        The constraints a child task actually inherits.
+
+        FIX (inverted fallback): "no keyword overlap" used to mean "inherit
+        EVERY requirement" -- exactly backwards. A subtask that shares no
+        vocabulary with a requirement is the subtask that requirement has
+        nothing to do with. That fallback is how a task like "implement the
+        binomial PMF" ended up carrying "operating temperature must exceed
+        1450C" and DIEing on a contradiction it was never asked to satisfy.
+
+        No overlap now yields nothing. Between the two, a softer prefix-stem
+        pass catches morphological near-misses ("cooling" vs "coolant") and
+        returns at most the two best-scoring requirements -- enough to keep a
+        genuinely-related constraint from being dropped over a suffix, not
+        enough to reinstate the dump-everything behaviour.
+        """
         if not requirements:
             return []
         task_words = self._significant_words(description)
         if not task_words:
-            return list(requirements)
+            print("  [requirements] task description has no significant words -- "
+                  "inheriting no requirements.")
+            return []
+
         kept = [r for r in requirements if task_words & self._significant_words(r)]
-        return kept if kept else list(requirements)
+        if kept:
+            return kept
+
+        task_stems = self._stems(task_words)
+        scored = []
+        for r in requirements:
+            overlap = len(task_stems & self._stems(self._significant_words(r)))
+            if overlap:
+                scored.append((overlap, r))
+        if scored:
+            scored.sort(key=lambda pair: -pair[0])
+            partial = [r for _, r in scored[:2]]
+            print(f"  [requirements] no exact keyword overlap for "
+                  f"'{description[:60]}' -- inheriting the {len(partial)} "
+                  f"closest requirement(s) by stem overlap only.")
+            return partial
+
+        print(f"  [requirements] no keyword overlap at all for "
+              f"'{description[:60]}' -- inheriting NO requirements (previously "
+              f"this inherited all of them, which is what forced unrelated "
+              f"constraints onto narrow subtasks).")
+        return []
 
     _VALID_ROLES = ("decomposer", "executor", "verifier")
 
@@ -516,10 +629,59 @@ class Orchestrator:
         )
         self._spawn_child_task(**next_spawn_kwargs)
 
+    def _reject_spawn_from_non_decomposer(self, event: Event) -> bool:
+        """
+        Returns True if this SPAWN may proceed, False if it was rejected and
+        rerouted. See handle_spawn for why this is enforced in code.
+        """
+        spawner_id = event.from_agent
+        spawner = self.colony.get_agent(spawner_id) if spawner_id else None
+        # Orchestrator-originated spawns (bootstrap, overflow drains) have no
+        # agent record to check -- those are ours, not a model's request.
+        if spawner is None or spawner.role == "decomposer":
+            return True
+
+        print(f"REJECT (structural) on {spawner_id}: a '{spawner.role}' agent "
+              f"requested a SPAWN, which only a decomposer may do -- "
+              f"rerouting to the TASK TOO LARGE respawn path.")
+
+        spawner.fail_reason = (
+            "Previous attempt was REJECTED: you issued a SPAWN, but only a "
+            "decomposer may spawn subtasks. If the task is genuinely too big "
+            "for one agent, DIE with a payload starting 'TASK TOO LARGE:' and "
+            "it will be re-planned by a decomposer; otherwise do the work "
+            "yourself with THINK/TOOL and REPORT the result."
+        )
+        self.messenger.push_event(
+            "failure_request",
+            spawner_id,
+            {
+                "task_id": spawner.task_id,
+                "role": spawner.role,
+                "parent_id": spawner.parent_id,
+                "result": ("TASK TOO LARGE: the assigned agent tried to "
+                           "decompose this task itself instead of executing "
+                           "it."),
+            },
+        )
+        return False
+
     def handle_spawn(self, event: Event):
         """Triggered when an existing agent requests sub-agents (children)."""
         payload = event.payload
         parent_id = payload.get("parent_id")
+
+        # Only a decomposer may spawn. The prompt already says so in bold,
+        # and _enforce_child_role only constrains WHICH role a child gets --
+        # not whether this agent was entitled to ask for one. Prompt-only
+        # enforcement of a structural rule does not hold: an executor that
+        # decides its task is too big spawns instead of DIEing, and the
+        # children it invents carry whatever text its generation happened to
+        # be mid-sentence on. Converted here to the DIE / "TASK TOO LARGE"
+        # path the prompt already describes, which handle_failure respawns
+        # as a decomposer on the same task.
+        if not self._reject_spawn_from_non_decomposer(event):
+            return
 
         subtasks = payload.get("subtasks")
 
@@ -710,6 +872,13 @@ class Orchestrator:
         if result:
             result = _dedupe_repeated_sentences(str(result), max_chars=2000)
 
+        # Remembered whatever the judge decides next: if this task is later
+        # abandoned by the attempt cap, this is the salvage value handed to
+        # the parent. Recorded before judging on purpose -- a rejected
+        # REPORT is still more than nothing.
+        if result and task_id:
+            self.last_partial_result[task_id] = str(result)
+
         agent_node = self.colony.get_agent(agent_id)
 
         # FIX (root-acceptance bug): a generation-0 decomposer's contract is
@@ -767,9 +936,21 @@ class Orchestrator:
                 )
 
             word_count = len(str(result).split())
-            skip_tier2 = (not is_root) and word_count <= self.SHORT_ANSWER_WORD_THRESHOLD
+            # Tier 2 is a MiniLM cosine between the output and the task
+            # description. Comparing Python source against an English task
+            # description puts correct and useless answers within ~0.1 of
+            # each other (measured: a plausible implementation scored 0.593,
+            # 270 words of content-free filler scored 0.496) -- near enough
+            # to noise that it strike-limits agents for being roughly right.
+            # A code output is bypassed for the same reason a very short
+            # answer already is: the score would not mean anything.
+            looks_like_code = self._looks_like_code(result)
+            skip_tier2 = (not is_root) and (
+                word_count <= self.SHORT_ANSWER_WORD_THRESHOLD or looks_like_code
+            )
             print(f"  [judge-bypass-check] word_count={word_count} "
                   f"threshold={self.SHORT_ANSWER_WORD_THRESHOLD} "
+                  f"looks_like_code={looks_like_code} "
                   f"will_skip_tier2={skip_tier2} "
                   f"result={str(result)!r}")
             if (self.embed_model is not None and target_embedding is not None
@@ -795,6 +976,32 @@ class Orchestrator:
 
         if verdict["verdict"] == "warn":
             print(f"Judge WARN on {agent_id}/{task_id}: {verdict['reason']}")
+
+            # A WARN sends the agent back to try again. If it comes back with
+            # a byte-identical REPORT, it is not converging -- it has already
+            # shown it will re-derive the same string, and a third strike
+            # spent to arrive at the same place is a wasted cycle (observed:
+            # one agent burning two WARNs on one identical string). Skip
+            # straight to the respawn the strikes would have produced.
+            previous = self.last_warned_report.get(agent_id)
+            if previous is not None and previous == str(result):
+                print(f"  [warn-short-circuit] {agent_id} REPORTed a "
+                      f"byte-identical result after a WARN -- respawning now "
+                      f"instead of spending another strike on the same string.")
+                if agent_node is not None:
+                    agent_node.fail_reason = (
+                        "Previous attempt was REJECTED: you submitted exactly "
+                        "the same REPORT twice after being asked to revise it. "
+                        "Repeating the same output is not a revision -- change "
+                        "the approach, not the wording."
+                    )
+                self.last_warned_report.pop(agent_id, None)
+                role = getattr(agent_node, "role", "worker") if agent_node else "worker"
+                parent_id = getattr(agent_node, "parent_id", None) if agent_node else None
+                self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict)
+                return
+
+            self.last_warned_report[agent_id] = str(result)
             return
 
         if verdict["verdict"] == "execute":
@@ -957,9 +1164,100 @@ class Orchestrator:
                     )
                 return
 
-        print(f"Agent {agent_id} failed. Respawning {role} with ghost context.")
-        self.respawn_counts[task_id] = self.respawn_counts.get(task_id, 0) + 1
+        # A2 attempt cap. Checked here, after the success-cache shortcut
+        # (a cache hit is a completion, not another attempt) and before the
+        # respawn it would otherwise authorise.
+        attempts = self.respawn_counts.get(task_id, 0)
+        if attempts >= self.MAX_TASK_ATTEMPTS:
+            self._abandon_task(task_id, parent_id, agent_id, attempts)
+            return
+
+        print(f"Agent {agent_id} failed. Respawning {role} with ghost context "
+              f"(attempt {attempts + 2} of {self.MAX_TASK_ATTEMPTS + 1} for this task).")
+        self.respawn_counts[task_id] = attempts + 1
         self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id, ghost_context=ghost_context)
+
+    def _abandon_task(self, task_id: str, parent_id: Optional[str],
+                       agent_id: Optional[str], attempts: int):
+        """
+        Terminal disposition for a task that has burned through
+        MAX_TASK_ATTEMPTS respawns without ever satisfying the judge.
+
+        Deliberately NOT task_graph.fail_task: that cascades status=3 down
+        every dependent, which throws away work that could still complete
+        from a partial input. This marks only this task failed, hands the
+        parent the best partial result it produced with an explicit
+        abandonment marker so the parent can reason about the gap instead of
+        stalling on `awaiting`, and releases the dependents the same way a
+        completion would.
+        """
+        self.abandoned_tasks.add(task_id)
+        task_node = self.task_graph.tasks.get(task_id)
+        description = task_node.description if task_node is not None else "<unknown task>"
+
+        partial = self.last_partial_result.get(task_id)
+        if partial is None and task_node is not None:
+            partial = task_node.result
+        if partial is None:
+            partial = self.colony.results.get(task_id)
+        partial_text = str(partial).strip() if partial else ""
+
+        marker = (
+            f"[ABANDONED after {attempts + 1} attempt(s) -- no agent assigned to "
+            f"this subtask produced an acceptable result, so it was stopped "
+            f"rather than recycled further.]"
+        )
+        if partial_text:
+            abandoned_result = (
+                f"{marker}\nBest partial output produced before abandonment "
+                f"(unverified -- it was rejected by review at least once):\n"
+                f"{partial_text}"
+            )
+        else:
+            abandoned_result = f"{marker}\nNo usable output was produced for this subtask."
+
+        print("=" * 62)
+        print(f"TASK ABANDONED: {task_id} -- \"{description}\"")
+        print(f"  {attempts + 1} attempt(s) exhausted (cap MAX_TASK_ATTEMPTS="
+              f"{self.MAX_TASK_ATTEMPTS}). Marking failed and releasing dependents.")
+        print(f"  Salvaged partial: {'yes' if partial_text else 'none'}")
+        print("=" * 62)
+
+        if task_node is not None:
+            task_node.status = 3
+            task_node.result = abandoned_result
+        self.colony.store_result(task_id, abandoned_result)
+
+        # Release dependents. complete_task() does this as a side effect of
+        # marking status=2, which would be a lie here, so the in_degree
+        # bookkeeping is repeated explicitly rather than reused.
+        if task_node is not None:
+            for dependent_id in task_node.dependents:
+                dep_task = self.task_graph.tasks.get(dependent_id)
+                if dep_task is None:
+                    continue
+                dep_task.in_degree -= 1
+                if dep_task.in_degree == 0 and dep_task.agent_id is not None:
+                    dep_task.status = 1
+
+        # A freed fan-out slot is a freed slot whether the child succeeded or
+        # was abandoned -- otherwise a decomposer's queued overflow never
+        # spawns at all once one of its children dies permanently.
+        self._drain_pending_overflow(parent_id)
+
+        if parent_id:
+            self.messenger.push_event(
+                "parent_notification",
+                "orchestrator",
+                {"parent_id": parent_id, "child_id": agent_id, "result": abandoned_result}
+            )
+
+        if task_id == self.root_task_id:
+            # Nothing further can be attempted on the root. tick() sees
+            # status==3 and stops the loop, which lands in terminate()'s
+            # partial-synthesis path instead of spinning to energy death.
+            print("  The ABANDONED task is the ROOT task -- ending the run and "
+                  "synthesizing whatever subtasks did complete.")
 
     @staticmethod
     def _summarize_tool_result(result) -> str:
@@ -1138,6 +1436,9 @@ class Orchestrator:
 
     def tick(self) -> bool:
         """Processes a single heartbeat of the orchestrator loop."""
+        self.tick_count += 1
+        if self.tick_count % self.LEDGER_EVERY_TICKS == 0:
+            self._print_energy_report(header=f"MID-RUN tick {self.tick_count}")
         rem_energy = self._check_energy()
         status = self._get_energy_status(rem_energy)
         self.peak_live_agents = max(self.peak_live_agents, len(self.live_agents))
@@ -1167,12 +1468,14 @@ class Orchestrator:
         self._run_live_agents()
         
         root_task = self.task_graph.tasks.get(self.root_task_id)
-        if root_task and root_task.status == 2:
+        # status 3 as well as 2: the root can now be ABANDONED by the
+        # attempt cap, and there is nothing left to tick once it is.
+        if root_task and root_task.status in (2, 3):
             return False
     
         return True
 
-    def _print_energy_report(self):
+    def _print_energy_report(self, header: str = "final"):
         """Prints the energy ledger, credits, reconciliation, and respawn counts.
 
         A1 deliverable: answers "where did the budget go, and which tasks
@@ -1188,8 +1491,8 @@ class Orchestrator:
             total_debits = sum(ledger.values())
             total_credits = sum(credits.values())
 
-            print("\n" + "=" * 62)
-            print("ENERGY LEDGER (where the budget went)")
+            print(chr(10) + "=" * 62)
+            print(f"ENERGY LEDGER [{header}] (where the budget went)")
             print("=" * 62)
 
             if not ledger:
@@ -1277,10 +1580,23 @@ class Orchestrator:
         if is_successful:
             print("System Status: TERMINATED [SUCCESS]")
             print("The root task successfully completed and synthesized.")
+        elif self.root_task_id in self.abandoned_tasks:
+            print("System Status: TERMINATED [ABANDONED]")
+            print(f"The root task exhausted its {self.MAX_TASK_ATTEMPTS} respawn "
+                  f"attempts without an acceptable result. Synthesizing whatever "
+                  f"subtasks did complete.")
         else:
             rem_energy = self._check_energy()
             print("System Status: TERMINATED [ENERGY DEATH]")
             print(f"The colony depleted its energy allocation. Remaining budget: {rem_energy}")
+
+        if self.abandoned_tasks:
+            print(f"\n  ABANDONED TASKS ({len(self.abandoned_tasks)}) -- hit the "
+                  f"{self.MAX_TASK_ATTEMPTS}-attempt cap:")
+            for abandoned_id in self.abandoned_tasks:
+                abandoned = self.task_graph.tasks.get(abandoned_id)
+                description = abandoned.description if abandoned is not None else "<unknown>"
+                print(f"    {abandoned_id}  {description[:70]}")
 
         # Printed on BOTH exit paths on purpose: a successful run's ledger is
         # the baseline the failing runs get compared against.
@@ -1302,11 +1618,17 @@ class Orchestrator:
                 goal_text = self.spec.get("goal", "") if self.spec else ""
                 try:
                     partial_answer = self.synthesizer.format_output(partial_results, goal_text)
+                    cause = (
+                        "one or more subtasks were abandoned after exhausting "
+                        f"their {self.MAX_TASK_ATTEMPTS} respawn attempts"
+                        if self.abandoned_tasks
+                        else "the colony ran out of its energy budget"
+                    )
                     best_result = (
-                        f"[PARTIAL RESULT -- the colony ran out of its energy budget "
-                        f"before finishing every subtask. {len(partial_results)} "
-                        f"subtask(s) completed and are synthesized below; anything "
-                        f"not mentioned was not reached.]\n\n{partial_answer}"
+                        f"[PARTIAL RESULT -- {cause} before every subtask "
+                        f"finished. {len(partial_results)} subtask(s) completed "
+                        f"and are synthesized below; anything not mentioned was "
+                        f"not reached.]\n\n{partial_answer}"
                     )
                 except Exception as e:
                     print(f"Warning: failed synthesizing partial result: {e}")
