@@ -99,7 +99,17 @@ class Judge:
             # (TracebackSummarizer for code_result, SymPy error for math_result).
             # fast_check surfaces it verbatim -- this string is exactly what
             # the ghost extractor wants for "what not to do" context.
-            error = output.get("data") or output.get("error") or f"status={status}"
+            # "message" first: it is the key ToolRegistry's error results
+            # actually use (the condensed TracebackSummarizer verdict lives
+            # there). Without it every code_result failure collapsed to the
+            # contentless "status=error", discarding the one string the ghost
+            # extractor and the agent both need.
+            error = (
+                output.get("message")
+                or output.get("data")
+                or output.get("error")
+                or f"status={status}"
+            )
             return {"pass": False, "error": str(error)}
 
         if output_type == "text":

@@ -193,6 +193,12 @@ DOMAIN_TIMEOUT_SCALE: Dict[str, float] = {
 }
 
 
+# Name of the file every sandbox script is written to; traceback frames
+# referencing it are the agent's own code (offset by the preambles), anything
+# else is a library frame.
+SANDBOX_SCRIPT_NAME = "sandbox_executor.py"
+
+
 class TracebackSummarizer:
     """
     Mitigates Edge Case 3 (The Traceback Noise Trap).
@@ -201,7 +207,16 @@ class TracebackSummarizer:
     """
 
     @staticmethod
-    def summarize(raw_stderr: str) -> str:
+    def summarize(raw_stderr: str, line_offset: int = 0) -> str:
+        """
+        `line_offset` is the number of preamble lines assemble_script prepended
+        ahead of the agent's own code. Traceback line numbers are absolute in
+        the assembled file, so without subtracting it the agent is told its
+        SyntaxError is on "line 214" of a 6-line script -- a number it cannot
+        map onto anything it wrote, which is worse than no number at all.
+        Frames that resolve above the agent's code (a crash inside a preamble)
+        keep their absolute number and are labelled as sandbox-internal.
+        """
         if not raw_stderr:
             return ""
 
@@ -219,13 +234,22 @@ class TracebackSummarizer:
                     parts = line_stripped.split(',')
                     file_name = os.path.basename(parts[0].split('"')[1])
                     line_no = parts[1].strip()
+                    if line_offset and file_name == SANDBOX_SCRIPT_NAME:
+                        line_no = TracebackSummarizer._rebase_line_number(
+                            line_no, line_offset
+                        )
                     func_name = parts[2].strip() if len(parts) > 2 else ""
                     last_file_context = f"[{file_name} -> {line_no} {func_name}]"
                     last_executed_code = ""
                 except Exception:
                     pass
 
-            elif line.startswith("    "):
+            # A caret/tilde marker line ("      ^^^^") is indented like source
+            # but is not source. Left unguarded it overwrote the offending line
+            # it was pointing at -- so every SyntaxError reached the agent as
+            # "Executed Code: '^'", i.e. with the one piece of information it
+            # needed to fix the call stripped out.
+            elif line.startswith("    ") and not set(line_stripped) <= set("^~ "):
                 last_executed_code = f" Executed Code: '{line_stripped}'"
 
             elif ":" in line and not line.startswith(" "):
@@ -248,6 +272,18 @@ class TracebackSummarizer:
             )
 
         return " | ".join(summary_lines)
+
+    @staticmethod
+    def _rebase_line_number(line_no: str, line_offset: int) -> str:
+        """'line 214' -> 'line 7 of your code' given the preamble offset."""
+        match = re.search(r"line\s+(\d+)", line_no)
+        if not match:
+            return line_no
+        absolute = int(match.group(1))
+        relative = absolute - line_offset
+        if relative < 1:
+            return f"line {absolute} (inside the sandbox preamble, not your code)"
+        return f"line {relative} of your code"
 
 
 class CodeSandboxManager:
@@ -668,6 +704,11 @@ except Exception:
     ) -> str:
         """Assembles safety preambles, network blocks, and the original run script.
 
+        Returns (assembled_script, preamble_line_count). The second value is
+        what TracebackSummarizer needs to translate an absolute traceback line
+        number back into a line of the agent's own code -- without it the agent
+        is handed line numbers from a file it never saw.
+
         effective_timeout is the domain-scaled wall-clock budget run_code
         computed for this execution; it feeds the RLIMIT_CPU backstop at
         2x that value (T18). The resource-limit preamble is appended AFTER
@@ -693,8 +734,12 @@ except Exception:
             )
         )
 
+        preamble = "\n".join(assembled_parts)
         assembled_parts.append(original_code)
-        return "\n".join(assembled_parts)
+        # +1: the join inserts one more newline between the preamble and the
+        # agent's code, so its first line sits at preamble_line_count + 1.
+        preamble_line_count = preamble.count("\n") + 1
+        return "\n".join(assembled_parts), preamble_line_count
 
 
 # Explicit allowlist of agent-callable tools. FIX: list_tools() used to
@@ -978,7 +1023,7 @@ class ToolRegistry:
         scale = DOMAIN_TIMEOUT_SCALE.get(domain, 1.0)
         effective_timeout = int(timeout * scale)
 
-        sanitized_script = CodeSandboxManager.assemble_script(
+        sanitized_script, preamble_line_count = CodeSandboxManager.assemble_script(
             code_string, domain, effective_timeout
         )
 
@@ -1119,7 +1164,9 @@ class ToolRegistry:
                     payload["rng_seed"] = rng_seed
                 return payload
             else:
-                condensed_error = TracebackSummarizer.summarize(stderr)
+                condensed_error = TracebackSummarizer.summarize(
+                    stderr, line_offset=preamble_line_count
+                )
                 return {
                     "status": "error",
                     "reason": "script_crash",

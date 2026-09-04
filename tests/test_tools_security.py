@@ -151,7 +151,7 @@ def test_rlimit_preamble_applies_to_every_domain():
     with AS hard == soft == 1 GB (no self-raise bypass) and CPU at 2x the
     effective timeout. The Data Engineering preamble must no longer carry
     its own copy."""
-    script = CodeSandboxManager.assemble_script("pass", "General Discourse")
+    script, _ = CodeSandboxManager.assemble_script("pass", "General Discourse")
     assert "RLIMIT_AS, (1073741824, 1073741824)" in script
     assert "RLIMIT_CPU, (120, 120)" in script  # default effective_timeout=60
 
@@ -163,7 +163,7 @@ def test_rlimit_preamble_applies_to_every_domain():
 
 def test_rlimit_cpu_doubles_effective_timeout():
     """T18: RLIMIT_CPU must be 2x the effective (domain-scaled) timeout."""
-    script = CodeSandboxManager.assemble_script(
+    script, _ = CodeSandboxManager.assemble_script(
         "pass", "Theoretical Mathematics", effective_timeout=10
     )
     assert "RLIMIT_CPU, (20, 20)" in script
