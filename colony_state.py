@@ -34,6 +34,19 @@ class ColonyState:
         self.goal_embedding = goal_embedding
         self.results = {}
 
+        # Energy accounting (A1). Kept here rather than on Orchestrator
+        # because debit_energy already lives here and this is the object
+        # that owns budget_remaining -- the Orchestrator is reconstructed
+        # per run, the ledger should describe the same object as the budget.
+        #   energy_ledger:  category -> total debited
+        #   energy_credits: category -> total refunded
+        # starting_budget is the figure the ledger reconciles against;
+        # Orchestrator.initialize_colony() overwrites budget_remaining from
+        # the phaser spec and must re-stamp this alongside it.
+        self.starting_budget = initial_budget
+        self.energy_ledger = {}
+        self.energy_credits = {}
+
     def register_agent(self, agent: AgentNode):
         self.agents[agent.agent_id] = agent
         parent = agent.parent_id
@@ -52,13 +65,37 @@ class ColonyState:
         else:
             print(f"Warning: {agent_id} invalid for status update.")
 
-    def debit_energy(self, agent_id: str, amount: int):
+    def debit_energy(self, agent_id: str, amount: int, category: str = "uncategorized"):
+        """Spends `amount` from the colony budget and records it under `category`.
+
+        The budget is decremented WHETHER OR NOT the agent is still
+        registered. Previously the else-branch printed a warning and paid
+        nothing, which made a slice of the respawn cost invisible --
+        _kill_and_respawn() calls unregister_agent() before some debits
+        land, so those were free. A cost you cannot attribute to an agent
+        is still a cost you paid; it is booked under the "orphaned" ledger
+        key instead, and only the per-agent energy_spent attribution is
+        skipped.
+
+        `category` defaults so that a missed call site does not break --
+        it shows up as an "uncategorized" row in terminate()'s ledger
+        table instead.
+        """
         agent = self.agents.get(agent_id)
         if agent:
             agent.energy_spent += amount
             self.budget_remaining -= amount
+            self.energy_ledger[category] = self.energy_ledger.get(category, 0) + amount
         else:
-            print(f"Warning: {agent_id} invalid for energy debit.")
+            print(f"Warning: {agent_id} invalid for energy debit "
+                  f"(category={category}) -- charging budget as 'orphaned'.")
+            self.budget_remaining -= amount
+            self.energy_ledger["orphaned"] = self.energy_ledger.get("orphaned", 0) + amount
+
+    def credit_energy(self, amount: int, category: str = "uncategorized"):
+        """Refunds `amount` to the colony budget and records it under `category`."""
+        self.budget_remaining += amount
+        self.energy_credits[category] = self.energy_credits.get(category, 0) + amount
 
     def can_spawn(self, cost: int) -> bool:
         return self.budget_remaining >= cost
@@ -157,6 +194,8 @@ class ColonyState:
         """
         idle_agents = [aid for aid, a in self.agents.items() if a.status == "idle"]
         for aid in idle_agents:
-            self.budget_remaining += 2
+            # Routed through credit_energy so a stress-triggered merge shows
+            # up as a line item instead of silently topping up the budget.
+            self.credit_energy(2, category="consolidation")
             self.unregister_agent(aid)
         return idle_agents

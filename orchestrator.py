@@ -59,6 +59,16 @@ class Orchestrator:
         # Populated by initialize_colony() once Problem_Phaser has run.
         self.spec: Optional[Dict[str, Any]] = None
 
+        # A1 observation only: task_id -> number of times _kill_and_respawn
+        # has respawned an agent for that task. No cap is enforced here --
+        # a task_id sitting at 14 respawns with no completion is the
+        # signature of the respawn loop, and seeing that number is the
+        # whole point before any control flow changes to react to it.
+        self.respawn_counts: Dict[str, int] = {}
+
+        # High-water mark of len(self.live_agents), sampled once per tick.
+        self.peak_live_agents = 0
+
         # Live Agent objects (the think/decide/execute reasoning wrapper),
         # keyed by agent_id. Distinct from ColonyState.agents, which only
         # holds the AgentNode data records. Previously nothing populated
@@ -203,17 +213,18 @@ class Orchestrator:
                     agent_node.last_active = time.time()
 
                     crash_cost = self.energy_when_new_by_role.get(live_agent.role, self.energy_when_new)
-                    self.colony.debit_energy(agent_id, crash_cost)
+                    self.colony.debit_energy(agent_id, crash_cost, category="crash")
 
                     agent_node.fail_reason = fail_reason
                     agent_node.crash_count += 1
                     give_up = agent_node.crash_count >= self.MAX_CONSECUTIVE_CRASHES
                     crash_label = f"{agent_node.crash_count} times in a row"
                 else:
-                    # No colony node: debit_energy is a no-op for an
-                    # unregistered id and there's nowhere to keep a crash
-                    # count, so a live_agent in this state would crash-loop
-                    # for free, forever. Route it out on the first crash.
+                    # No colony node: there's nowhere to keep a crash
+                    # count (the debit itself is no longer free -- it would
+                    # book under "orphaned" -- but an uncounted crash-loop
+                    # would still retry forever). Route it out on the first
+                    # crash.
                     crash_label = "with no registered colony node"
 
                 if give_up:
@@ -237,7 +248,7 @@ class Orchestrator:
 
             new_chars = len(live_agent.thought_process) - prev_len
             cost = max(1, new_chars // 100)
-            self.colony.debit_energy(agent_id, cost)
+            self.colony.debit_energy(agent_id, cost, category="think_tick")
 
     def initialize_colony(self, problem_spec: str):
         """System entry point. Bootstraps the first task and the root agent."""
@@ -258,6 +269,10 @@ class Orchestrator:
         self.spec = spec
 
         self.colony.budget_remaining = spec.get("colony_budget", self.colony.budget_remaining)
+        # The phaser's budget replaces whatever ColonyState was constructed
+        # with, so the ledger's reconciliation baseline has to move with it.
+        # Safe here: no debit has landed yet (the root spawn is below).
+        self.colony.starting_budget = self.colony.budget_remaining
         self.colony.goal_embedding = spec.get("goal_vector")
 
         goal_text = spec.get("goal", problem_spec)
@@ -330,7 +345,7 @@ class Orchestrator:
         self.task_graph.assign_agent(task_id, agent_id)
         
         # Debit the initialization energy cost from the colony budget
-        self.colony.debit_energy(agent_id, spawn_cost)
+        self.colony.debit_energy(agent_id, spawn_cost, category="spawn")
         self.agent_counter += 1
 
         if self.model is not None and self.tokeniser is not None:
@@ -667,7 +682,7 @@ class Orchestrator:
         live_parent.thought_process += injected_text
 
         injection_cost = max(1, len(injected_text) // 100)
-        self.colony.debit_energy(parent_id, injection_cost)
+        self.colony.debit_energy(parent_id, injection_cost, category="injection")
 
         live_parent.awaiting = None
 
@@ -774,7 +789,7 @@ class Orchestrator:
 
             if verdict.get("tier") == 3:
                 critique_cost = max(1, len(str(verdict.get("reason", ""))) // 100)
-                self.colony.debit_energy(agent_id, critique_cost)
+                self.colony.debit_energy(agent_id, critique_cost, category="tier3_critique")
                 print(f"  [judge tier-3 cost] agent={agent_id} deep_critique "
                       f"debited {critique_cost} energy (previously untracked).")
 
@@ -943,6 +958,7 @@ class Orchestrator:
                 return
 
         print(f"Agent {agent_id} failed. Respawning {role} with ghost context.")
+        self.respawn_counts[task_id] = self.respawn_counts.get(task_id, 0) + 1
         self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id, ghost_context=ghost_context)
 
     @staticmethod
@@ -1124,6 +1140,7 @@ class Orchestrator:
         """Processes a single heartbeat of the orchestrator loop."""
         rem_energy = self._check_energy()
         status = self._get_energy_status(rem_energy)
+        self.peak_live_agents = max(self.peak_live_agents, len(self.live_agents))
 
         try:
             import torch
@@ -1155,6 +1172,80 @@ class Orchestrator:
     
         return True
 
+    def _print_energy_report(self):
+        """Prints the energy ledger, credits, reconciliation, and respawn counts.
+
+        A1 deliverable: answers "where did the budget go, and which tasks
+        cycled?" at the end of every run. Read-only -- it must never be able
+        to change the outcome of a run, hence the broad guard at the bottom.
+        """
+        try:
+            ledger = dict(getattr(self.colony, "energy_ledger", {}) or {})
+            credits = dict(getattr(self.colony, "energy_credits", {}) or {})
+            start = getattr(self.colony, "starting_budget", None)
+            remaining = getattr(self.colony, "budget_remaining", 0)
+
+            total_debits = sum(ledger.values())
+            total_credits = sum(credits.values())
+
+            print("\n" + "=" * 62)
+            print("ENERGY LEDGER (where the budget went)")
+            print("=" * 62)
+
+            if not ledger:
+                print("  (no energy was debited this run)")
+            else:
+                print(f"  {'category':<20}{'total':>10}{'% of start':>14}")
+                for category, total in sorted(ledger.items(), key=lambda kv: -kv[1]):
+                    pct = f"{(100.0 * total / start):.1f}%" if start else "n/a"
+                    print(f"  {category:<20}{total:>10}{pct:>14}")
+                print(f"  {'-' * 44}")
+                print(f"  {'TOTAL DEBITED':<20}{total_debits:>10}")
+
+            print("\n  CREDITS (refunds)")
+            if not credits:
+                print("    (none)")
+            else:
+                for category, total in sorted(credits.items(), key=lambda kv: -kv[1]):
+                    print(f"    {category:<18}{total:>10}")
+                print(f"    {'TOTAL CREDITED':<18}{total_credits:>10}")
+
+            # These three must agree. If they don't, there is an energy path
+            # writing budget_remaining directly instead of going through
+            # debit_energy/credit_energy -- find it before tuning anything.
+            expected = (start - total_debits + total_credits) if start is not None else None
+            print("\n  RECONCILIATION")
+            print(f"    starting budget            : {start}")
+            print(f"    start - debits + credits   : {expected}")
+            print(f"    colony.budget_remaining    : {remaining}")
+            if expected is None:
+                print("    [WARN] no starting_budget recorded -- cannot reconcile.")
+            elif expected != remaining:
+                print(f"    [MISMATCH] delta = {remaining - expected} -- there is an "
+                      f"energy path bypassing debit_energy/credit_energy.")
+            else:
+                print("    [OK] ledger reconciles with the remaining budget.")
+
+            print("\n  RESPAWNS (top 10 by count)")
+            respawns = getattr(self, "respawn_counts", {}) or {}
+            if not respawns:
+                print("    (no respawns this run)")
+            else:
+                for task_id, count in sorted(respawns.items(), key=lambda kv: -kv[1])[:10]:
+                    task = self.task_graph.tasks.get(task_id)
+                    status = task.status if task is not None else "?"
+                    description = (task.description or "") if task is not None else "<unknown task>"
+                    if len(description) > 60:
+                        description = description[:57] + "..."
+                    print(f"    {count:>3}x  status={status}  {task_id}  {description}")
+
+            live_count = getattr(self, "_live_agents_at_terminate", len(self.live_agents))
+            print(f"\n  live_agents at terminate : {live_count}")
+            print(f"  peak live_agents        : {getattr(self, 'peak_live_agents', 'n/a')}")
+            print("=" * 62 + "\n")
+        except Exception:
+            print(f"Warning: failed printing energy report:\n{traceback.format_exc()}")
+
     def terminate(self) -> Any:
         """
         1. Prints system resolution (Success or Energy Death).
@@ -1164,6 +1255,10 @@ class Orchestrator:
         """
         self.running = False
         self.run_trace = self.colony.get_snapshot()
+
+        # Captured before the teardown below empties the dict -- the energy
+        # report is printed after it and would otherwise always read 0.
+        self._live_agents_at_terminate = len(self.live_agents)
 
         for live_agent in self.live_agents.values():
             live_agent.KV_Cache = None
@@ -1186,6 +1281,10 @@ class Orchestrator:
             rem_energy = self._check_energy()
             print("System Status: TERMINATED [ENERGY DEATH]")
             print(f"The colony depleted its energy allocation. Remaining budget: {rem_energy}")
+
+        # Printed on BOTH exit paths on purpose: a successful run's ledger is
+        # the baseline the failing runs get compared against.
+        self._print_energy_report()
 
         best_result = self.colony.results.get("final_spec")
 
