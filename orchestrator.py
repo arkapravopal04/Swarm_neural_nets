@@ -945,6 +945,42 @@ class Orchestrator:
         print(f"Agent {agent_id} failed. Respawning {role} with ghost context.")
         self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id, ghost_context=ghost_context)
 
+    @staticmethod
+    def _summarize_tool_result(result) -> str:
+        """
+        The single string an agent actually gets to read about its tool call.
+
+        The previous `result.get("data") or result.get("message") or str(result)`
+        had two holes that both ended with the agent unable to act:
+          - a successful run whose script printed nothing has data == "",
+            which is falsy, so the agent was handed the raw dict repr;
+          - an error carried its "reason" ("script_crash", "timeout",
+            "output_overflow") only inside that repr, so a condensed
+            TracebackSummarizer line arrived with no marker saying it WAS a
+            failure -- easy for the model to read as ordinary output.
+        Status is now stated explicitly and the reason is kept alongside the
+        message.
+        """
+        if not isinstance(result, dict):
+            return str(result)
+
+        status = result.get("status")
+        if status == "success":
+            data = result.get("data")
+            if data is None:
+                data = result.get("message")
+            if data is None or str(data).strip() == "":
+                return ("SUCCESS: the tool ran without error but produced no "
+                        "output. If you expected output, your code did not "
+                        "print anything -- add a print() of the value you "
+                        "need.")
+            return f"SUCCESS: {data}"
+
+        reason = result.get("reason")
+        message = result.get("message") or result.get("data") or str(result)
+        reason_str = f" ({reason})" if reason else ""
+        return f"ERROR{reason_str}: {message}"
+
     def handle_tool_request(self, event: Event):
         """Handles external tool execution requests from agents."""
         payload = event.payload
@@ -967,11 +1003,25 @@ class Orchestrator:
         if self.judge is not None:
             fast_result = self.judge.fast_check(result, output_type)
 
-        summary = result.get("data") or result.get("message") or str(result)
+        summary = self._summarize_tool_result(result)
+
+        # Whether the call succeeded is decided by the tool's own status
+        # first, and only then narrowed by the judge. Reading it off
+        # fast_result alone had two failure modes that both told the agent an
+        # error was a success -- clearing its fail_reason and (since the
+        # consecutive-failure circuit breaker counts these) letting a call
+        # that fails every time run to the 15-attempt ceiling:
+        #   - with no judge configured, fast_result was hardcoded to pass;
+        #   - for any tool other than run_code/verify_math, output_type is
+        #     "text", and fast_check's text branch only asks "is this
+        #     non-empty?" -- an error dict is non-empty, so a failed
+        #     write_file/safe_read_file/query_dataframe passed.
+        tool_ok = not (isinstance(result, dict) and result.get("status") == "error")
+        success = tool_ok and bool(fast_result["pass"])
 
         live_agent = self.live_agents.get(agent_id)
         if live_agent is not None:
-            live_agent.receive_tool_result(tool_name, str(summary), fast_result["pass"])
+            live_agent.receive_tool_result(tool_name, summary, success)
 
         self.messenger.push_event(
             "tool_response",

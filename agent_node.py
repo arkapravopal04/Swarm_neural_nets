@@ -28,6 +28,7 @@ from transformers import StoppingCriteria, StoppingCriteriaList
 import ast
 import re
 import json
+from collections import deque
 
 
 class _ActionPayloadStop(StoppingCriteria):
@@ -99,7 +100,26 @@ class Agent:
         self.model = model
         self.thought_process = ""
         self.last_tool_result = None
-        self.last_tool_call = None
+        # FIX (retry loop): a single-slot `last_tool_call` only ever caught a
+        # call identical to the *immediately* preceding one, and compared the
+        # args byte-for-byte. Both holes fired together in practice: an agent
+        # resubmitting "print(x)" then a newline-prefixed copy of it and
+        # then "print(x)" again
+        # matched neither the previous slot nor the exact-string compare, so
+        # all seven identical-in-substance calls sailed through to the 15-call
+        # ceiling. A short window of whitespace-normalized signatures catches
+        # that pattern on call two.
+        self.recent_tool_calls = deque(maxlen=self.TOOL_CALL_HISTORY)
+        # Statuses of the most recent tool results, for the consecutive-failure
+        # circuit breaker. A repeated *failing* call is worse than a repeated
+        # successful one and gets a much tighter bound than the 15-call ceiling.
+        self.recent_tool_errors = deque(maxlen=self.MAX_CONSECUTIVE_TOOL_FAILURES)
+        # The error text behind those failures, so the circuit breaker can
+        # hand the agent what actually went wrong instead of just a count.
+        self.recent_tool_error_text = deque(maxlen=self.MAX_CONSECUTIVE_TOOL_FAILURES)
+        # Set when request_tool had to repair a mangled tool_name, so the
+        # agent is told what its spelling actually resolved to.
+        self.pending_tool_name_correction = None
         self.last_token_id = None
         self._total_generated = 0
         # actions
@@ -210,6 +230,10 @@ class Agent:
             ),
         }
         positive = examples.get(self.role, examples["executor"])
+        if self.tool_circuit_open and positive.startswith("ACTION: TOOL"):
+            # Showing a TOOL example while TOOL is refused is the single
+            # strongest nudge back into the loop we are trying to break.
+            positive = examples["verifier"]
 
         executor_spawn_example = (
             'Example of a valid response when YOUR task turns out to be too '
@@ -415,8 +439,17 @@ class Agent:
             "Constraints you must satisfy:\n" + "\n".join(f"- {r}" for r in requirements) + "\n"
             if requirements else ""
         )
-        tools_str = f"Tools actually available to you: {available_tools}\n" if available_tools else ""
-        actions_str = "Real actions that exist: THINK, SPAWN, TOOL, REPORT, DIE (no others exist).\n"
+        tools_str = (
+            f"Tools actually available to you: {available_tools}\n"
+            if available_tools and not self.tool_circuit_open else ""
+        )
+        actions_str = (
+            "Real actions that exist: THINK, SPAWN, REPORT, DIE (TOOL is "
+            "closed to you after repeated tool failures -- do not attempt "
+            "it).\n"
+            if self.tool_circuit_open else
+            "Real actions that exist: THINK, SPAWN, TOOL, REPORT, DIE (no others exist).\n"
+        )
         ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
         fail_str = f"WARNING - Previous Action Failed: {self.fail_reason}\n" if self.fail_reason else ""
         tool_result_str = (
@@ -460,6 +493,20 @@ class Agent:
         format_example_str = self._get_format_example()
         role_constraint_str = self._get_role_constraint_str()
 
+        # Circuit breaker open: TOOL is refused by request_tool anyway, so
+        # advertising it here only invites another wasted decide() cycle that
+        # gets bounced. Drop it from the menu and say why.
+        if self.tool_circuit_open:
+            tool_action_line = (
+                "- TOOL   — UNAVAILABLE. Your last "
+                f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} tool calls all failed; "
+                "further TOOL actions are refused. Do not attempt one.\n"
+            )
+        else:
+            tool_action_line = (
+                f"- TOOL   — call an external tool. Available tools: {available_tools}.\n"
+            )
+
         prompt = f"""You are an AI agent in a colony of agents working together to solve problems.
 Your Agent ID: {self.agent_id}
 Your Role: {self.role}
@@ -469,8 +516,7 @@ Your Role: {self.role}
 Available actions:
 - THINK  — continue reasoning before acting (Use this to plan your next move).
 - SPAWN  — create a sub-agent to handle a sub-task. Available roles: {available_roles}.
-- TOOL   — call an external tool. Available tools: {available_tools}.
-- REPORT — your task is complete, submit your final result to your parent.
+{tool_action_line}- REPORT — your task is complete, submit your final result to your parent.
 - DIE    — you cannot complete this task, signal failure to your parent.
 
 OUTPUT FORMAT INSTRUCTIONS:
@@ -869,6 +915,127 @@ Your next action:"""
         self.awaiting = "children"
 
     MAX_TOOL_ATTEMPTS_PER_AGENT = 15
+    # How many recent tool-call signatures to remember for duplicate
+    # detection. Long enough to catch an A -> B -> A alternation, short
+    # enough that a genuinely iterative agent (edit, run, edit, run) is
+    # not blocked from revisiting a call several steps later.
+    TOOL_CALL_HISTORY = 5
+    # Consecutive error-returning tool calls tolerated before TOOL is
+    # refused outright. Deliberately far below MAX_TOOL_ATTEMPTS_PER_AGENT:
+    # a call that keeps failing is not converging, and letting it run to 15
+    # just burns energy producing the same SyntaxError fifteen times.
+    MAX_CONSECUTIVE_TOOL_FAILURES = 3
+
+    @staticmethod
+    def _normalize_args_for_signature(value):
+        r"""
+        Whitespace-insensitive view of a tool's args, for duplicate detection.
+
+        The model regenerates the *same* call with cosmetically different
+        whitespace constantly -- a leading newline, a trailing one, an extra
+        blank line between statements. Byte-comparing the JSON treats those
+        as distinct calls; normalizing them away treats them as what they
+        are: the same call again.
+
+        LEADING INDENTATION IS PRESERVED, deliberately. The obvious
+        implementation -- re.sub(r"\s+", " ", value) -- collapses
+        indentation too, and in Python indentation *is* the program:
+
+            "if x:\n    print(1)\n    print(2)"   (both prints in the branch)
+            "if x:\n    print(1)\nprint(2)"       (second print unconditional)
+
+        both flatten to "if x: print(1) print(2)". Those are two different
+        programs, and an agent that just fixed an IndentationError by
+        re-indenting a block would have its corrected call rejected as a
+        duplicate of the broken one -- turning this guard into the very
+        loop it exists to break. So: per line, expand tabs, collapse runs
+        of intra-line whitespace, drop trailing whitespace and blank lines,
+        keep the indent.
+        """
+        if isinstance(value, str):
+            normalized_lines = []
+            for line in value.expandtabs(4).splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue  # blank lines never change a call's meaning
+                indent = line[:len(line) - len(line.lstrip())]
+                normalized_lines.append(indent + re.sub(r"\s+", " ", stripped))
+            return "\n".join(normalized_lines)
+        if isinstance(value, dict):
+            return {k: Agent._normalize_args_for_signature(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [Agent._normalize_args_for_signature(v) for v in value]
+        return value
+
+    @classmethod
+    def _tool_call_signature(cls, tool_name, args):
+        """(canonical_tool_name, whitespace-normalized args) as a hashable key."""
+        normalized_args = cls._normalize_args_for_signature(args)
+        try:
+            args_key = json.dumps(normalized_args, sort_keys=True, default=str)
+        except TypeError:
+            args_key = str(normalized_args)
+        return (tool_name, args_key)
+
+    def _canonicalize_tool_name(self, raw_name):
+        """
+        Resolve a possibly-mangled tool name to its canonical spelling HERE,
+        at the agent, rather than only inside ToolRegistry.execute().
+
+        ToolRegistry already repairs "__run_code__" -> "run_code" before
+        dispatch, but it repairs it privately: the agent's own duplicate
+        history, the orchestrator's log line and the echoed result all kept
+        carrying whatever the agent typed. So an agent alternating between
+        two spellings of one tool saw two "different" calls both succeed,
+        with nothing anywhere telling it its spelling was wrong. Canonical
+        name in, canonical name stored/logged/echoed back out.
+
+        Returns (canonical_name, correction_note_or_None).
+        """
+        available = self._default_available_tools()
+        canonical = normalize_identifier(raw_name, available, cutoff=0.75)
+        if canonical and canonical != raw_name:
+            return canonical, (
+                f"NOTE: you wrote the tool name as {raw_name!r}; it was "
+                f"interpreted as '{canonical}'. Use '{canonical}' exactly "
+                f"from now on."
+            )
+        # No confident match: leave it alone and let ToolRegistry.execute()
+        # produce its "not found / did you mean" error, which is more
+        # informative than anything that can be said here.
+        return (canonical or raw_name), None
+
+    @property
+    def tool_circuit_open(self):
+        """
+        True once MAX_CONSECUTIVE_TOOL_FAILURES tool calls in a row have come
+        back with an error. While open, no further TOOL action is accepted --
+        the agent's only remaining moves are REPORT (with whatever it has) or
+        DIE.
+        """
+        return (
+            len(self.recent_tool_errors) >= self.MAX_CONSECUTIVE_TOOL_FAILURES
+            and all(self.recent_tool_errors)
+        )
+
+    def _accumulated_tool_errors_text(self):
+        """The error text behind an open circuit, oldest first."""
+        if not self.recent_tool_error_text:
+            return "  (no error text was captured)"
+        return "\n".join(
+            f"  ({i}) {err}" for i, err in enumerate(self.recent_tool_error_text, 1)
+        )
+
+    def _push_tool_budget_failure(self):
+        event = Event(type="failure_request", from_agent=self.agent_id)
+        event.payload.update({
+            "agent_id": self.agent_id,
+            "parent_id": self.parent_id,
+            "task_id": self.task_id,
+            "role": self.role,
+            "result": str(self.fail_reason),
+        })
+        self.message.push(event)
 
     def request_tool(self, payload):
         """Calls an external tool."""
@@ -879,36 +1046,45 @@ Your next action:"""
 
         self.node.tool_call_count = getattr(self.node, "tool_call_count", 0) + 1
 
-        try:
-            call_signature = (payload["tool_name"], json.dumps(payload["args"], sort_keys=True, default=str))
-        except TypeError:
-            call_signature = (payload["tool_name"], str(payload["args"]))
-        if call_signature == self.last_tool_call:
+        tool_name, correction_note = self._canonicalize_tool_name(payload["tool_name"])
+        args = payload["args"]
+
+        if self.tool_circuit_open:
             self.fail_reason = (
-                f"You just submitted this exact same '{payload['tool_name']}' "
-                f"call with identical arguments and already have its result "
-                f"above (see 'Result of your most recent TOOL call'). "
-                f"Repeating it wastes energy without new information -- use "
-                f"that result, try genuinely different arguments, or move "
-                f"to REPORT/DIE."
+                f"TOOL is no longer available to you: your last "
+                f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} tool calls ALL failed:\n"
+                f"{self._accumulated_tool_errors_text()}\n"
+                f"Stop calling tools. Choose REPORT (submit your best "
+                f"partial result and state plainly what you could not "
+                f"verify) or DIE (explain why this task cannot be "
+                f"completed). Those are your only two options now."
             )
-            print(f"  [request_tool() BLOCKED - exact duplicate] {call_signature}")
+            print(f"  [request_tool() BLOCKED - circuit breaker after "
+                  f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} consecutive failures] {tool_name}")
+            return
+
+        call_signature = self._tool_call_signature(tool_name, args)
+
+        if call_signature in self.recent_tool_calls:
+            self.fail_reason = (
+                f"You already submitted this exact '{tool_name}' call -- same "
+                f"arguments, ignoring whitespace -- within your last "
+                f"{self.TOOL_CALL_HISTORY} tool calls, and already have its "
+                f"result above (see 'Result of your most recent TOOL call'). "
+                f"Reformatting the same call (adding a newline, re-indenting) "
+                f"does not make it a new call. Use that result, try genuinely "
+                f"different arguments, or move to REPORT/DIE."
+            )
+            print(f"  [request_tool() BLOCKED - duplicate within last "
+                  f"{self.TOOL_CALL_HISTORY}] {call_signature}")
             if self.node.tool_call_count > self.MAX_TOOL_ATTEMPTS_PER_AGENT:
                 self.fail_reason = (
                     f"Exceeded {self.MAX_TOOL_ATTEMPTS_PER_AGENT} TOOL attempts "
-                    f"(including blocked exact-duplicate ones) without "
+                    f"(including blocked duplicate ones) without "
                     f"converging to REPORT. Stop iterating and report your "
                     f"best result so far."
                 )
-                event = Event(type="failure_request", from_agent=self.agent_id)
-                event.payload.update({
-                    "agent_id": self.agent_id,
-                    "parent_id": self.parent_id,
-                    "task_id": self.task_id,
-                    "role": self.role,
-                    "result": str(self.fail_reason),
-                })
-                self.message.push(event)
+                self._push_tool_budget_failure()
             return
 
         if self.node.tool_call_count > self.MAX_TOOL_ATTEMPTS_PER_AGENT:
@@ -917,27 +1093,24 @@ Your next action:"""
                 f"(including malformed ones) without converging to REPORT. "
                 f"Stop iterating and report your best result so far."
             )
-            event = Event(type="failure_request", from_agent=self.agent_id)
-            event.payload.update({
-                "agent_id": self.agent_id,
-                "parent_id": self.parent_id,
-                "task_id": self.task_id,
-                "role": self.role,
-                "result": str(self.fail_reason),
-            })
-            self.message.push(event)
+            self._push_tool_budget_failure()
             return
 
         self.fail_reason = None
-        self.last_tool_call = call_signature
+        self.recent_tool_calls.append(call_signature)
+        self.pending_tool_name_correction = correction_note
+        if correction_note:
+            print(f"  [request_tool() NAME REPAIRED] {payload['tool_name']!r} -> {tool_name!r}")
 
         event = Event(type="tool_request", from_agent=self.agent_id)
         event.payload.update({
             "agent_id": self.agent_id,
-            "tool_name": payload["tool_name"],
-            "args": payload["args"]
+            # Canonical name, so the orchestrator logs it, ToolRegistry sees
+            # it already-resolved, and receive_tool_result echoes it back.
+            "tool_name": tool_name,
+            "args": args
         })
-        
+
         self.message.push(event)
 
     def report(self, payload):
@@ -977,12 +1150,43 @@ Your next action:"""
         """
         Injects a TOOL action's outcome back into this agent's own context so
         its next think()/decide() cycle actually sees what happened.
+
+        `tool_name` is the canonical name request_tool resolved and sent --
+        not whatever the agent originally typed -- so a mangled spelling is
+        visibly corrected here rather than silently accepted.
+
+        Also feeds the consecutive-failure circuit breaker: this is the only
+        place that learns whether a call actually worked.
         """
+        result_summary = str(result_summary)
+        if self.pending_tool_name_correction:
+            result_summary = f"{self.pending_tool_name_correction}\n{result_summary}"
+            self.pending_tool_name_correction = None
+
         self.thought_process += f"\n[TOOL RESULT - {tool_name}]: {result_summary}\n"
         self.last_tool_result = f"[TOOL RESULT - {tool_name}]: {result_summary}"
+
+        self.recent_tool_errors.append(not success)
+
         if not success:
+            self.recent_tool_error_text.append(
+                _dedupe_repeated_sentences(f"{tool_name}: {result_summary}", max_chars=300)
+            )
             self.fail_reason = f"Tool call to '{tool_name}' failed: {result_summary}"
+            if self.tool_circuit_open:
+                # Nth consecutive failure: say so now, in the same context the
+                # agent reads before its next decide(), rather than waiting for
+                # it to attempt an (N+1)th call and get bounced by request_tool.
+                self.fail_reason = (
+                    f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} tool calls in a row "
+                    f"have now failed:\n{self._accumulated_tool_errors_text()}\n"
+                    f"TOOL is closed to you. REPORT your best partial result "
+                    f"(saying what you could not verify) or DIE."
+                )
+                print(f"  [receive_tool_result() CIRCUIT OPEN] agent={self.agent_id} "
+                      f"after {self.MAX_CONSECUTIVE_TOOL_FAILURES} consecutive tool failures")
         else:
+            self.recent_tool_error_text.clear()
             self.fail_reason = None
 
     def run(self, available_roles=None, available_tools=None, requirements=None):
