@@ -24,9 +24,65 @@ from text_utils import (
     strip_scaffolding_lines,
 )
 import torch
+from transformers import StoppingCriteria, StoppingCriteriaList
 import ast
 import re
 import json
+
+
+class _ActionPayloadStop(StoppingCriteria):
+    """
+    N3: real early-stop for decide()'s generation, checked every step.
+
+    Without this, decide() always burns its full max_new_tokens budget --
+    confirmed via real decide() calls discarding ~1000-1300 trailing chars
+    (roughly two-thirds of the 400-token budget) every single time, all of
+    it generated then thrown away by the post-hoc extraction below ("N3-lite":
+    _extract_first_balanced_object trims the wasted tail AFTER the fact,
+    it never stops generation from producing that tail in the first place).
+    This stops the model the moment its own output already contains a
+    complete ACTION:/PAYLOAD: block, so the wasted tokens are never
+    generated at all.
+
+    Only decodes the NEWLY generated suffix (input_ids sliced at
+    prompt_len) each step -- decoding the whole sequence repeatedly would
+    re-scan the entire prompt (which can itself contain "ACTION:"/
+    "PAYLOAD:" as instructional text) on every one of the ~400 steps.
+    """
+
+    def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10):
+        self.tokenizer = tokenizer
+        self.prompt_len = prompt_len
+        self.extract_balanced_object = extract_balanced_object
+        self.min_new_tokens = min_new_tokens
+
+    def __call__(self, input_ids, scores, **kwargs):
+        new_ids = input_ids[0][self.prompt_len:]
+        if len(new_ids) < self.min_new_tokens:
+            return False
+
+        text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+
+        if not re.search(r"ACTION:\s*[A-Za-z]+", text, re.IGNORECASE):
+            return False
+        payload_match = re.search(r"PAYLOAD:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+        if not payload_match:
+            return False
+        payload_raw = payload_match.group(1).strip()
+        if not payload_raw:
+            return False
+
+        if payload_raw.startswith("{"):
+            # JSON-shaped payload (SPAWN/TOOL) -- only complete once the
+            # object actually balances; mirrors decide()'s own parser so
+            # this never stops mid-object.
+            return self.extract_balanced_object(payload_raw) is not None
+
+        # Plain-text payload (REPORT/THINK/DIE) -- no structural closer to
+        # wait for, so a blank line after real content is treated as "the
+        # model considers this done" (matches how format_example_str's own
+        # examples are paragraph-separated).
+        return text.endswith("\n\n")
 
 
 class Agent:
@@ -565,6 +621,16 @@ Your next action:"""
 
         prompt = self._build_prompt(available_roles, available_tools, requirements)
         inputs = self.tokeniser(prompt , return_tensors = "pt").to(self.model.device)
+        prompt_len = inputs["input_ids"].shape[1]
+
+        # N3: stop the moment a complete ACTION:/PAYLOAD: block exists,
+        # instead of always running the full max_new_tokens budget and
+        # discarding the wasted tail after the fact. Stateless (only reads
+        # input_ids each call), so the same instance is reused across the
+        # retry loop below.
+        stopping_criteria = StoppingCriteriaList([
+            _ActionPayloadStop(self.tokeniser, prompt_len, self._extract_first_balanced_object)
+        ])
 
         generated_text = None
         for attempt in range(3):
@@ -575,6 +641,7 @@ Your next action:"""
                 pad_token_id=self.tokeniser.eos_token_id,
                 do_sample=use_sampling,
                 repetition_penalty=1.15,
+                stopping_criteria=stopping_criteria,
                 # FIX: repetition_penalty alone discounts logits per-token,
                 # cumulatively over the sequence -- it doesn't reliably
                 # block a multi-word PHRASE from recurring if its individual
@@ -594,8 +661,7 @@ Your next action:"""
                 gen_kwargs["temperature"] = 0.7
             with torch.no_grad():
                 outputs = self.model.generate(**inputs, **gen_kwargs)
-            input_length = inputs["input_ids"].shape[1]
-            generated_tokens = outputs[0][input_length:]
+            generated_tokens = outputs[0][prompt_len:]
             generated_text = self.tokeniser.decode(generated_tokens, skip_special_tokens=True).strip()
 
             if not self._looks_degenerate(generated_text):

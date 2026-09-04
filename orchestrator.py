@@ -90,6 +90,19 @@ class Orchestrator:
         self.MAX_SUBTASKS_ROOT = 3
         self.MAX_SUBTASKS_NON_ROOT = 2
 
+        # A decomposer's SPAWN batch over the fan-out cap used to get its
+        # overflow crammed into one bundled child -- which, being several
+        # unrelated items forced into one agent, reliably DIEd as "TASK TOO
+        # LARGE" and got re-split anyway (a wasted respawn cycle, twice per
+        # run at cap=2/3). Now the overflow beyond `cap` is parked here
+        # (keyed by the decomposer's agent_id, already fully resolved --
+        # see handle_spawn) and drained one item at a time in
+        # _drain_pending_overflow, called whenever one of that decomposer's
+        # children genuinely completes and frees a slot. Keeps the same
+        # "at most `cap` concurrently in-flight children" invariant the cap
+        # exists for, without discarding or force-merging anything.
+        self.pending_overflow: Dict[str, list] = {}
+
         self.energy_map = {
             0: "fine",
             1: "stressed",
@@ -460,6 +473,34 @@ class Orchestrator:
 
         self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id, ghost_context=combined_context)
 
+    def _drain_pending_overflow(self, parent_id: Optional[str]):
+        """
+        Spawns exactly one queued overflow subtask (if any) for this
+        decomposer -- called whenever one of its children genuinely
+        completes and frees a fan-out slot. See pending_overflow's
+        docstring in __init__ for why this replaces the old
+        bundle-into-one-oversized-child approach.
+
+        Draining exactly one per freed slot maintains the same "at most
+        `cap` concurrently in-flight children" invariant the batch was
+        capped to in the first place, without needing to separately track
+        how many of this parent's children are currently live.
+        """
+        if not parent_id:
+            return
+        queue = self.pending_overflow.get(parent_id)
+        if not queue:
+            return
+        next_spawn_kwargs = queue.pop(0)
+        if not queue:
+            del self.pending_overflow[parent_id]
+        print(
+            f"  [handle_spawn] fan-out slot freed under decomposer "
+            f"{parent_id} -- draining next queued subtask "
+            f"({len(queue)} still waiting)."
+        )
+        self._spawn_child_task(**next_spawn_kwargs)
+
     def handle_spawn(self, event: Event):
         """Triggered when an existing agent requests sub-agents (children)."""
         payload = event.payload
@@ -469,63 +510,13 @@ class Orchestrator:
 
         if subtasks:
             parent_node = self.colony.get_agent(parent_id) if parent_id else None
+            cap = None
             if parent_node is not None and parent_node.role == "decomposer":
                 cap = (
                     self.MAX_SUBTASKS_ROOT if parent_node.generation == 0
                     else self.MAX_SUBTASKS_NON_ROOT
                 )
-                if len(subtasks) > cap:
-                    keep_count = max(1, cap - 1)
-                    kept = subtasks[:keep_count]
-                    overflow = subtasks[keep_count:]
 
-                    kept_labels = set()
-                    for i, k in enumerate(kept):
-                        k_norm = self._normalize_subtask_keys(k) if isinstance(k, dict) else {}
-                        if k_norm.get("label"):
-                            kept_labels.add(str(k_norm["label"]))
-                        kept_labels.add(str(i))
-
-                    overflow_descs = []
-                    overflow_role = None
-                    merged_deps = set()
-                    for ov in overflow:
-                        ov_norm = self._normalize_subtask_keys(ov) if isinstance(ov, dict) else {}
-                        desc = ov_norm.get("task") or ov_norm.get("description") or str(ov)
-                        overflow_descs.append(desc)
-                        if overflow_role is None:
-                            overflow_role = ov_norm.get("role")
-                        for d in (ov_norm.get("dependencies") or []):
-                            if str(d) in kept_labels:
-                                merged_deps.add(str(d))
-
-                    merged_task = (
-                        "Handle the following items together (they were "
-                        "part of a larger batch trimmed to fit this "
-                        "decomposer's fan-out limit). If this is genuinely "
-                        "too much for one pass, DIE with 'TASK TOO LARGE:' "
-                        "as usual so it gets split up properly:\n"
-                        + "\n".join(f"- {d}" for d in overflow_descs)
-                    )
-                    merged_sub = {
-                        "label": "overflow_batch",
-                        "role": overflow_role or "worker",
-                        "task": merged_task,
-                        "dependencies": list(merged_deps),
-                    }
-
-                    print(
-                        f"  [handle_spawn] batch of {len(subtasks)} subtasks "
-                        f"from a generation-{parent_node.generation} decomposer "
-                        f"exceeds the fan-out cap ({cap}) -- keeping "
-                        f"{len(kept)} as-is and merging the remaining "
-                        f"{len(overflow)} into one bundled child instead of "
-                        f"dropping them, so nothing required by the original "
-                        f"task is silently lost."
-                    )
-                    subtasks = kept + [merged_sub]
-
-        if subtasks:
             prepared = []
             label_to_id = {}
             for i, sub in enumerate(subtasks):
@@ -534,8 +525,7 @@ class Orchestrator:
                 # expected {"role":..., "task":...} object. Without this
                 # guard, _normalize_subtask_keys's sub.items() call throws
                 # and takes the entire tick (and therefore the whole colony
-                # run) down with it. Mirrors the guard already used in the
-                # fan-out-cap code above -- just applied to this loop too.
+                # run) down with it.
                 if not isinstance(sub, dict):
                     print(f"Warning: subtask entry at index {i} is not a dict ({sub!r}), skipping.")
                     continue
@@ -551,6 +541,23 @@ class Orchestrator:
                 if label:
                     label_to_id[str(label)] = task_id
                 prepared.append((sub, description, task_id))
+
+            # Fan-out cap: resolved against the FULL original batch's labels
+            # above (so an item past the cap can still be a valid dependency
+            # target/source), but only the first `cap` are spawned now --
+            # the rest are queued (see pending_overflow's docstring in
+            # __init__) instead of force-merged into one oversized child.
+            if cap is not None and len(prepared) > cap:
+                print(
+                    f"  [handle_spawn] batch of {len(prepared)} subtasks "
+                    f"from a generation-{parent_node.generation} decomposer "
+                    f"exceeds the fan-out cap ({cap}) -- spawning the first "
+                    f"{cap} now and queueing the remaining "
+                    f"{len(prepared) - cap} to spawn one at a time as this "
+                    f"decomposer's other children complete, instead of "
+                    f"bundling them into one child that's reliably too "
+                    f"large for a single agent."
+                )
 
             for i, (sub, description, task_id) in enumerate(prepared):
                 if "dependencies" in sub:
@@ -591,13 +598,27 @@ class Orchestrator:
                             f"dependency '{dep}' which doesn't match any "
                             f"label/index in this SPAWN batch -- dropped."
                         )
-                self._spawn_child_task(
+
+                spawn_kwargs = dict(
                     description=description,
                     role=sub.get("role", "worker"),
                     parent_id=parent_id,
                     dependencies=resolved_deps,
                     task_id=task_id,
                 )
+                if cap is not None and i >= cap:
+                    # Queued rather than spawned now. NOTE (known edge case,
+                    # matching TaskGraph.add_task's own "depends on unknown
+                    # task_id" limitation): if this item depends on ANOTHER
+                    # still-queued overflow item rather than an
+                    # already-kept/spawned one, its in_degree will never
+                    # resolve until that sibling is drained first -- fine
+                    # for the common case this replaces (independent
+                    # overflow items), not handled for a genuine chain of
+                    # dependent overflow items.
+                    self.pending_overflow.setdefault(parent_id, []).append(spawn_kwargs)
+                else:
+                    self._spawn_child_task(**spawn_kwargs)
             return
 
         # Single-subtask case.
@@ -816,6 +837,12 @@ class Orchestrator:
         # If you actually want the payload fallback to work, loosen the
         # `if agent_node and parent_id:` gate below to `if parent_id:`.
         parent_id = getattr(agent_node, 'parent_id', None) if agent_node else None
+
+        # This child just genuinely completed -- a real fan-out slot under
+        # its decomposer parent opened up (unlike _kill_and_respawn, which
+        # reuses the same task_id/slot). Drain one queued overflow subtask
+        # into it, if that parent has any waiting.
+        self._drain_pending_overflow(parent_id)
 
         if agent_node and parent_id:
             self.messenger.push_event(

@@ -85,6 +85,42 @@ def normalize_identifier(raw, candidates, cutoff: float = 0.75, strip_chars: str
     return None
 
 
+def _join_within_budget(sentences, max_chars):
+    """
+    Joins sentences with a single space, keeping only as many WHOLE
+    sentences as fit within max_chars -- never slices into the middle of
+    the last one.
+
+    The previous approach (in both callers below) joined everything
+    first, then hard-sliced the joined string at max_chars and backed up
+    to the nearest space. That still routinely landed mid-sentence (e.g.
+    a goal cut off at "...Minimize" with the rest of the clause gone),
+    and the leftover fragment reads as a near-duplicate of whatever
+    sentence it was chopped out of -- confirmed against a real goal
+    string. Sentences are already split out for the dedupe pass in each
+    caller; reusing that boundary here instead of re-deriving one from
+    raw character offsets is what actually fixes it.
+
+    A single sentence longer than max_chars on its own is kept whole
+    rather than dropped or truncated -- an over-budget complete thought
+    is still better than a truncated fragment, and max_chars is a soft
+    target everywhere it's used here, not a hard wire limit.
+    """
+    if not sentences:
+        return ""
+    kept = [sentences[0]]
+    total = len(sentences[0])
+    for s in sentences[1:]:
+        if total + 1 + len(s) > max_chars:
+            break
+        kept.append(s)
+        total += 1 + len(s)
+    result = " ".join(kept)
+    if len(kept) < len(sentences):
+        result += "..."
+    return result
+
+
 def dedupe_and_cap(text, max_chars: int = 500):
     """
     Collapses consecutive repeated sentences and caps overall length.
@@ -102,10 +138,7 @@ def dedupe_and_cap(text, max_chars: int = 500):
     for s in sentences:
         if not deduped or s.strip() != deduped[-1].strip():
             deduped.append(s)
-    result = " ".join(deduped)
-    if len(result) > max_chars:
-        result = result[:max_chars].rsplit(" ", 1)[0] + "..."
-    return result
+    return _join_within_budget(deduped, max_chars)
 
 
 def dedupe_global_and_cap(text, max_chars: int = 400):
@@ -132,10 +165,7 @@ def dedupe_global_and_cap(text, max_chars: int = 400):
             if key:
                 seen.add(key)
             deduped.append(s)
-    result = " ".join(deduped)
-    if len(result) > max_chars:
-        result = result[:max_chars].rsplit(" ", 1)[0] + "..."
-    return result
+    return _join_within_budget(deduped, max_chars)
 
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^\s>]{0,40}\|>")
