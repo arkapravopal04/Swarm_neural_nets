@@ -293,7 +293,16 @@ class Agent:
         )
 
 
-        negative = "The next step would be to implement the binomial sampling function by..."
+        # This string is shown to the model as an example of BAD output.
+        # It must not contain anything that can be lifted out and read as
+        # a task: a real-sounding sentence here gets copied verbatim into
+        # a SPAWN payload (confirmed -- one agent spawned "Implement the
+        # binomial probability mass function..." into an unrelated
+        # turbine-blade colony straight out of the previous wording here,
+        # killing four downstream agents on the contradiction). The
+        # example only has to demonstrate SHAPE, so it carries no domain
+        # content at all.
+        negative = "<free-form reasoning with no ACTION: line -- placeholder, not a task>"
 
         tool_arg_reference = (
             "Tool argument reference (use the EXACT keys shown for each "
@@ -688,20 +697,18 @@ Your next action:"""
                 do_sample=use_sampling,
                 repetition_penalty=1.15,
                 stopping_criteria=stopping_criteria,
-                # FIX: repetition_penalty alone discounts logits per-token,
-                # cumulatively over the sequence -- it doesn't reliably
-                # block a multi-word PHRASE from recurring if its individual
-                # tokens are common elsewhere in a long prompt (role text,
-                # constraints, ghost context, previous thoughts all add up).
-                # no_repeat_ngram_size hard-blocks any repeated n-gram of
-                # this length outright, which is the more direct fix for
-                # verbatim clause/sentence-level repetition (confirmed
-                # against a real transcript showing a ~2-sentence block
-                # repeated near-verbatim). 4 is a starting point -- small
-                # enough to catch a repeated clause, large enough not to
-                # falsely block short legitimate repeats (units, variable
-                # names); tune based on further testing.
-                no_repeat_ngram_size=4,
+                # REVERTED (no_repeat_ngram_size=4 was here): the model
+                # routes around a blocked n-gram rather than obeying it --
+                # a blocked 4-gram comes back as a misspelling of itself
+                # ("thermodynamicaly" -> "thermodynamally" ->
+                # "thermodynamilly"), which is a fresh 4-gram every time, and
+                # one agent degenerated all the way into Cyrillic symbol-soup
+                # ("декор / деформа / деоторон"). Same failure mode as the
+                # original revert, and the sampling retry below did not
+                # rescue it. Repetition control is repetition_penalty alone
+                # again; clause-level repeats get cleaned downstream in
+                # _dedupe_repeated_sentences instead of by narrowing the
+                # vocabulary the model is allowed to spell correctly.
             )
             if use_sampling:
                 gen_kwargs["temperature"] = 0.7
@@ -751,14 +758,41 @@ Your next action:"""
             if parsed_action in self.action_tokens:
                 action = parsed_action
             else:
-                normalized_action = normalize_identifier(parsed_action, self.action_tokens, cutoff=0.75)
+                # Minimum-length guard before fuzzy matching. difflib at
+                # cutoff 0.75 happily turns a 3-character fragment into a
+                # full action token -- 'SPA' matched 'SPAWN', and the
+                # resulting spawn carried whatever half-formed text followed
+                # it. A token this short is evidence the generation was cut
+                # off or garbled, not evidence of which action was meant, so
+                # it is not fuzzy-matched at all.
+                normalized_action = None
+                if len(parsed_action) >= 4:
+                    normalized_action = normalize_identifier(
+                        parsed_action, self.action_tokens, cutoff=0.75
+                    )
+                else:
+                    print(
+                        f"  [decide() action-match] action token "
+                        f"'{parsed_action}' is shorter than 4 characters -- "
+                        f"too short to fuzzy-match safely, not attempting."
+                    )
+
                 if normalized_action:
                     action = normalized_action
                 else:
+                    # Falls back to THINK, NOT REPORT. A parse failure is the
+                    # one moment we know least about what the agent intended,
+                    # and REPORT is the single action that ENDS the task --
+                    # a garbled 'SPAWNSUBTASKS' becoming a REPORT is what
+                    # triggered a root structural reject on a live run.
+                    # THINK costs one cycle and discards nothing.
+                    action = "THINK"
                     print(
                         f"  [decide() action-match] unrecognized action "
                         f"'{parsed_action}' -- no exact or fuzzy match against "
-                        f"{self.action_tokens}; defaulting to REPORT."
+                        f"{self.action_tokens}; defaulting to THINK (one wasted "
+                        f"cycle) rather than REPORT (ends the task on a parse "
+                        f"failure)."
                     )
 
         payload = ""
