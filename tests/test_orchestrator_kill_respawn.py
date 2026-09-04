@@ -218,3 +218,100 @@ def test_unregistered_crashing_agent_escalates_immediately():
     assert len(events) == 1
     assert events[0].type == "failure_request"
     assert events[0].from_agent == "agent-1"
+
+
+# ── A1: energy ledger ─────────────────────────────────────────────────────
+#
+# Two contracts pinned here:
+#   1. Debits are attributed to categories and the categories sum to the
+#      total drawn from the budget (so terminate()'s reconciliation block
+#      is meaningful rather than decorative).
+#   2. A debit for an *unregistered* agent still moves budget_remaining.
+#      This is the honesty fix: _kill_and_respawn() unregisters before some
+#      debits land, and the old else-branch printed a warning and charged
+#      nothing -- making part of the respawn cost invisible.
+
+
+def test_ledger_categories_sum_to_budget_drawn():
+    colony = ColonyState(initial_budget=100, goal_embedding=None)
+    for agent_id in ("a", "b"):
+        colony.register_agent(
+            AgentNode(agent_id=agent_id, role="executor", status="running",
+                      parent_id=None, task="t")
+        )
+
+    colony.debit_energy("a", 4, category="spawn")
+    colony.debit_energy("b", 4, category="spawn")
+    colony.debit_energy("a", 3, category="think_tick")
+    colony.debit_energy("a", 7, category="think_tick")
+    colony.debit_energy("b", 2, category="crash")
+
+    assert colony.energy_ledger == {"spawn": 8, "think_tick": 10, "crash": 2}
+    assert sum(colony.energy_ledger.values()) == 20
+    assert colony.budget_remaining == 80
+    assert colony.starting_budget == 100
+
+    # Per-agent attribution still works alongside the ledger.
+    assert colony.get_agent("a").energy_spent == 14
+    assert colony.get_agent("b").energy_spent == 6
+
+    # And the reconciliation identity terminate() prints must hold.
+    assert (colony.starting_budget
+            - sum(colony.energy_ledger.values())
+            + sum(colony.energy_credits.values())) == colony.budget_remaining
+
+
+def test_debit_for_unregistered_agent_still_charges_budget():
+    colony = ColonyState(initial_budget=50, goal_embedding=None)
+
+    colony.debit_energy("ghost-agent", 6, category="spawn")
+
+    assert colony.budget_remaining == 44, "an unattributable cost is still a cost"
+    assert colony.energy_ledger == {"orphaned": 6}, (
+        "an unregistered debit must book under 'orphaned', not its own category"
+    )
+
+
+def test_credit_energy_is_recorded_and_reconciles():
+    colony = ColonyState(initial_budget=30, goal_embedding=None)
+    colony.register_agent(
+        AgentNode(agent_id="a", role="executor", status="running",
+                  parent_id=None, task="t")
+    )
+
+    colony.debit_energy("a", 10, category="spawn")
+    colony.credit_energy(2, category="consolidation")
+
+    assert colony.energy_credits == {"consolidation": 2}
+    assert colony.budget_remaining == 22
+    assert (colony.starting_budget
+            - sum(colony.energy_ledger.values())
+            + sum(colony.energy_credits.values())) == colony.budget_remaining
+
+
+def test_crash_debit_is_categorised_as_crash():
+    orch = _orchestrator_with_crashing_agent()
+
+    orch._run_live_agents()
+
+    assert orch.colony.energy_ledger.get("crash", 0) > 0, (
+        "the crash path must book its debit under the 'crash' category"
+    )
+    assert "uncategorized" not in orch.colony.energy_ledger
+
+
+def test_respawn_counts_increment_per_task():
+    orch = _make_orchestrator(_RecordingMemoryStore())
+    orch.task_graph.add_task(TaskNode(task_id="task-1", description="do a thing", status=1))
+
+    for i in range(3):
+        agent_id = f"agent-{i}"
+        orch.colony.register_agent(
+            AgentNode(agent_id=agent_id, role="executor", status="running",
+                      parent_id=None, task="do a thing")
+        )
+        # No model wired, so spawn_agent debits + registers a node but never
+        # builds a live Agent -- enough to exercise the counter.
+        orch._kill_and_respawn(agent_id, "task-1", "executor", None)
+
+    assert orch.respawn_counts == {"task-1": 3}
