@@ -48,6 +48,13 @@ class TaskNode:
                                                          # from Problem_Phaser's spec so a
                                                          # subtask can carry its relevant
                                                          # slice of the parent's constraints
+    description_embedding : Any = None  # this task's own description, embedded once at
+                                         # spawn time (orchestrator._spawn_child_task) --
+                                         # judge.decide's tier-2 target for this task's
+                                         # agent. Left None on the root task, which has no
+                                         # separate description to compare against (its
+                                         # description IS the colony goal already covered
+                                         # by colony.goal_embedding).
 
 
 class TaskGraph:

@@ -6,8 +6,12 @@ Tiered verification of agent outputs for Project Hive. Decides life and death.
 Three tiers, run in escalating order, each gated behind the previous passing:
 
     Tier 1 -- fast_check     : sub-10ms syntax/execution check, runs on every output
-    Tier 2 -- semantic_check : cosine similarity vs the colony's master target
-                               embedding, runs only if tier 1 passed
+    Tier 2 -- semantic_check : cosine similarity vs the target embedding the
+                               caller supplies for THIS task (its own subtask
+                               description, or the colony goal only for the
+                               root task) -- runs only if tier 1 passed, and
+                               is skipped entirely for a decomposer (a plan
+                               isn't supposed to resemble the answer)
     Tier 3 -- deep_critique  : full LLM call, runs only when the caller flags
                                the output as needing a deep check (a child
                                promoting a result to its parent, or the root
@@ -321,7 +325,15 @@ class Judge:
         # override that also fires when no similarity check is happening
         # this round. Moved inside the `else` branch so it only applies
         # when tier 2 is actually about to run.
-        if output_embedding is None or target_embedding is None:
+        # N2a: a decomposer's output is a plan (a SPAWN batch / DIE reason),
+        # not an attempt at the goal itself -- it is not supposed to
+        # resemble the target text, and no SEMANTIC_WARN/EXECUTE threshold
+        # is meaningful against it. Exempting by role, ahead of the
+        # embedding-presence check below, so this holds even on a call that
+        # happens to have both embeddings available.
+        if agent.role == "decomposer":
+            similarity = None
+        elif output_embedding is None or target_embedding is None:
             # No embeddings supplied (e.g. Phase 1 text-only agent with no
             # embedding pipeline wired up yet, or a short/terse result
             # deliberately exempted from tier 2 -- see orchestrator.py's
@@ -347,10 +359,16 @@ class Judge:
 
             if similarity <= SEMANTIC_WARN_THRESHOLD:
                 agent.warning_count += 1
+                # N2b: target_embedding is now this agent's OWN task (its
+                # subtask's description embedding, or the colony goal only
+                # for the root) -- never mention "the colony goal" here
+                # unconditionally, since for a non-root agent that's not
+                # what similarity was actually measured against, and
+                # agent.task already names whatever it really was.
                 correction = (
                     f"WARNING: Your last output had low semantic similarity "
-                    f"to the colony goal (similarity={similarity:.3f}). You "
-                    f"are drifting from your assigned subtask. Refocus on: "
+                    f"to your assigned task (similarity={similarity:.3f}). You "
+                    f"are drifting from it. Refocus on: "
                     f"{getattr(agent, 'task', '<task unavailable>')}"
                 )
                 agent.fail_reason = correction
