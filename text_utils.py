@@ -230,3 +230,85 @@ def dedupe_list_exact(items):
             seen.add(key)
             deduped.append(item)
     return deduped
+
+
+def trim_to_sentences(text, max_sentences: int = 3, max_words: int = 60, marker: bool = True):
+    """
+    Hard-trims free text to the first few whole sentences.
+
+    Belt-and-braces companion to the REPORT generation budget in
+    _ActionPayloadStop: even with generation capped, a REPORT payload has
+    no closing token, so what arrives at the judge can still be several
+    paragraphs of restatement wrapped around a one-line answer. The judge
+    reads the whole thing and rejects it for padding. Trimming to the
+    first 2-3 sentences before judging keeps the part that actually
+    answers the subtask ("list the waste types" -> the list) and drops
+    the trailing self-commentary.
+
+    Two independent bounds, whichever bites first: max_sentences, and
+    max_words across the kept sentences. The word bound exists because
+    "three sentences" is not a length -- three run-on sentences are
+    exactly the output this is meant to catch.
+
+    Never slices mid-sentence: if the first sentence alone already blows
+    the word budget it is kept whole, same soft-target contract as
+    _join_within_budget.
+
+    marker=False suppresses the trailing "[...]". Callers trimming text
+    that a JUDGE will read should pass it: an explicit truncation mark
+    is honest about what happened to the string, but it also tells the
+    judge the answer is cut off, which is the opposite of the signal a
+    trim is trying to produce. Keep the marker where a human or a later
+    agent reads the string and needs to know something was dropped.
+    """
+    if not text:
+        return text
+    stripped = str(text).strip()
+    sentences = [s for s in re.split(r'(?<=[.!?])\s+', stripped) if s.strip()]
+    if not sentences:
+        return stripped
+
+    kept = []
+    words = 0
+    for s in sentences[:max_sentences]:
+        s_words = len(s.split())
+        if kept and words + s_words > max_words:
+            break
+        kept.append(s)
+        words += s_words
+
+    if not kept:
+        kept = [sentences[0]]
+
+    result = " ".join(kept).strip()
+    if marker and len(kept) < len(sentences):
+        result += " [...]"
+    return result
+
+
+def first_clause(text, max_chars: int = 120):
+    """
+    Reduces a block of critique prose to one short clause.
+
+    The judge's tier-3 critique is written as flowing prose, and it used
+    to be pasted into the next agent's prompt nearly whole. At that
+    length and in that register it is indistinguishable from the agent's
+    own "Previous Thoughts" section sitting a few lines below it -- so
+    the model does not read it as a verdict to act on, it reads it as
+    reasoning it was already producing and simply continues it. Cutting
+    it to a single clause removes enough prose texture that it can only
+    be read as a label.
+    """
+    if not text:
+        return ""
+    flat = re.sub(r"\s+", " ", str(text)).strip()
+    if not flat:
+        return ""
+    # First sentence, then first clause within it.
+    first = re.split(r'(?<=[.!?])\s', flat, maxsplit=1)[0].strip()
+    if len(first) > max_chars:
+        clause = re.split(r'\s[-—;:]\s|,\s', first, maxsplit=1)[0].strip()
+        first = clause if clause else first
+    if len(first) > max_chars:
+        first = first[:max_chars].rsplit(" ", 1)[0].rstrip(",;:-") + "..."
+    return first.rstrip()
