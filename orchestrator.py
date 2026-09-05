@@ -1019,7 +1019,16 @@ class Orchestrator:
                 output_type="text",
                 output_embedding=output_embedding,
                 target_embedding=target_embedding,
-                needs_deep_check=True,
+                # STEP 2 (temporary experiment -- REVERT TO True AFTERWARDS):
+                # tier 3 disabled to isolate whether deep_critique is the
+                # thing blocking subtask completion. Tiers 1 and 2 still run
+                # exactly as before; decide() now returns verdict="pass" at
+                # tier 2 instead of ever reaching deep_critique, so no
+                # tier3_critique energy is debited and the TIER-3 VERDICTS
+                # section of the ledger will read "(deep_critique never ran
+                # this run)". If subtasks complete under this flag, the judge
+                # is the blocker.
+                needs_deep_check=False,
             )
 
             if verdict.get("tier") == 3:
@@ -1027,6 +1036,16 @@ class Orchestrator:
                 self.colony.debit_energy(agent_id, critique_cost, category="tier3_critique")
                 print(f"  [judge tier-3 cost] agent={agent_id} deep_critique "
                       f"debited {critique_cost} energy (previously untracked).")
+
+                # Step 1: count the tier-3 split explicitly. decide() maps
+                # deep_critique's accept -> "promote" and reject ->
+                # "execute", so the tier-3 verdict has to be read back off
+                # that mapping here. Without this the accept rate is only
+                # inferrable by eyeballing log lines; with it, the final
+                # report states it as a number.
+                self.colony.record_verdict(
+                    "tier3_accept" if verdict["verdict"] == "promote" else "tier3_reject"
+                )
 
         if verdict["verdict"] == "warn":
             print(f"Judge WARN on {agent_id}/{task_id}: {verdict['reason']}")
@@ -1590,6 +1609,19 @@ class Orchestrator:
                       f"energy path bypassing debit_energy/credit_energy.")
             else:
                 print("    [OK] ledger reconciles with the remaining budget.")
+
+            print(chr(10) + "  TIER-3 VERDICTS (deep_critique accept/reject)")
+            verdicts = dict(getattr(self.colony, "verdict_counts", {}) or {})
+            accepts = verdicts.get("tier3_accept", 0)
+            rejects = verdicts.get("tier3_reject", 0)
+            tier3_total = accepts + rejects
+            if tier3_total == 0:
+                print("    (deep_critique never ran this run)")
+            else:
+                rate = 100.0 * accepts / tier3_total
+                print(f"    accept : {accepts}")
+                print(f"    reject : {rejects}")
+                print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
 
             print("\n  RESPAWNS (top 10 by count)")
             respawns = getattr(self, "respawn_counts", {}) or {}
