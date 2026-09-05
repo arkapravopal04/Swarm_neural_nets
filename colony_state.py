@@ -47,6 +47,14 @@ class ColonyState:
         self.energy_ledger = {}
         self.energy_credits = {}
 
+        # Tier-3 verdict tally (Step 1). Deliberately NOT folded into
+        # energy_ledger: that dict is summed against starting_budget in
+        # _print_energy_report's reconciliation, so a row holding a COUNT
+        # rather than an energy amount would break the check. Kept as its
+        # own counter and printed as its own section.
+        #   verdict_counts: "tier3_accept" / "tier3_reject" -> int
+        self.verdict_counts = {}
+
     def register_agent(self, agent: AgentNode):
         self.agents[agent.agent_id] = agent
         parent = agent.parent_id
@@ -91,6 +99,15 @@ class ColonyState:
                   f"(category={category}) -- charging budget as 'orphaned'.")
             self.budget_remaining -= amount
             self.energy_ledger["orphaned"] = self.energy_ledger.get("orphaned", 0) + amount
+
+    def record_verdict(self, name: str):
+        """Increments a named verdict counter (e.g. "tier3_accept").
+
+        Pure bookkeeping -- affects no budget and no agent state. Exists so
+        the tier-3 accept/reject split is a measured number in the final
+        report rather than something inferred from log lines.
+        """
+        self.verdict_counts[name] = self.verdict_counts.get(name, 0) + 1
 
     def credit_energy(self, amount: int, category: str = "uncategorized"):
         """Refunds `amount` to the colony budget and records it under `category`."""
