@@ -47,6 +47,31 @@ ADAPTER_PATH = "/kaggle/input/datasets/arkapravopal/adapter-model-v1"
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GHOST_PERSIST_PATH = "./hive_memory/ghosts"
 
+# Orchestrator has accepted a budget_override since it was written, but
+# nothing ever passed one -- build_orchestrator() constructed the
+# Orchestrator without the argument, so the override branch in
+# initialize_colony() was unreachable and every run silently used the
+# phaser's proposed budget. Wired to an env var so a run can be adjusted
+# without editing source: HIVE_BUDGET_OVERRIDE=500 python main.py
+BUDGET_OVERRIDE_ENV = "HIVE_BUDGET_OVERRIDE"
+
+
+def _budget_override_from_env():
+    raw = os.environ.get(BUDGET_OVERRIDE_ENV)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        print(f"[budget] {BUDGET_OVERRIDE_ENV}={raw!r} is not an integer -- "
+              f"ignoring it and using the phaser's proposed budget.")
+        return None
+    if value <= 0:
+        print(f"[budget] {BUDGET_OVERRIDE_ENV}={value} is not positive -- "
+              f"ignoring it (a 0-budget colony dies on tick 1).")
+        return None
+    return value
+
 
 def _report_vram(label: str):
     """Cheap diagnostic so VRAM behavior is visible during a Kaggle run,
@@ -170,6 +195,14 @@ def build_orchestrator() -> Orchestrator:
     task_graph = TaskGraph()
     messenger = Messenger()
 
+    budget_override = _budget_override_from_env()
+    if budget_override is None:
+        print(f"[budget] no {BUDGET_OVERRIDE_ENV} set -- using the phaser's "
+              f"proposed colony budget for this run.")
+    else:
+        print(f"[budget] {BUDGET_OVERRIDE_ENV}={budget_override} -- overriding "
+              f"the phaser's proposed colony budget.")
+
     orchestrator = Orchestrator(
         colony_state, task_graph, messenger,
         phaser=phaser,
@@ -179,6 +212,7 @@ def build_orchestrator() -> Orchestrator:
         model=model,
         tokeniser=tokeniser,
         embed_model=shared_embedder,
+        budget_override=budget_override,
     )
     return orchestrator
 

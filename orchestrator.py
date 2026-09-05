@@ -24,7 +24,7 @@ from task_graph import TaskGraph, TaskNode
 from event_queue import Messenger, Event
 from agent_node import Agent, _dedupe_repeated_sentences
 from tools import ToolRegistry
-from text_utils import normalize_identifier
+from text_utils import normalize_identifier, trim_to_sentences, first_clause
 import ghost_extractor
 
 class Orchestrator:
@@ -332,6 +332,16 @@ class Orchestrator:
                   f"This run is NON-STANDARD.")
             self.colony.budget_remaining = self.budget_override
             self.colony.starting_budget = self.budget_override
+
+        # Printed unconditionally, on both paths. The override branch above
+        # only announces itself when it fires, which made "the override did
+        # not land" and "the override landed on the same number the phaser
+        # proposed" look identical in a log. This line is the one to read.
+        print(f"[initialize_colony] EFFECTIVE COLONY BUDGET: "
+              f"{self.colony.budget_remaining} "
+              f"(source={'override' if self.budget_override is not None else 'phaser'}, "
+              f"phaser proposed {spec.get('colony_budget')}, "
+              f"starting_budget={self.colony.starting_budget})")
 
         self.colony.goal_embedding = spec.get("goal_vector")
 
@@ -899,6 +909,23 @@ class Orchestrator:
         if result:
             result = _dedupe_repeated_sentences(str(result), max_chars=2000)
 
+        # Belt-and-braces companion to _ActionPayloadStop.REPORT_MAX_NEW_TOKENS.
+        # That cap stops the model from GENERATING a 400-token REPORT; this
+        # stops a long one that got through anyway from reaching the judge,
+        # which reads padding as evidence the agent did not answer the
+        # subtask. Trimming to the first 2-3 sentences keeps the part that
+        # answers it and drops the trailing restatement. Code results are
+        # exempt for the same reason they bypass the tier-2 similarity
+        # check below: sentence boundaries mean nothing in source, and
+        # "the first three sentences" of a function is a broken function.
+        if result and not self._looks_like_code(result):
+            trimmed = trim_to_sentences(str(result), max_sentences=3,
+                                        max_words=60, marker=False)
+            if trimmed != str(result):
+                print(f"  [report-trim] {agent_id} REPORT trimmed "
+                      f"{len(str(result))} -> {len(trimmed)} chars before judging.")
+                result = trimmed
+
         # Remembered whatever the judge decides next: if this task is later
         # abandoned by the attempt cap, this is the salvage value handed to
         # the parent. Recorded before judging on purpose -- a rejected
@@ -1035,11 +1062,19 @@ class Orchestrator:
             print(f"Judge EXECUTE on {agent_id}/{task_id}: {verdict['reason']}")
 
             if agent_node is not None:
-                critique_text = str(verdict.get("reason", ""))[:400]
-                critique_text = _dedupe_repeated_sentences(critique_text)
+                # The critique used to be pasted in at up to 400 chars of the
+                # judge's own flowing prose. Sitting in the next prompt a few
+                # lines above "Your Previous Thoughts", prose of that length
+                # and register is indistinguishable from the agent's own
+                # reasoning -- so the model did not act on it as a verdict, it
+                # continued it as thought. One clause, prefixed as a verdict,
+                # cannot be read that way.
+                critique_text = _dedupe_repeated_sentences(str(verdict.get("reason", "")))
+                critique_text = first_clause(critique_text, max_chars=120)
                 agent_node.fail_reason = (
-                    f"Previous attempt was REJECTED by review with this specific "
-                    f"feedback: {critique_text}"
+                    f"REJECTED BY REVIEW -- {critique_text}"
+                    if critique_text else
+                    "REJECTED BY REVIEW -- output did not satisfy the subtask."
                 )
 
             role = getattr(agent_node, "role", "worker") if agent_node else "worker"

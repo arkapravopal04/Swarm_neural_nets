@@ -51,11 +51,41 @@ class _ActionPayloadStop(StoppingCriteria):
     "PAYLOAD:" as instructional text) on every one of the ~400 steps.
     """
 
-    def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10):
+    # Per-action budget for a REPORT. Everything else in this class waits
+    # for a STRUCTURAL closer -- a balanced "}" for SPAWN/TOOL, a blank
+    # line for the rest -- but a free-text REPORT has no closing token at
+    # all, so when the model does not happen to emit a blank line the
+    # criterion never fires and generation runs to the full 400. That is
+    # the common case, not the edge case: a colony whose subtasks are
+    # "list the waste types" does not need 400 tokens to answer one, and
+    # the surplus is where the restatement-and-rambling that gets the
+    # REPORT rejected comes from. 80 tokens is roughly 60 words, which is
+    # the length these answers actually want to be.
+    REPORT_MAX_NEW_TOKENS = 80
+
+    def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10,
+                 report_max_new_tokens=None):
         self.tokenizer = tokenizer
         self.prompt_len = prompt_len
         self.extract_balanced_object = extract_balanced_object
         self.min_new_tokens = min_new_tokens
+        self.report_max_new_tokens = (
+            self.REPORT_MAX_NEW_TOKENS if report_max_new_tokens is None
+            else report_max_new_tokens
+        )
+
+    def _parsed_action(self, text):
+        """The action decide() would parse out of this partial generation.
+
+        Mirrors decide()'s own two-step read: a labelled "ACTION: X" line
+        first, and failing that a bare leading keyword -- decide()
+        recovers from a missing label that way, so the budget below has
+        to recognize the same generations decide() will.
+        """
+        match = re.search(r"ACTION:\s*([A-Za-z]+)", text, re.IGNORECASE)
+        if match is None:
+            match = re.match(r"\s*(THINK|SPAWN|TOOL|REPORT|DIE)\b", text, re.IGNORECASE)
+        return match.group(1).strip().upper() if match else None
 
     def __call__(self, input_ids, scores, **kwargs):
         new_ids = input_ids[0][self.prompt_len:]
@@ -63,6 +93,16 @@ class _ActionPayloadStop(StoppingCriteria):
             return False
 
         text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
+
+        action = self._parsed_action(text)
+        if action is None:
+            return False
+
+        # REPORT's own budget, checked before the structural tests below:
+        # those can only ever fire on a blank line for this action, and
+        # waiting for one is exactly what burns the other 320 tokens.
+        if action == "REPORT" and len(new_ids) >= self.report_max_new_tokens:
+            return True
 
         if not re.search(r"ACTION:\s*[A-Za-z]+", text, re.IGNORECASE):
             return False
@@ -460,7 +500,17 @@ class Agent:
             "Real actions that exist: THINK, SPAWN, TOOL, REPORT, DIE (no others exist).\n"
         )
         ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
-        fail_str = f"WARNING - Previous Action Failed: {self.fail_reason}\n" if self.fail_reason else ""
+        # Delimited and labelled as an external verdict, not narrated as a
+        # sentence. "WARNING - Previous Action Failed: <prose>" read as one
+        # more line of the agent's own commentary, especially with the
+        # thoughts section rendered in the same register directly below;
+        # the model continued it instead of acting on it.
+        fail_str = (
+            f"[VERDICT FROM REVIEWER -- this is not your reasoning, it is a "
+            f"ruling on your last attempt]\n{self.fail_reason}\n"
+            f"[END VERDICT]\n"
+            if self.fail_reason else ""
+        )
         tool_result_str = (
             f"Result of your most recent TOOL call:\n{self.last_tool_result}\n"
             if self.last_tool_result else ""
@@ -481,7 +531,17 @@ class Agent:
             requirements = self.requirements or []
 
         ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
-        fail_str = f"WARNING - Previous Action Failed: {self.fail_reason}\n" if self.fail_reason else ""
+        # Delimited and labelled as an external verdict, not narrated as a
+        # sentence. "WARNING - Previous Action Failed: <prose>" read as one
+        # more line of the agent's own commentary, especially with the
+        # thoughts section rendered in the same register directly below;
+        # the model continued it instead of acting on it.
+        fail_str = (
+            f"[VERDICT FROM REVIEWER -- this is not your reasoning, it is a "
+            f"ruling on your last attempt]\n{self.fail_reason}\n"
+            f"[END VERDICT]\n"
+            if self.fail_reason else ""
+        )
         tool_result_str = (
             f"Result of your most recent TOOL call:\n{self.last_tool_result}\n"
             if self.last_tool_result else ""
