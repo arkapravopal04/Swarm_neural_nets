@@ -30,7 +30,8 @@ import ghost_extractor
 class Orchestrator:
     def __init__(self, colony_state: ColonyState, task_graph: TaskGraph, messenger: Messenger,
                  phaser=None, judge=None, memory_store=None, synthesizer=None,
-                 model=None, tokeniser=None, embed_model=None):
+                 model=None, tokeniser=None, embed_model=None,
+                 budget_override: Optional[int] = None):
         self.colony = colony_state
         self.task_graph = task_graph
         self.messenger = messenger
@@ -90,6 +91,20 @@ class Orchestrator:
         # while the run is still going.
         self.tick_count = 0
         self.LEDGER_EVERY_TICKS = 20
+
+        # Hard ceiling on tick count. With a large budget_override a colony
+        # that never converges can run until the session dies, which reads
+        # identically to "still working" in the log. Stopping at a fixed tick
+        # count and saying so distinguishes "ran out of time" from "ran out
+        # of energy" at a glance.
+        self.MAX_TICKS = 800
+        self.hit_tick_ceiling = False
+
+        # Diagnostic lever: when set, replaces the budget the Problem_Phaser
+        # derives for the run (see initialize_colony). Non-standard by
+        # design -- it exists to answer "is energy the binding constraint?"
+        # without the phaser's estimate in the way.
+        self.budget_override = budget_override
 
         # Live Agent objects (the think/decide/execute reasoning wrapper),
         # keyed by agent_id. Distinct from ColonyState.agents, which only
@@ -306,6 +321,18 @@ class Orchestrator:
         # with, so the ledger's reconciliation baseline has to move with it.
         # Safe here: no debit has landed yet (the root spawn is below).
         self.colony.starting_budget = self.colony.budget_remaining
+
+        if self.budget_override is not None:
+            # starting_budget has to move with budget_remaining: the ledger's
+            # reconciliation check compares starting_budget - debits + credits
+            # against budget_remaining, and would report a phantom leak of
+            # exactly the override delta if only one of the two changed.
+            print(f"[initialize_colony] BUDGET OVERRIDE ACTIVE: phaser proposed "
+                  f"{self.colony.budget_remaining}, using {self.budget_override}. "
+                  f"This run is NON-STANDARD.")
+            self.colony.budget_remaining = self.budget_override
+            self.colony.starting_budget = self.budget_override
+
         self.colony.goal_embedding = spec.get("goal_vector")
 
         goal_text = spec.get("goal", problem_spec)
@@ -1580,6 +1607,11 @@ class Orchestrator:
         if is_successful:
             print("System Status: TERMINATED [SUCCESS]")
             print("The root task successfully completed and synthesized.")
+        elif self.hit_tick_ceiling:
+            print("System Status: TERMINATED [TICK CEILING]")
+            print(f"The colony ran {self.tick_count} ticks without converging and "
+                  f"hit the {self.MAX_TICKS}-tick ceiling. Energy was NOT the "
+                  f"binding constraint -- remaining budget: {self._check_energy()}.")
         elif self.root_task_id in self.abandoned_tasks:
             print("System Status: TERMINATED [ABANDONED]")
             print(f"The root task exhausted its {self.MAX_TASK_ATTEMPTS} respawn "
@@ -1664,6 +1696,12 @@ class Orchestrator:
         while self.running:
             tick_success = self.tick()
             if not tick_success:
+                break
+            if self.tick_count >= self.MAX_TICKS:
+                self.hit_tick_ceiling = True
+                print(f"TERMINATED [TICK CEILING] -- {self.tick_count} ticks elapsed "
+                      f"(MAX_TICKS={self.MAX_TICKS}) with the root task still "
+                      f"unresolved. Stopping.")
                 break
 
         return self.terminate()
