@@ -1026,16 +1026,15 @@ class Orchestrator:
                 output_type="text",
                 output_embedding=output_embedding,
                 target_embedding=target_embedding,
-                # STEP 2 (temporary experiment -- REVERT TO True AFTERWARDS):
-                # tier 3 disabled to isolate whether deep_critique is the
-                # thing blocking subtask completion. Tiers 1 and 2 still run
-                # exactly as before; decide() now returns verdict="pass" at
-                # tier 2 instead of ever reaching deep_critique, so no
-                # tier3_critique energy is debited and the TIER-3 VERDICTS
-                # section of the ledger will read "(deep_critique never ran
-                # this run)". If subtasks complete under this flag, the judge
-                # is the blocker.
-                needs_deep_check=False,
+                # A8 STEP 2, re-enabled: tier 1 now closes the empty-answer
+                # hole (see judge.fast_check), so a REPORT reaching
+                # deep_critique is no longer a bare heading/colon/placeholder
+                # by construction. Tools stay disabled (see
+                # _run_live_agents's available_tools) -- this is the clean
+                # tier-3 experiment: if deep_critique itself is still
+                # blocking subtask completion, the tier3_accept/tier3_reject
+                # counters below will now actually populate and show it.
+                needs_deep_check=True,
             )
 
             if verdict.get("tier") == 3:
