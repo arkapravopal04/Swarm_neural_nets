@@ -226,7 +226,14 @@ class Orchestrator:
         every agent whose task is currently running.
         """
         available_roles = ["decomposer", "executor", "verifier"]
-        available_tools = ToolRegistry.list_tools()
+        # A8 STEP 1 (temporary experiment -- REVERT TO ToolRegistry.list_tools()
+        # AFTERWARDS): tools disabled entirely to isolate whether TOOL is
+        # part of what's blocking subtask completion. With this and tier 3
+        # (see judge.decide() call below) both off, the only paths an agent
+        # has left are THINK -> REPORT -> tier 1/2 -- the maximum-isolation
+        # run. request_tool() now enforces this (not just the prompt text),
+        # so a TOOL action can't sneak through even if the model emits one.
+        available_tools = []
 
         for agent_id, live_agent in list(self.live_agents.items()):
             task_id = live_agent.task_id
