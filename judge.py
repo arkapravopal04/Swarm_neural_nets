@@ -44,6 +44,21 @@ SEMANTIC_EXECUTE_THRESHOLD = 0.3   # at or below this -> execute, too far gone
 # entirely on the next tier 2 pass and execute regardless of current score.
 MAX_WARNINGS = 3
 
+# --- Tier 1 empty-answer detection ------------------------------------------
+# A single-line REPORT matching either pattern is a label, not an answer --
+# an ATX markdown heading ("## Summary") or a line wrapped entirely in bold
+# markup ("**Conclusion**") with nothing else in the payload.
+_HEADING_ONLY_RE = re.compile(r'^\s*#{1,6}\s+\S.*$')
+_BOLD_ONLY_RE = re.compile(r'^\s*\*{1,3}[^*\n]+\*{1,3}\s*$')
+
+# Common LLM non-answers that survive the "non-empty" check but carry no
+# actual content. Compared against the REPORT with surrounding punctuation
+# and markdown decoration stripped and casefolded.
+_PLACEHOLDER_REPORTS = {
+    "n/a", "na", "tbd", "todo", "none", "null", "done", "ok", "okay",
+    "no answer", "no content", "pending", "n a",
+}
+
 
 class Judge:
     """
@@ -113,8 +128,45 @@ class Judge:
             return {"pass": False, "error": str(error)}
 
         if output_type == "text":
-            if output is None or (isinstance(output, str) and output.strip() == ""):
+            if output is None or not isinstance(output, str) or output.strip() == "":
                 return {"pass": False, "error": "empty or missing text output"}
+
+            stripped = output.strip()
+
+            # FIX (empty-answer hole): the presence check above only catches
+            # a REPORT that is literally empty. It let through the far more
+            # common degenerate shape -- a REPORT that trails off into a
+            # heading with nothing behind it ("Summary:", "## Final
+            # Answer"). Confirmed in a real run: "short" was being treated
+            # as "trustworthy" by everything downstream once tier 1 passed
+            # it, so one of these worthless REPORTs got promoted with zero
+            # actual content. These three checks close that hole without
+            # touching legitimate short answers (e.g. a bare "42") --
+            # none of them fire on a complete short answer, only on the
+            # shapes above.
+            if stripped.endswith(":"):
+                return {
+                    "pass": False,
+                    "error": f"REPORT ends on a colon with nothing after it: {stripped!r}",
+                }
+
+            lines = [line for line in stripped.splitlines() if line.strip()]
+            if len(lines) == 1 and (
+                _HEADING_ONLY_RE.match(lines[0]) or _BOLD_ONLY_RE.match(lines[0])
+            ):
+                return {
+                    "pass": False,
+                    "error": f"REPORT is a bare heading with no content: {lines[0]!r}",
+                }
+
+            alnum_chars = re.sub(r"[^A-Za-z0-9]", "", stripped)
+            normalized = stripped.strip(" \t\n.-_*#").lower()
+            if len(alnum_chars) < 2 or normalized in _PLACEHOLDER_REPORTS:
+                return {
+                    "pass": False,
+                    "error": f"REPORT has no substantive content: {stripped!r}",
+                }
+
             return {"pass": True, "error": None}
 
         return {"pass": False, "error": f"unknown output_type: {output_type!r}"}
