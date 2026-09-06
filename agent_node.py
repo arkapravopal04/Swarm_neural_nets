@@ -164,6 +164,13 @@ class Agent:
         self._total_generated = 0
         # actions
         self.action_tokens = ["THINK", "SPAWN", "TOOL", "REPORT", "DIE"]
+        # Set by run() to whatever available_tools it was actually called
+        # with. None means "no restriction" (direct request_tool() calls,
+        # e.g. in tests, bypass run() entirely and keep working against the
+        # real registry). run() setting this to [] is what makes an
+        # available_tools=[] argument actually block TOOL at execute() time
+        # instead of only changing prompt wording -- see request_tool().
+        self._run_available_tools = None
 
     @property
     def agent_id(self):
@@ -564,17 +571,27 @@ class Agent:
 
         # Circuit breaker open: TOOL is refused by request_tool anyway, so
         # advertising it here only invites another wasted decide() cycle that
-        # gets bounced. Drop it from the menu and say why.
+        # gets bounced. Drop it from the menu and say why. Same logic applies
+        # when the caller passed available_tools=[] for this run (e.g. the
+        # tools-disabled isolation experiment): TOOL is enforced-blocked at
+        # request_tool() now (see _run_available_tools), so don't advertise
+        # it as an option here either -- drop the action and its PAYLOAD
+        # format line entirely rather than showing "Available tools: []".
         if self.tool_circuit_open:
             tool_action_line = (
                 "- TOOL   — UNAVAILABLE. Your last "
                 f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} tool calls all failed; "
                 "further TOOL actions are refused. Do not attempt one.\n"
             )
+            tool_format_line = ""
+        elif not available_tools:
+            tool_action_line = ""
+            tool_format_line = ""
         else:
             tool_action_line = (
                 f"- TOOL   — call an external tool. Available tools: {available_tools}.\n"
             )
+            tool_format_line = '- If TOOL: Provide a JSON object: {"tool_name": "name", "args": {...}}\n'
 
         prompt = f"""You are an AI agent in a colony of agents working together to solve problems.
 Your Agent ID: {self.agent_id}
@@ -595,8 +612,7 @@ ACTION: <One of the available actions>
 PAYLOAD: <Depends on the action>
 - If THINK: Provide your reasoning in plain text.
 - If SPAWN: Provide a JSON object: {{"role": "chosen_role", "task": "specific task definition"}}
-- If TOOL: Provide a JSON object: {{"tool_name": "name", "args": {{...}}}}
-- If REPORT: Provide the final answer or result in plain text.
+{tool_format_line}- If REPORT: Provide the final answer or result in plain text.
 - If DIE: Provide the reason you cannot proceed.
 
 {format_example_str}
@@ -1143,6 +1159,16 @@ Your next action:"""
         tool_name, correction_note = self._canonicalize_tool_name(payload["tool_name"])
         args = payload["args"]
 
+        if self._run_available_tools is not None and tool_name not in self._run_available_tools:
+            self.fail_reason = (
+                "TOOL is disabled for this run (no tools were made available "
+                f"to you). Requested tool: '{tool_name}'. Choose REPORT "
+                "(submit your best result) or DIE (explain why this task "
+                "cannot be completed without a tool)."
+            )
+            print(f"  [request_tool() BLOCKED - tools disabled for this run] {tool_name}")
+            return
+
         if self.tool_circuit_open:
             self.fail_reason = (
                 f"TOOL is no longer available to you: your last "
@@ -1285,6 +1311,13 @@ Your next action:"""
 
     def run(self, available_roles=None, available_tools=None, requirements=None):
         """The core heartbeat coordinator for a single execution cycle."""
+        # Record what this cycle was actually told is available so
+        # request_tool() can enforce it below, not just advertise it in the
+        # prompt. `None` here (the default) means "unrestricted" -- decide()
+        # and think() already fall back to _default_available_tools() in
+        # that case, so leave enforcement off to match.
+        self._run_available_tools = available_tools
+
         action = self.think(available_roles, available_tools, requirements)
         
         if action == "FORCE_DECIDE" or (action in self.action_tokens and action != "THINK"):
