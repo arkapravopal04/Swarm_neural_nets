@@ -7,6 +7,9 @@ fine_tuning.py
 outreach/
 paper/
 
+.claude/
+Claude outputs/
+
 # Python caches
 __pycache__/
 *.py[cod]
@@ -17,7 +20,3 @@ __pycache__/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
-
-# Claude
-.claude/
-Claude outputs/
