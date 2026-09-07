@@ -20,6 +20,8 @@ synthesizer doesn't own a model instance, the orchestrator wires in whatever
 already wraps the shared model.
 """
 
+from text_utils import dedupe_and_cap as _dedupe_and_cap
+
 
 class Synthesizer:
     # FIX: problem_phaser.py caps raw input at 3000 chars before it ever reaches
@@ -149,7 +151,14 @@ class Synthesizer:
             "FINAL ANSWER:"
         )
 
-        return self.llm_call_fn(prompt)
+        # Same greedy-decoding sentence-looping failure mode every other
+        # llm_call_fn caller already guards against (see judge.deep_critique,
+        # agent_node's REPORT/DIE paths) -- undeduped here, it's the last
+        # LLM call in the whole run, so a loop survives straight into what
+        # the user reads as the finished answer instead of getting caught
+        # partway through the pipeline. Capped at the same budget as the
+        # input side (MAX_RESULTS_BLOCK_CHARS) for symmetry.
+        return _dedupe_and_cap(self.llm_call_fn(prompt), max_chars=self.MAX_RESULTS_BLOCK_CHARS)
 
     # ------------------------------------------------------------------
     # Entry point

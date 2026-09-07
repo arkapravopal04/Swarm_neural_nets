@@ -160,6 +160,11 @@ class Agent:
         # Set when request_tool had to repair a mangled tool_name, so the
         # agent is told what its spelling actually resolved to.
         self.pending_tool_name_correction = None
+        # Count of TOOL calls blocked purely because tools are disabled for
+        # this run (see MAX_DISABLED_TOOL_ATTEMPTS) -- kept separate from
+        # tool_call_count, which a blocked-for-this-reason call never
+        # increments (see request_tool()).
+        self.disabled_tool_attempts = 0
         self.last_token_id = None
         self._total_generated = 0
         # actions
@@ -1035,6 +1040,13 @@ Your next action:"""
     # a call that keeps failing is not converging, and letting it run to 15
     # just burns energy producing the same SyntaxError fifteen times.
     MAX_CONSECUTIVE_TOOL_FAILURES = 3
+    # Blocked-because-tools-are-disabled-this-run calls tolerated before TOOL
+    # is refused outright. This is not a failing call -- it's a call that
+    # was never going to reach a tool at all, so it needs its own, much
+    # tighter bound rather than sharing MAX_TOOL_ATTEMPTS_PER_AGENT. Nothing
+    # changes between attempt 1 and attempt 15 of the same deterministically
+    # blocked call; two is enough to establish the agent is repeating it.
+    MAX_DISABLED_TOOL_ATTEMPTS = 2
 
     @staticmethod
     def _normalize_args_for_signature(value):
@@ -1154,20 +1166,39 @@ Your next action:"""
             print(f"  [request_tool() REJECTED] payload={payload!r}")
             return
 
-        self.node.tool_call_count = getattr(self.node, "tool_call_count", 0) + 1
-
         tool_name, correction_note = self._canonicalize_tool_name(payload["tool_name"])
         args = payload["args"]
 
+        # Checked, and returned from, BEFORE tool_call_count is touched: this
+        # call was never going to reach a tool -- no tools exist for this run
+        # at all -- so it costs the agent nothing toward
+        # MAX_TOOL_ATTEMPTS_PER_AGENT. Closes TOOL itself after
+        # MAX_DISABLED_TOOL_ATTEMPTS identical-in-kind blocks instead of
+        # letting the agent grind all the way to the 15-call ceiling
+        # re-discovering the same "no tools available" fact each time.
         if self._run_available_tools is not None and tool_name not in self._run_available_tools:
-            self.fail_reason = (
-                "TOOL is disabled for this run (no tools were made available "
-                f"to you). Requested tool: '{tool_name}'. Choose REPORT "
-                "(submit your best result) or DIE (explain why this task "
-                "cannot be completed without a tool)."
-            )
-            print(f"  [request_tool() BLOCKED - tools disabled for this run] {tool_name}")
+            self.disabled_tool_attempts += 1
+            if self.disabled_tool_attempts >= self.MAX_DISABLED_TOOL_ATTEMPTS:
+                self.fail_reason = (
+                    f"TOOL is closed to you for the rest of this run: tools "
+                    f"are disabled for this run and you have already tried "
+                    f"{self.disabled_tool_attempts} times. Choose REPORT "
+                    f"(submit your best result) or DIE (explain why this "
+                    f"task cannot be completed without a tool)."
+                )
+            else:
+                self.fail_reason = (
+                    "TOOL is disabled for this run (no tools were made available "
+                    f"to you). Requested tool: '{tool_name}'. Choose REPORT "
+                    "(submit your best result) or DIE (explain why this task "
+                    "cannot be completed without a tool)."
+                )
+            print(f"  [request_tool() BLOCKED - tools disabled for this run] "
+                  f"{tool_name} (attempt {self.disabled_tool_attempts}/"
+                  f"{self.MAX_DISABLED_TOOL_ATTEMPTS})")
             return
+
+        self.node.tool_call_count = getattr(self.node, "tool_call_count", 0) + 1
 
         if self.tool_circuit_open:
             self.fail_reason = (
