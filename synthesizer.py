@@ -140,12 +140,27 @@ class Synthesizer:
                 + "\n... [TRUNCATED -- additional subtask results omitted for length]"
             )
 
+        # FIX (synthesizer grounding): collect_results already restricts
+        # SUBTASK RESULTS to promoted (status==2) tasks, so the results
+        # block itself is honest -- but nothing told the model to stay
+        # inside it. "Combine these into a coherent answer" is an open
+        # invitation to bridge gaps with invented facts once it starts
+        # writing prose, and a gap in subtask coverage would come out
+        # looking exactly like a confidently synthesized claim. Every
+        # claim in the final answer now has to trace back to one of the
+        # results actually promoted by the judge, or say plainly that the
+        # colony didn't cover it.
         prompt = (
             "You are the final synthesizer for an AI agent colony that just "
             "solved a problem by decomposing it into subtasks. Combine the "
             "following subtask results into a single, coherent answer to the "
             "original problem. Do not mention the colony, agents, or subtasks "
             "in your answer -- write as if you solved the problem directly.\n\n"
+            "Ground every claim in the SUBTASK RESULTS below -- do not "
+            "introduce facts, figures, or conclusions that are not traceable "
+            "to one of them. If the results leave part of the problem "
+            "uncovered, say plainly that it wasn't addressed rather than "
+            "inventing an answer for it.\n\n"
             f"ORIGINAL PROBLEM: {problem_spec}\n\n"
             f"SUBTASK RESULTS:\n{results_block}\n\n"
             "FINAL ANSWER:"

@@ -282,7 +282,10 @@ class Agent:
             ),
         }
         positive = examples.get(self.role, examples["executor"])
-        if self.tool_circuit_open and positive.startswith("ACTION: TOOL"):
+        if (
+            (self.tool_circuit_open or self.disabled_tool_closed)
+            and positive.startswith("ACTION: TOOL")
+        ):
             # Showing a TOOL example while TOOL is refused is the single
             # strongest nudge back into the loop we are trying to break.
             positive = examples["verifier"]
@@ -502,15 +505,23 @@ class Agent:
         )
         tools_str = (
             f"Tools actually available to you: {available_tools}\n"
-            if available_tools and not self.tool_circuit_open else ""
+            if available_tools and not self.tool_circuit_open
+            and not self.disabled_tool_closed else ""
         )
-        actions_str = (
-            "Real actions that exist: THINK, SPAWN, REPORT, DIE (TOOL is "
-            "closed to you after repeated tool failures -- do not attempt "
-            "it).\n"
-            if self.tool_circuit_open else
-            "Real actions that exist: THINK, SPAWN, TOOL, REPORT, DIE (no others exist).\n"
-        )
+        if self.tool_circuit_open:
+            actions_str = (
+                "Real actions that exist: THINK, SPAWN, REPORT, DIE (TOOL is "
+                "closed to you after repeated tool failures -- do not attempt "
+                "it).\n"
+            )
+        elif self.disabled_tool_closed:
+            actions_str = (
+                "Real actions that exist: THINK, SPAWN, REPORT, DIE (TOOL is "
+                "closed to you for the rest of this run -- do not attempt "
+                "it).\n"
+            )
+        else:
+            actions_str = "Real actions that exist: THINK, SPAWN, TOOL, REPORT, DIE (no others exist).\n"
         ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
@@ -587,6 +598,14 @@ class Agent:
                 "- TOOL   — UNAVAILABLE. Your last "
                 f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} tool calls all failed; "
                 "further TOOL actions are refused. Do not attempt one.\n"
+            )
+            tool_format_line = ""
+        elif self.disabled_tool_closed:
+            tool_action_line = (
+                "- TOOL   — UNAVAILABLE. You have already tried "
+                f"{self.disabled_tool_attempts} tool call(s) that aren't in "
+                "your available set; TOOL is closed for the rest of this "
+                "run. Do not attempt one.\n"
             )
             tool_format_line = ""
         elif not available_tools:
@@ -970,7 +989,23 @@ Your next action:"""
             if generated_text.strip():
                 payload = generated_text.strip()
                 if action in ("SPAWN", "TOOL"):
-                    action = "REPORT"
+                    # FIX (SPAWN/TOOL -> REPORT mislabel): this used to
+                    # silently relabel action as REPORT here, handing the
+                    # parent a "final result" that was actually just the raw
+                    # ACTION:/PAYLOAD scaffolding of a decomposition the
+                    # agent never got to make -- the task branch ends right
+                    # there with that scaffolding text as its answer, and it
+                    # can ride all the way into the synthesized final answer.
+                    # A missing payload is a parse failure, same category as
+                    # the unrecognized-action case above, and gets the same
+                    # treatment: THINK (one wasted cycle, discards nothing),
+                    # not REPORT (which ends the task on a parse failure).
+                    self.fail_reason = (
+                        f"{action} Action Failed: no PAYLOAD was found after "
+                        f"'ACTION: {action}'. Provide the required JSON "
+                        f"payload on your next attempt."
+                    )
+                    action = "THINK"
             else:
                 payload = "[No content generated -- decide() produced an empty response.]"
 
@@ -1139,6 +1174,23 @@ Your next action:"""
             len(self.recent_tool_errors) >= self.MAX_CONSECUTIVE_TOOL_FAILURES
             and all(self.recent_tool_errors)
         )
+
+    @property
+    def disabled_tool_closed(self):
+        """
+        True once MAX_DISABLED_TOOL_ATTEMPTS TOOL calls in a row have been
+        blocked because the requested tool wasn't in this run's available
+        set. FIX (unwired cap): request_tool() used to count these and, on
+        reaching the cap, tell the agent TOOL was "closed to you for the
+        rest of this run" -- but nothing actually closed it. The prompt
+        kept advertising TOOL every cycle exactly like tool_circuit_open's
+        case does when it's wired in, so the agent kept re-selecting TOOL,
+        the counter kept climbing past the cap, and the agent just re-read
+        the same "closed" verdict forever. Mirrors tool_circuit_open so the
+        cap is enforced the same way: once True, the prompt stops offering
+        TOOL at all.
+        """
+        return self.disabled_tool_attempts >= self.MAX_DISABLED_TOOL_ATTEMPTS
 
     def _accumulated_tool_errors_text(self):
         """The error text behind an open circuit, oldest first."""

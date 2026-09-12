@@ -215,13 +215,43 @@ class Judge:
         if self.llm_call_fn is None:
             raise ValueError("deep_critique requires llm_call_fn to be set at Judge construction")
 
+        # FIX (tier-3 scope rewrite): the docstring above has always promised
+        # this critique looks at engagement depth, confidence calibration,
+        # and on-topic-ness -- but the prompt itself never told the model
+        # any of that; it was just "critique this", so the promised scope
+        # existed only in the docstring, never in what the model actually
+        # saw. Now stated explicitly.
+        #
+        # Also closes the leak where invented content bled into the
+        # reviewed text: the old prompt ended cold on `f"OUTPUT: {output}\n"`
+        # with no marker saying the output was finished. A small model reads
+        # that as "continue this text", not "now critique it", and would
+        # keep extending OUTPUT with its own invented content before ever
+        # reaching a verdict -- which then rode into `reasoning` looking
+        # like part of the thing being judged. BEGIN/END fencing plus an
+        # explicit "this is finished, don't continue it" instruction mirrors
+        # the same delimiter fix already used for agent_node.py's
+        # [VERDICT FROM REVIEWER]/[END VERDICT] block.
         prompt = (
-            "You are the judge for an AI agent colony. Critique the following "
-            "output against its assigned subtask. Respond with exactly one "
-            "verdict line: 'VERDICT: accept' or 'VERDICT: reject', followed by "
-            "a brief reasoning.\n\n"
+            "You are the judge for an AI agent colony. You will be shown a "
+            "subtask and the OUTPUT an agent produced for it, then critique "
+            "that output -- and only that output.\n\n"
+            "Judge specifically on:\n"
+            "- did the agent actually engage with the subtask, or quietly "
+            "collapse it into something simpler?\n"
+            "- is its confidence calibrated -- does how sure it sounds match "
+            "how accurate it actually is?\n"
+            "- is the output on-topic for the subtask, not a tangent or a "
+            "restatement of the question?\n\n"
             f"SUBTASK: {subtask_spec}\n\n"
-            f"OUTPUT: {output}\n"
+            "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
+            f"{output}\n"
+            "=== END OUTPUT ===\n\n"
+            "The OUTPUT block above is already finished. Do not continue, "
+            "extend, or add to it -- everything you write from here on is "
+            "your own critique, not a continuation of the agent's answer.\n"
+            "Respond with exactly one verdict line: 'VERDICT: accept' or "
+            "'VERDICT: reject', followed by a brief reasoning.\n"
         )
 
         response = self.llm_call_fn(prompt)
