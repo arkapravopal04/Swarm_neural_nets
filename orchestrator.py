@@ -11,6 +11,7 @@ RUN & TERMINATE: manages system lifespan, captures run traces, and retrieves exe
 """
 
 import ast
+import difflib
 import uuid
 import time
 import re
@@ -22,7 +23,11 @@ from typing import Optional, Dict, Any, List
 from colony_state import ColonyState, AgentNode
 from task_graph import TaskGraph, TaskNode
 from event_queue import Messenger, Event
-from agent_node import Agent, _dedupe_repeated_sentences
+from agent_node import (
+    Agent,
+    _dedupe_repeated_sentences,
+    EXEMPLAR_SUBTASK_DESCRIPTIONS,
+)
 from tools import ToolRegistry
 from text_utils import normalize_identifier, trim_to_sentences, first_clause
 import ghost_extractor
@@ -673,6 +678,164 @@ class Orchestrator:
         )
         self._spawn_child_task(**next_spawn_kwargs)
 
+    # How close a spawned subtask's description has to be to one of the
+    # prompt's own examples before it is treated as copied rather than
+    # written. Deliberately high: this rejects an entire batch, so it has to
+    # mean "this is the example text", not "this is on a similar topic".
+    _EXEMPLAR_MATCH_CUTOFF = 0.85
+    # How much longer than the exemplar a containing description may be and
+    # still count as a copy. Some exemplars are short and generic ("Select
+    # the base material"), and a real subtask legitimately extends one of
+    # those into project vocabulary ("Select the base material for the
+    # turbine blade given the 1450C floor") -- that is a decomposition, not
+    # a copy, and rejecting it would throw away a valid plan. A copy that
+    # merely has a few words of connective tissue bolted on stays well
+    # inside this bound; an elaboration that adds real content does not.
+    _EXEMPLAR_PADDING_ALLOWANCE = 1.5
+
+    @staticmethod
+    def _normalize_for_exemplar_match(text: str) -> str:
+        """Casefolded, punctuation-free, whitespace-collapsed view of a task
+        description -- so "Pick a color palette for the newsletter template."
+        and "pick a colour  palette for the newsletter template" compare as
+        the same string modulo the ratio below."""
+        return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+    @classmethod
+    def _matching_exemplar(cls, description: str) -> Optional[str]:
+        """
+        The prompt exemplar this subtask description was copied from, or None.
+
+        The exemplars come from agent_node.EXEMPLAR_SUBTASK_DESCRIPTIONS,
+        which is the same tuple the prompt's SPAWN examples are built from --
+        that shared constant is the whole point, since a hardcoded copy here
+        would silently stop matching the moment someone reworded an example.
+        """
+        normalized = cls._normalize_for_exemplar_match(description)
+        if not normalized:
+            return None
+        for exemplar in EXEMPLAR_SUBTASK_DESCRIPTIONS:
+            exemplar_norm = cls._normalize_for_exemplar_match(exemplar)
+            if not exemplar_norm:
+                continue
+            if normalized == exemplar_norm:
+                return exemplar
+            # Containment either way: the model routinely emits the example
+            # sentence with a few words of its own bolted on either end,
+            # which drops the plain ratio below the cutoff while leaving the
+            # copied text fully intact. Bounded by the padding allowance
+            # above so that genuinely extending a short generic exemplar
+            # into this project's vocabulary is not read as copying it.
+            if normalized in exemplar_norm:
+                return exemplar
+            if (exemplar_norm in normalized
+                    and len(normalized) <= len(exemplar_norm) * cls._EXEMPLAR_PADDING_ALLOWANCE + 12):
+                return exemplar
+            if difflib.SequenceMatcher(
+                None, normalized, exemplar_norm
+            ).ratio() >= cls._EXEMPLAR_MATCH_CUTOFF:
+                return exemplar
+        return None
+
+    def _has_no_requirement_overlap(self, description: str) -> bool:
+        """
+        True when this description shares no vocabulary at all -- neither a
+        significant word nor a prefix stem -- with ANY of the project's
+        requirements.
+
+        This is the exact condition _filter_requirements_for_task already
+        computes and prints its "no keyword overlap at all" warning for. That
+        warning fires on precisely the failure this guard exists to catch (a
+        newsletter-palette subtask inside a turbine-blade colony shares no
+        vocabulary with a single turbine requirement), so it is promoted from
+        a warning to a rejection here rather than reimplemented.
+
+        Kept to the requirements corpus specifically, NOT the goal text, so
+        it stays the same condition as the warning it promotes.
+        """
+        requirements = self.spec.get("requirement", []) if self.spec else []
+        if not requirements:
+            return False
+        task_words = self._significant_words(description)
+        if not task_words:
+            return False
+        if any(task_words & self._significant_words(r) for r in requirements):
+            return False
+        task_stems = self._stems(task_words)
+        if any(task_stems & self._stems(self._significant_words(r)) for r in requirements):
+            return False
+        return True
+
+    def _reject_derived_subtask_batch(self, event: Event, descriptions: list) -> bool:
+        """
+        Returns True if this SPAWN batch may proceed, False if it was
+        rejected and the spawner rerouted to a respawn.
+
+        Rejects the WHOLE batch, not the offending subtask, and does it in
+        code rather than in the prompt. Three separate rewordings of the
+        SPAWN examples have failed to stop a decomposer under load from
+        lifting an example's task text straight into its own payload -- the
+        colony then spends real agents, real energy and real wall-clock time
+        building a newsletter template for a turbine-blade problem, and every
+        downstream agent that depends on that subtask dies on the
+        contradiction. A batch with one copied subtask is a batch the model
+        was pattern-matching rather than decomposing, so the plan is thrown
+        away whole and the decomposer is respawned to produce a real one.
+        """
+        spawner_id = event.from_agent
+        spawner = self.colony.get_agent(spawner_id) if spawner_id else None
+        # Orchestrator-originated spawns (bootstrap, overflow drains) are
+        # ours, not a model's -- nothing to reject and nobody to respawn.
+        if spawner is None:
+            return True
+
+        offending = None
+        for description in descriptions:
+            exemplar = self._matching_exemplar(description)
+            if exemplar is not None:
+                offending = (
+                    f"subtask '{description[:80]}' is a near-copy of the "
+                    f"prompt's own worked example '{exemplar}', which is "
+                    f"illustration text, not work belonging to this project"
+                )
+                break
+            if self._has_no_requirement_overlap(description):
+                offending = (
+                    f"subtask '{description[:80]}' shares no vocabulary at "
+                    f"all with any of this project's requirements, which is "
+                    f"what a subtask copied from an example looks like"
+                )
+                break
+
+        if offending is None:
+            return True
+
+        print(f"REJECT (derived subtask) on {spawner_id}: {offending} -- "
+              f"discarding all {len(descriptions)} subtask(s) in this batch "
+              f"and respawning the decomposer.")
+
+        spawner.fail_reason = (
+            "Previous attempt was REJECTED and none of its subtasks were "
+            f"created: {offending}. The examples in your instructions show "
+            "the FORMAT only -- their task text belongs to a different, "
+            "made-up project and must never appear in your payload. Every "
+            "subtask you spawn must be a piece of THIS project's task, "
+            "worded in this project's own vocabulary."
+        )
+        self.messenger.push_event(
+            "failure_request",
+            spawner_id,
+            {
+                "task_id": spawner.task_id,
+                "role": spawner.role,
+                "parent_id": spawner.parent_id,
+                "result": ("REJECTED: decomposition copied its subtasks from "
+                           "the prompt's worked examples instead of "
+                           "decomposing the assigned task."),
+            },
+        )
+        return False
+
     def _reject_spawn_from_non_decomposer(self, event: Event) -> bool:
         """
         Returns True if this SPAWN may proceed, False if it was rejected and
@@ -763,6 +926,14 @@ class Orchestrator:
                     label_to_id[str(label)] = task_id
                 prepared.append((sub, description, task_id))
 
+            # Exemplar guard, run on the whole prepared batch BEFORE any
+            # child is created: one copied subtask invalidates the plan, not
+            # just itself (see _reject_derived_subtask_batch).
+            if not self._reject_derived_subtask_batch(
+                event, [description for _, description, _ in prepared]
+            ):
+                return
+
             # Fan-out cap: resolved against the FULL original batch's labels
             # above (so an item past the cap can still be a valid dependency
             # target/source), but only the first `cap` are spawned now --
@@ -849,6 +1020,9 @@ class Orchestrator:
 
         if not description:
             print("Warning: Spawn request ignored due to missing task description in payload.")
+            return
+
+        if not self._reject_derived_subtask_batch(event, [description]):
             return
 
         self._spawn_child_task(

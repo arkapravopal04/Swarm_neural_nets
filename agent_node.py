@@ -31,6 +31,67 @@ import json
 from collections import deque
 
 
+# ---------------------------------------------------------------------------
+# ACTION: line parsing -- one definition, used by BOTH the streaming stop
+# criterion and decide()'s own post-hoc read, which are required to agree.
+#
+# FIX (label-parsed-as-action): the old pattern was r"ACTION:\s*([A-Za-z]+)",
+# which captures whatever word follows the FIRST colon. When the model emits
+# the label twice -- "ACTION: ACTION: SPAWN", a common restatement of the
+# format block -- that word is "ACTION" itself. "ACTION" is not in
+# action_tokens and is too far from any of them to fuzzy-match, so a
+# perfectly readable SPAWN was thrown away and downgraded to a wasted THINK
+# cycle (three of them on the root, before any work started, in one run).
+# Any run of repeated ACTION:/PAYLOAD: labels is now skipped, so the
+# captured group is the token AFTER the label rather than the label itself.
+_ACTION_LINE_RE = re.compile(
+    r"ACTION\s*:\s*(?:(?:ACTION|PAYLOAD)\b\s*:?\s*)*([A-Za-z]+)",
+    re.IGNORECASE,
+)
+_BARE_ACTION_RE = re.compile(r"\s*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Every task string that appears inside a SPAWN example in the prompt below.
+#
+# These exist in ONE place and are interpolated into the examples rather
+# than written out inline, because orchestrator.handle_spawn rejects any
+# spawned subtask whose description near-matches one of them. Three separate
+# attempts to fix this by rewording the prompt have failed: a decomposer
+# under load copies the example's task text verbatim into its own SPAWN
+# payload, and the colony then spends real agents building a newsletter
+# palette for a turbine-blade problem. The guard is in code now, and a guard
+# that can drift out of sync with the prompt it guards is worse than no
+# guard -- so the prompt reads its strings from here too.
+#
+# Add a task string to a prompt example ONLY by adding it here.
+_EX_CORE_ALGORITHM = "Implement the core algorithm"
+_EX_COOLANT_GEOMETRY = ("Analyze coolant channel geometry independently of "
+                        "the flow rate calculation")
+_EX_WELCOME_COPY_LONG = "Draft the welcome email copy for new newsletter subscribers"
+_EX_WELCOME_COPY = "Draft the welcome email copy"
+_EX_PALETTE = "Pick a color palette for the newsletter template"
+_EX_ASSEMBLE = "Assemble the final template using the chosen palette and copy"
+_EX_MATERIAL = "Select the base material"
+_EX_GEOMETRY = "Define the geometry bounds"
+_EX_COATING = "Size the protective coating using the selected material's properties"
+_EX_FINAL_CHECK = ("Run the final combined check using material, geometry, "
+                   "and coating results")
+
+EXEMPLAR_SUBTASK_DESCRIPTIONS = (
+    _EX_CORE_ALGORITHM,
+    _EX_COOLANT_GEOMETRY,
+    _EX_WELCOME_COPY_LONG,
+    _EX_WELCOME_COPY,
+    _EX_PALETTE,
+    _EX_ASSEMBLE,
+    _EX_MATERIAL,
+    _EX_GEOMETRY,
+    _EX_COATING,
+    _EX_FINAL_CHECK,
+)
+
+
 class _ActionPayloadStop(StoppingCriteria):
     """
     N3: real early-stop for decide()'s generation, checked every step.
@@ -82,9 +143,9 @@ class _ActionPayloadStop(StoppingCriteria):
         recovers from a missing label that way, so the budget below has
         to recognize the same generations decide() will.
         """
-        match = re.search(r"ACTION:\s*([A-Za-z]+)", text, re.IGNORECASE)
+        match = _ACTION_LINE_RE.search(text)
         if match is None:
-            match = re.match(r"\s*(THINK|SPAWN|TOOL|REPORT|DIE)\b", text, re.IGNORECASE)
+            match = _BARE_ACTION_RE.match(text)
         return match.group(1).strip().upper() if match else None
 
     def __call__(self, input_ids, scores, **kwargs):
@@ -104,7 +165,7 @@ class _ActionPayloadStop(StoppingCriteria):
         if action == "REPORT" and len(new_ids) >= self.report_max_new_tokens:
             return True
 
-        if not re.search(r"ACTION:\s*[A-Za-z]+", text, re.IGNORECASE):
+        if not _ACTION_LINE_RE.search(text):
             return False
         payload_match = re.search(r"PAYLOAD:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
         if not payload_match:
@@ -270,7 +331,7 @@ class Agent:
         examples = {
             "decomposer": (
                 'ACTION: SPAWN\n'
-                'PAYLOAD: {"role": "executor", "task": "Implement the core algorithm"}'
+                'PAYLOAD: {"role": "executor", "task": "' + _EX_CORE_ALGORITHM + '"}'
             ),
             "verifier": (
                 'ACTION: REPORT\n'
@@ -295,7 +356,7 @@ class Agent:
             'large for one agent (several independent sub-parts, not just '
             'one focused piece of work):\n'
             'ACTION: SPAWN\n'
-            'PAYLOAD: {"role": "executor", "task": "Analyze coolant channel geometry independently of the flow rate calculation"}\n\n'
+            'PAYLOAD: {"role": "executor", "task": "' + _EX_COOLANT_GEOMETRY + '"}\n\n'
         )
 
         decomposer_batch_example = (
@@ -310,8 +371,8 @@ class Agent:
             'list, not a missing field):\n'
             'ACTION: SPAWN\n'
             'PAYLOAD: {"subtasks": [\n'
-            '  {"label": "copy", "role": "executor", "task": "Draft the welcome email copy for new newsletter subscribers", "dependencies": []},\n'
-            '  {"label": "palette", "role": "executor", "task": "Pick a color palette for the newsletter template", "dependencies": []}\n'
+            '  {"label": "copy", "role": "executor", "task": "' + _EX_WELCOME_COPY_LONG + '", "dependencies": []},\n'
+            '  {"label": "palette", "role": "executor", "task": "' + _EX_PALETTE + '", "dependencies": []}\n'
             ']}\n\n'
             'Example of a batch with a real SEQUENTIAL dependency (one '
             'piece genuinely cannot start until another\'s result exists) '
@@ -319,9 +380,9 @@ class Agent:
             'label in the dependent piece\'s "dependencies":\n'
             'ACTION: SPAWN\n'
             'PAYLOAD: {"subtasks": [\n'
-            '  {"label": "palette", "role": "executor", "task": "Pick a color palette for the newsletter template", "dependencies": []},\n'
-            '  {"label": "copy", "role": "executor", "task": "Draft the welcome email copy", "dependencies": []},\n'
-            '  {"role": "executor", "task": "Assemble the final template using the chosen palette and copy", "dependencies": ["palette", "copy"]}\n'
+            '  {"label": "palette", "role": "executor", "task": "' + _EX_PALETTE + '", "dependencies": []},\n'
+            '  {"label": "copy", "role": "executor", "task": "' + _EX_WELCOME_COPY + '", "dependencies": []},\n'
+            '  {"role": "executor", "task": "' + _EX_ASSEMBLE + '", "dependencies": ["palette", "copy"]}\n'
             ']}\n\n'
             'Example combining all three shapes in ONE batch -- some '
             'subtasks start immediately (empty dependencies), one needs '
@@ -329,10 +390,10 @@ class Agent:
             'several earlier ones done first (terminal):\n'
             'ACTION: SPAWN\n'
             'PAYLOAD: {"subtasks": [\n'
-            '  {"label": "material", "role": "executor", "task": "Select the base material", "dependencies": []},\n'
-            '  {"label": "geometry", "role": "executor", "task": "Define the geometry bounds", "dependencies": []},\n'
-            '  {"label": "coating", "role": "executor", "task": "Size the protective coating using the selected material\'s properties", "dependencies": ["material"]},\n'
-            '  {"role": "executor", "task": "Run the final combined check using material, geometry, and coating results", "dependencies": ["material", "geometry", "coating"]}\n'
+            '  {"label": "material", "role": "executor", "task": "' + _EX_MATERIAL + '", "dependencies": []},\n'
+            '  {"label": "geometry", "role": "executor", "task": "' + _EX_GEOMETRY + '", "dependencies": []},\n'
+            '  {"label": "coating", "role": "executor", "task": "' + _EX_COATING + '", "dependencies": ["material"]},\n'
+            '  {"role": "executor", "task": "' + _EX_FINAL_CHECK + '", "dependencies": ["material", "geometry", "coating"]}\n'
             ']}\n\n'
             'Watch for this mistake: a subtask worded "the proposed/chosen/'
             'selected X" implies another subtask produces X first -- make '
@@ -736,6 +797,59 @@ Your next action:"""
                         return text[:i + 1]
         return None
 
+    # Payload keys that make a recovered object usable by the action that
+    # was actually parsed. A recovered object that satisfies none of these
+    # is not this action's payload, and handing it over would be worse than
+    # admitting the parse failed.
+    _PAYLOAD_SHAPE = {
+        "SPAWN": ("subtasks", "task", "description"),
+        "TOOL": ("tool_name",),
+    }
+
+    @classmethod
+    def _recover_unlabelled_payload(cls, action, text):
+        """
+        The JSON payload of a SPAWN/TOOL that never emitted a "PAYLOAD:"
+        label, or emitted it somewhere the PAYLOAD: regex could not see.
+
+        FIX (SPAWN mislabel, second half): the first half of this fix
+        stopped a payload-less SPAWN from being relabelled REPORT -- which
+        ended the task on a parse failure -- and degraded it to THINK
+        instead. Safe, but still wrong in the case that actually happens:
+        the model wrote the object, just without the label in front of it
+        ("ACTION: SPAWN" then a bare {...} on the next line). The action is
+        known, the object is right there, and the agent was still burning a
+        cycle re-deriving it -- reliably the root's opening cycles. So look
+        for a well-formed object of the right SHAPE anywhere in the
+        generation before falling back to THINK.
+
+        Returns the dict, or None if nothing of the right shape is present
+        (in which case the caller degrades to THINK exactly as before).
+        """
+        required = cls._PAYLOAD_SHAPE.get(action)
+        if not required or not text:
+            return None
+
+        search_from = 0
+        while True:
+            start = text.find("{", search_from)
+            if start == -1:
+                return None
+            extracted = cls._extract_first_balanced_object(text[start:])
+            search_from = start + 1
+            if extracted is None:
+                continue
+            candidate = None
+            try:
+                candidate = json.loads(extracted)
+            except json.JSONDecodeError:
+                try:
+                    candidate = ast.literal_eval(extracted)
+                except (ValueError, SyntaxError):
+                    continue
+            if isinstance(candidate, dict) and any(k in candidate for k in required):
+                return candidate
+
     @staticmethod
     def _looks_degenerate(text: str) -> bool:
         """Cheap heuristic check for a collapsed generation: either a
@@ -828,7 +942,7 @@ Your next action:"""
         self.thought_process += f"\n{strip_special_tokens(generated_text)}\n"
 
         action = "REPORT"  # Safe default fallback
-        action_match = re.search(r"ACTION:\s*([A-Za-z]+)", generated_text, re.IGNORECASE)
+        action_match = _ACTION_LINE_RE.search(generated_text)
 
         if action_match:
             print(f"  [decide() action-match] raw='{action_match.group(1)}' "
@@ -841,9 +955,7 @@ Your next action:"""
         else:
             print(f"  [decide() action-match] NO 'ACTION:' LINE FOUND. "
                   f"Tail of generated_text: {generated_text[-200:]!r}")
-            bare_action_match = re.match(
-                r"\s*(THINK|SPAWN|TOOL|REPORT|DIE)\b", generated_text, re.IGNORECASE
-            )
+            bare_action_match = _BARE_ACTION_RE.match(generated_text)
             if bare_action_match:
                 action_match = bare_action_match
                 print(
@@ -996,16 +1108,35 @@ Your next action:"""
                     # agent never got to make -- the task branch ends right
                     # there with that scaffolding text as its answer, and it
                     # can ride all the way into the synthesized final answer.
-                    # A missing payload is a parse failure, same category as
-                    # the unrecognized-action case above, and gets the same
+                    #
+                    # Second half of the same fix: before degrading at all,
+                    # try to find the object the model actually wrote but
+                    # failed to label (see _recover_unlabelled_payload). Only
+                    # if there is nothing of the right shape to recover is
+                    # this a real parse failure -- same category as the
+                    # unrecognized-action case above, and it gets the same
                     # treatment: THINK (one wasted cycle, discards nothing),
                     # not REPORT (which ends the task on a parse failure).
-                    self.fail_reason = (
-                        f"{action} Action Failed: no PAYLOAD was found after "
-                        f"'ACTION: {action}'. Provide the required JSON "
-                        f"payload on your next attempt."
+                    recovered_payload = self._recover_unlabelled_payload(
+                        action, generated_text
                     )
-                    action = "THINK"
+                    if recovered_payload is not None:
+                        print(
+                            f"  [decide() payload RECOVERED] no 'PAYLOAD:' "
+                            f"label after 'ACTION: {action}', but a "
+                            f"well-formed {action} payload object was found "
+                            f"in the generation -- running the {action} "
+                            f"instead of burning a THINK cycle."
+                        )
+                        payload = recovered_payload
+                        self.fail_reason = None
+                    else:
+                        self.fail_reason = (
+                            f"{action} Action Failed: no PAYLOAD was found after "
+                            f"'ACTION: {action}'. Provide the required JSON "
+                            f"payload on your next attempt."
+                        )
+                        action = "THINK"
             else:
                 payload = "[No content generated -- decide() produced an empty response.]"
 
