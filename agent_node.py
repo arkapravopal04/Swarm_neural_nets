@@ -120,9 +120,22 @@ class _ActionPayloadStop(StoppingCriteria):
     # the common case, not the edge case: a colony whose subtasks are
     # "list the waste types" does not need 400 tokens to answer one, and
     # the surplus is where the restatement-and-rambling that gets the
-    # REPORT rejected comes from. 80 tokens is roughly 60 words, which is
-    # the length these answers actually want to be.
-    REPORT_MAX_NEW_TOKENS = 80
+    # REPORT rejected comes from.
+    #
+    # Raised from 80 (roughly 60 words). 80 was chosen as the length these
+    # answers want to BE, which is the right target only if the answer
+    # starts at token 1 -- and it did not: a preamble sentence ("The
+    # icebreaker activity prompt and timing guide are structured as
+    # follows:") consumed the entire allowance on its own, and the cap then
+    # fired before a single word of the actual answer was generated. The
+    # prompt now tells REPORT to lead with the answer, and the budget is
+    # wide enough to survive a preamble when it appears anyway.
+    #
+    # The cap still fires mid-sentence -- a free-text REPORT has no closing
+    # token to wait for -- so the resulting stump is walked back to the last
+    # complete sentence by text_utils.drop_incomplete_tail before the judge
+    # reads it. The budget is a ceiling on generation, not on what is kept.
+    REPORT_MAX_NEW_TOKENS = 200
 
     def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10,
                  report_max_new_tokens=None):
@@ -697,7 +710,7 @@ ACTION: <One of the available actions>
 PAYLOAD: <Depends on the action>
 - If THINK: Provide your reasoning in plain text.
 - If SPAWN: Provide a JSON object: {{"role": "chosen_role", "task": "specific task definition"}}
-{tool_format_line}- If REPORT: Provide the final answer or result in plain text.
+{tool_format_line}- If REPORT: Provide the final answer or result in plain text. Give the answer itself first. Do not introduce it.
 - If DIE: Provide the reason you cannot proceed.
 
 {format_example_str}

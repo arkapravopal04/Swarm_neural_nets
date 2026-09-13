@@ -29,7 +29,12 @@ from agent_node import (
     EXEMPLAR_SUBTASK_DESCRIPTIONS,
 )
 from tools import ToolRegistry
-from text_utils import normalize_identifier, trim_to_sentences, first_clause
+from text_utils import (
+    normalize_identifier,
+    trim_to_sentences,
+    first_clause,
+    drop_incomplete_tail,
+)
 import ghost_extractor
 
 class Orchestrator:
@@ -1100,7 +1105,18 @@ class Orchestrator:
         # check below: sentence boundaries mean nothing in source, and
         # "the first three sentences" of a function is a broken function.
         if result and not self._looks_like_code(result):
-            trimmed = trim_to_sentences(str(result), max_sentences=3,
+            # What feeds the trim below. The REPORT generation budget stops
+            # the model mid-sentence (it has no closing token to wait for),
+            # so without this the trim's last kept "sentence" can be a
+            # stump. Walk back to the last complete sentence first, then
+            # trim -- the trim decides how much the judge reads, this
+            # decides where the text actually ended.
+            completed = drop_incomplete_tail(str(result))
+            if completed != str(result):
+                print(f"  [report-trim] {agent_id} REPORT dropped an "
+                      f"incomplete trailing sentence "
+                      f"({len(str(result))} -> {len(completed)} chars).")
+            trimmed = trim_to_sentences(completed, max_sentences=3,
                                         max_words=60, marker=False)
             if trimmed != str(result):
                 print(f"  [report-trim] {agent_id} REPORT trimmed "

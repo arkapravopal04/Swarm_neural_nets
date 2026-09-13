@@ -312,3 +312,53 @@ def first_clause(text, max_chars: int = 120):
     if len(first) > max_chars:
         first = first[:max_chars].rsplit(" ", 1)[0].rstrip(",;:-") + "..."
     return first.rstrip()
+
+
+# A sentence terminator, plus any closing quotes/brackets that belong with
+# it -- so 'he said "stop."' walks back to the quote, not to the period.
+_SENTENCE_END_RE = re.compile(r'[.!?]["\'\)\]]*')
+
+def drop_incomplete_tail(text):
+    """
+    Drops a trailing partial sentence, keeping everything up to and
+    including the last '.', '!' or '?'.
+
+    This is what a REPORT generation budget produces: the cap fires
+    mid-sentence, because a free-text REPORT has no closing token to wait
+    for (see _ActionPayloadStop.REPORT_MAX_NEW_TOKENS). A hard cut leaves a
+    stump -- "...and the timing guide should allow roughly fifteen min" --
+    which reads to the judge as an answer that gave up halfway. Walking
+    back to the last complete sentence turns the same generation into a
+    shorter but finished answer.
+
+    Runs BEFORE trim_to_sentences rather than replacing it: this decides
+    where the text legitimately ends, trim_to_sentences then decides how
+    much of it the judge should read.
+
+    Returns the text unchanged when it already ends on a terminator, and
+    when it contains no terminator at all -- notably a REPORT that is one
+    unfinished throat-clearing clause, or a bare bullet list whose last
+    item was cut. Leaving those intact is deliberate: an answer that never
+    completed a single sentence is exactly what the judge's empty-answer
+    checks exist to catch, and silently emptying it here would hide that.
+
+    Deliberately unguarded against the case where the only complete
+    sentence IS the preamble ("The guide is structured as follows. Fifteen
+    minutes per rou" -> the preamble alone). Suppressing the walk-back
+    there would just hand the judge the stump instead, which it rejects
+    anyway; the fix for that shape is the REPORT prompt line telling the
+    model to lead with the answer, not a heuristic here.
+    """
+    if not text:
+        return text
+    stripped = str(text).rstrip()
+    if not stripped:
+        return text
+
+    last_end = None
+    for match in _SENTENCE_END_RE.finditer(stripped):
+        last_end = match.end()
+
+    if last_end is None or last_end == len(stripped):
+        return text
+    return stripped[:last_end]

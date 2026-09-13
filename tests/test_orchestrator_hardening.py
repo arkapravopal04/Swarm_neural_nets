@@ -11,7 +11,11 @@ Regression tests for the run-bounding fixes:
     stop it), including the zero-requirement-overlap case,
   * "ACTION: ACTION: SPAWN" parses as SPAWN, not as the label,
   * a SPAWN whose JSON object was never labelled "PAYLOAD:" is recovered and
-    run instead of downgraded to a wasted THINK cycle.
+    run instead of downgraded to a wasted THINK cycle,
+  * a REPORT cut mid-sentence by its generation budget is walked back to the
+    last complete sentence before the existing report-trim sees it, and a
+    REPORT that never completed a sentence is left alone for the judge's
+    empty-answer checks to catch.
 
 Each of these was previously only observable by reading a 4,000-line run
 log, which is exactly how they survived as long as they did.
@@ -30,6 +34,8 @@ from colony_state import AgentNode, ColonyState
 from event_queue import Messenger
 from orchestrator import Orchestrator
 from task_graph import TaskGraph, TaskNode
+from text_utils import drop_incomplete_tail
+from agent_node import _ActionPayloadStop
 
 
 class _NullMemoryStore:
@@ -346,3 +352,60 @@ def test_wrong_shaped_object_is_not_passed_off_as_a_payload():
     assert Agent._recover_unlabelled_payload("SPAWN", 'ACTION: SPAWN\n{"note": "hmm"}') is None
     assert Agent._recover_unlabelled_payload("SPAWN", "ACTION: SPAWN\nno object here") is None
     assert Agent._recover_unlabelled_payload("REPORT", '{"task": "x"}') is None
+
+
+# --------------------------------------------------- REPORT budget + walkback
+
+def test_report_budget_is_wide_enough_to_survive_a_preamble():
+    """80 tokens was the length an answer wants to BE, which only works if
+    the answer starts at token 1 -- a preamble sentence consumed the whole
+    allowance before any answer was generated."""
+    assert _ActionPayloadStop.REPORT_MAX_NEW_TOKENS >= 200
+
+
+def test_mid_sentence_stump_is_walked_back():
+    raw = ("Fifteen minutes per round. Allow five minutes for setup and ten "
+           "for the actual acti")
+    assert drop_incomplete_tail(raw) == "Fifteen minutes per round."
+
+
+def test_complete_text_is_left_alone():
+    for text in ["Fifteen minutes per round.", "Why not?", "Stop!"]:
+        assert drop_incomplete_tail(text) == text
+
+
+def test_closing_quote_travels_with_its_terminator():
+    assert drop_incomplete_tail('He said "stop." Then we') == 'He said "stop."'
+
+
+def test_text_with_no_terminator_is_never_emptied():
+    """The judge's empty-answer checks are the only reason this failure mode
+    is visible; the walk-back must not swallow the evidence."""
+    preamble = ("The icebreaker activity prompt and timing guide are "
+                "structured as follows:")
+    assert drop_incomplete_tail(preamble) == preamble
+    assert drop_incomplete_tail("- glass\n- paper\n- plas") == "- glass\n- paper\n- plas"
+    assert drop_incomplete_tail("") == ""
+    assert drop_incomplete_tail(None) is None
+
+
+def test_walkback_feeds_the_existing_report_trim():
+    """The two are ordered, not alternatives: the walk-back decides where the
+    text ends, report-trim decides how much of it the judge reads."""
+    orch = _make_orchestrator()
+    orch.task_graph.add_task(TaskNode(task_id="task-1", description="time the icebreaker", status=1))
+    _register(orch, "exec-1", role="executor")
+    orch.colony.get_agent("exec-1").task_id = "task-1"
+
+    raw = ("Fifteen minutes per round. Allow five minutes for setup and ten "
+           "for discussion. Then rotate the groups. Finally collect the "
+           "cards and rev")
+    orch.messenger.push_event(
+        "completion_request", "exec-1",
+        {"task_id": "task-1", "result": raw},
+    )
+    orch._route_events(orch.messenger.drain())
+
+    stored = orch.last_partial_result["task-1"]
+    assert stored.endswith("."), f"a stump reached the judge: {stored!r}"
+    assert "rev" not in stored.split(".")[-1]
