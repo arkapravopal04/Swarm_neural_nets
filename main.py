@@ -69,10 +69,10 @@ BUDGET_OVERRIDE_ENV = "HIVE_BUDGET_OVERRIDE"
 # Every generation path in the system samples now (agent_node.think/decide,
 # the phaser's goal call, and the shared judge/synthesizer closure), so no
 # two runs of the same prompt take the same trajectory any more. That is the
-# point of the change, but it also means a run can no longer be reproduced
-# from its inputs alone -- and an interesting failure is worth being able to
-# replay. One seed is drawn per run and PRINTED; setting HIVE_SEED to a
-# printed value replays that run's draws:
+# point of the change, but it also means a run's inputs alone no longer
+# reproduce it -- and an interesting failure is worth being able to replay.
+# One seed is drawn per run and PRINTED; setting HIVE_SEED to a printed
+# value replays that run's draws:
 #     HIVE_SEED=123456 python main.py
 #
 # Caveat worth knowing before trusting a replay: this makes the SAMPLING
