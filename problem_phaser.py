@@ -142,8 +142,15 @@ Output:"""
             inputs = self.tokeniser(goal_prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
             prompt_length = inputs.input_ids.shape[1]
             
+            # Sampled, not greedy. Greedy decoding on this prompt drops
+            # into the highest-probability continuation of an instruction
+            # block, which for a code-shaped input is the code itself --
+            # this call emitted "def extract_intent(text)" as the colony's
+            # GOAL, i.e. the root task description and the tier-2 similarity
+            # target every child is scored against.
             outputs = self.llm.generate(
-                **inputs, max_new_tokens=100, min_new_tokens=5, do_sample=False,
+                **inputs, max_new_tokens=100, min_new_tokens=5,
+                do_sample=True, temperature=0.7, top_p=0.9,
                 pad_token_id=self.tokeniser.eos_token_id,
                 repetition_penalty=1.15, no_repeat_ngram_size=4,
             )

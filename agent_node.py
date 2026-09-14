@@ -201,6 +201,16 @@ class _ActionPayloadStop(StoppingCriteria):
 
 
 class Agent:
+    # think()'s sampling profile. think() ran pure-greedy argmax while
+    # decide() sampled on retry, which made think() -- the loop that
+    # generates 256 tokens per cycle and feeds every one of them into
+    # thought_process -- the one place with no escape from a locked-in
+    # trajectory. Greedy decoding there is what produces the 256-token
+    # repetition loops and the verbatim regurgitation of the prompt's own
+    # context back into the agent's reasoning.
+    THINK_TEMPERATURE = 0.7
+    THINK_TOP_P = 0.9
+
     MAX_TOTAL_THINK_TOKENS = 4096
     THINK_CYCLES_BEFORE_DECIDE = 1
 
@@ -763,7 +773,25 @@ Your next action:"""
                 self.KV_Cache = outputs.past_key_values
                 logits = outputs.logits
 
-                next_token_tensor = torch.argmax(logits[:, -1, :], dim=-1)
+                # Nucleus sample rather than argmax. Done by hand because
+                # this is a manual forward-pass loop, not model.generate():
+                # temperature-scale, keep the smallest set of tokens whose
+                # cumulative probability reaches THINK_TOP_P, renormalize
+                # over just those, draw one.
+                next_token_logits = logits[:, -1, :] / self.THINK_TEMPERATURE
+                sorted_logits, sorted_indices = torch.sort(
+                    next_token_logits, descending=True, dim=-1
+                )
+                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                # Subtracting each token's own probability keeps the token
+                # that CROSSES the threshold, and guarantees the top-1 token
+                # is never masked (its cumulative-minus-self is 0).
+                cutoff = sorted_probs.cumsum(dim=-1) - sorted_probs > self.THINK_TOP_P
+                sorted_logits = sorted_logits.masked_fill(cutoff, float("-inf"))
+                choice = torch.multinomial(
+                    torch.softmax(sorted_logits, dim=-1), num_samples=1
+                )
+                next_token_tensor = sorted_indices.gather(-1, choice).squeeze(-1)
                 self.last_token_id = next_token_tensor.item()
                 self._total_generated += 1
 
@@ -916,12 +944,21 @@ Your next action:"""
 
         generated_text = None
         for attempt in range(3):
-            use_sampling = attempt > 0
+            # Sampled from attempt 0, not just on retry. Greedy-first meant
+            # the FIRST decide() of every agent was the one draw with no
+            # escape from a locked-in trajectory -- and a first attempt that
+            # degenerates has already cost a full 400-token generation by the
+            # time _looks_degenerate catches it. The retry loop below stays
+            # as a second net: each attempt is an independent draw, so a
+            # degenerate one is now genuinely re-rolled rather than switching
+            # decoding strategy mid-loop.
             gen_kwargs = dict(
                 max_new_tokens=400,
                 min_new_tokens=10,
                 pad_token_id=self.tokeniser.eos_token_id,
-                do_sample=use_sampling,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
                 repetition_penalty=1.15,
                 stopping_criteria=stopping_criteria,
                 # REVERTED (no_repeat_ngram_size=4 was here): the model
@@ -937,8 +974,6 @@ Your next action:"""
                 # _dedupe_repeated_sentences instead of by narrowing the
                 # vocabulary the model is allowed to spell correctly.
             )
-            if use_sampling:
-                gen_kwargs["temperature"] = 0.7
             with torch.no_grad():
                 outputs = self.model.generate(**inputs, **gen_kwargs)
             generated_tokens = outputs[0][prompt_len:]
@@ -949,7 +984,7 @@ Your next action:"""
             print(
                 f"  [decide() retry] attempt {attempt + 1} generation looked "
                 f"degenerate (repeated sentence or bracket noise) -- "
-                f"retrying with sampling."
+                f"drawing a fresh sample."
             )
 
         self.thought_process += f"\n{strip_special_tokens(generated_text)}\n"

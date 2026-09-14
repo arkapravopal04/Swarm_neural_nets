@@ -17,9 +17,20 @@ same sentence ad nauseam ("The blade is then subjected to a high-temperature
 wind tunnel test..." x14) instead of terminating cleanly -- repetition_penalty
 =1.3 is cheap insurance against that even after the empty-generation root
 cause is fixed elsewhere.
+
+FIX (sampling pass): that greedy decoding is now sampled outright
+(do_sample=True, temperature=0.7, top_p=0.9), matching agent_node's think()
+and decide(). This closure is the shared path for BOTH Judge.deep_critique
+and Synthesizer.format_output, so note that the judge's tier-3 verdict is no
+longer deterministic for a given output -- the same REPORT can draw accept on
+one run and reject on another. repetition_penalty stays at 1.15 for the
+reason described above: deep_critique structurally needs to repeat the words
+"accept"/"reject", and a stronger penalty fragments them past judge.py's
+verdict regex.
 """
 import gc
 import os
+import random
 import subprocess
 
 import torch
@@ -54,6 +65,47 @@ GHOST_PERSIST_PATH = "./hive_memory/ghosts"
 # phaser's proposed budget. Wired to an env var so a run can be adjusted
 # without editing source: HIVE_BUDGET_OVERRIDE=500 python main.py
 BUDGET_OVERRIDE_ENV = "HIVE_BUDGET_OVERRIDE"
+
+# Every generation path in the system samples now (agent_node.think/decide,
+# the phaser's goal call, and the shared judge/synthesizer closure), so no
+# two runs of the same prompt take the same trajectory any more. That is the
+# point of the change, but it also means a run can no longer be reproduced
+# from its inputs alone -- and an interesting failure is worth being able to
+# replay. One seed is drawn per run and PRINTED; setting HIVE_SEED to a
+# printed value replays that run's draws:
+#     HIVE_SEED=123456 python main.py
+#
+# Caveat worth knowing before trusting a replay: this makes the SAMPLING
+# deterministic, not the whole run. CUDA kernel nondeterminism and any
+# ordering that depends on wall-clock timing are not covered, so a replay
+# reproduces the same draws from the same state, not necessarily an
+# identical transcript end to end.
+SEED_ENV = "HIVE_SEED"
+
+
+def _seed_everything():
+    """Draws (or reads) this run's seed, seeds torch, and returns it for the
+    header line. Python's own `random` is seeded too -- it is what picks the
+    seed itself when none is supplied, and other modules may use it."""
+    raw = os.environ.get(SEED_ENV)
+    seed = None
+    if raw is not None and raw.strip():
+        try:
+            seed = int(raw.strip())
+        except ValueError:
+            print(f"[seed] {SEED_ENV}={raw!r} is not an integer -- "
+                  f"ignoring it and drawing a fresh seed.")
+    if seed is None:
+        seed = random.randrange(2 ** 31 - 1)
+        source = "fresh"
+    else:
+        source = f"from {SEED_ENV}"
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed, source
 
 
 def _budget_override_from_env():
@@ -146,7 +198,9 @@ def build_llm_call_fn(model, tokeniser):
                 **inputs,
                 max_new_tokens=300,
                 min_new_tokens=10,
-                do_sample=False,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
                 repetition_penalty=1.15,
                 pad_token_id=tokeniser.eos_token_id,
             )
@@ -194,6 +248,10 @@ def build_orchestrator() -> Orchestrator:
     colony_state = ColonyState(initial_budget=100, goal_embedding=None)
     task_graph = TaskGraph()
     messenger = Messenger()
+
+    seed, seed_source = _seed_everything()
+    print(f"[seed] {seed} ({seed_source}) -- replay this run with "
+          f"{SEED_ENV}={seed}")
 
     budget_override = _budget_override_from_env()
     if budget_override is None:
