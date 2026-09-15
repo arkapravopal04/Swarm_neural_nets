@@ -168,6 +168,147 @@ def dedupe_global_and_cap(text, max_chars: int = 400):
     return _join_within_budget(deduped, max_chars)
 
 
+# A Markdown fence marker, and the small set of info strings worth
+# treating as one. The info string is matched against a list rather than
+# as \w+ because both "```python Generate a parser." (info string) and
+# "```Generate a parser." (no info string) occur, and a greedy \w+ cannot
+# tell them apart -- it ate the first real word of the goal.
+_FENCE = r"(?:`{3,}|~{3,})"
+_FENCE_INFO = (
+    r"(?:python|py|json|markdown|md|text|txt|plaintext|bash|sh|shell|yaml|yml|"
+    r"xml|html|latex|tex|sql|cpp|c|java|javascript|js|typescript|ts|go|rust|"
+    r"r|matlab|pseudocode|code)"
+)
+# A line that is nothing but a fence, with or without an info string. Any
+# word is allowed here -- alone on its line there is no real text to eat.
+# Takes its newline with it, or stripping leaves a blank line in the
+# middle of what should be one sentence.
+_FENCE_LINE_RE = re.compile(
+    rf"^[ \t]*{_FENCE}[ \t]*\w*[ \t]*$\r?\n?", re.MULTILINE
+)
+# An opening fence welded onto the front of the text...
+_LEADING_FENCE_RE = re.compile(
+    rf"^[ \t]*{_FENCE}[ \t]*(?:{_FENCE_INFO}\b[ \t]*)?", re.IGNORECASE
+)
+# ...and one welded onto the END of it. This is the shape the generation
+# cap produces most often: the model finishes the sentence, opens a code
+# block to elaborate, and the cap fires on the fence line itself.
+_TRAILING_FENCE_RE = re.compile(
+    rf"[ \t]*{_FENCE}[ \t]*(?:{_FENCE_INFO}\b[ \t]*)?$", re.IGNORECASE
+)
+# A short dangling run (one or two backticks) -- only ever stripped when
+# the text's backticks are unbalanced, so an inline `code span` at the
+# end of a sentence keeps its closing tick.
+_DANGLING_TICKS_RE = re.compile(r"[ \t]*`{1,2}[ \t]*$")
+
+
+def strip_code_fences(text):
+    """
+    Removes Markdown code-fence markers -- whole fence lines, an opening
+    fence welded to the front or the end of the text, and an unbalanced
+    dangling backtick -- while leaving the text between them alone.
+
+    Written for the problem phaser's goal extraction, which is sampled
+    rather than greedy precisely because greedy decoding on a code-shaped
+    user input continues the input as code. Sampling stops it emitting a
+    whole function body, but it still occasionally dresses the one
+    sentence it does produce as a code block, and the generation cap then
+    cuts the block before its closing fence -- so the fences arrive
+    unbalanced and a symmetric ```...``` match would not catch them. The
+    goal string is the root TaskNode.description and (via goal_vector)
+    the tier-2 similarity target every child is scored against, so a
+    stray fence is both printed to the user and embedded into the target.
+    """
+    if not text:
+        return text
+    text = _FENCE_LINE_RE.sub("", text)
+    text = _LEADING_FENCE_RE.sub("", text)
+    text = _TRAILING_FENCE_RE.sub("", text)
+    if text.count("`") % 2 == 1:
+        text = _DANGLING_TICKS_RE.sub("", text)
+    return text.strip()
+
+
+# Connectives that separate the reasoning from the constraint it
+# produced. Everything before the LAST one is derivation; what follows is
+# the constraint itself.
+_DERIVATION_JOIN_RE = re.compile(
+    r",?\s*(?:therefore|thus|hence|so|meaning|which means|implying that|"
+    r"so the constraint is|the constraint is|this means(?: that)?|"
+    r"=>|->)\s*[:,]?\s+",
+    re.IGNORECASE,
+)
+# A leading subordinate clause -- "Since the alloy melts at 1400C, the
+# blade must be cooled" -- whose main clause is the actual constraint.
+_DERIVATION_PREFIX_RE = re.compile(
+    r"^(?:since|because|as|given(?: that)?|seeing(?: that)?|"
+    r"in order to|to satisfy|due to|owing to)\b[^,]{0,200},\s*",
+    re.IGNORECASE,
+)
+# Normative vocabulary. A line with none of it is a statement about the
+# problem, not a bound on the solution.
+_NORMATIVE_RE = re.compile(
+    r"\b(?:must|shall|should|needs? to|has to|have to|required?|requires?|"
+    r"cannot|can't|may not|must not|no more than|at least|at most|under|"
+    r"below|above|within|limited to|prohibited|forbidden|avoid|only|"
+    r"minimum|maximum|target|budget|not exceed|exceed)\b",
+    re.IGNORECASE,
+)
+
+
+def final_derived_constraint(line):
+    """
+    Reduces one extracted constraint bullet to the constraint itself,
+    dropping the reasoning that produced it.
+
+    The phaser's constraint prompt asks for bare bullets, but the test
+    prompts it runs on end with "Show reasoning and calculations, not
+    just a final answer" -- and the extractor, reading the same text,
+    writes the derivation out alongside the bound: "The base alloy cannot
+    survive 1400C alone, therefore an internal cooling scheme is
+    required." Those strings are not just displayed; each is embedded
+    into requirement_vectors, counted by _estimate_by_constraints (so
+    derivation prose inflates num_reqs and the budget), and threaded down
+    the task graph into every child agent's "Constraints you must
+    satisfy" block, where a sentence of reasoning reads as context to
+    continue rather than as a bound to meet.
+
+    Returns "" for a line that is pure derivation with no bound in it,
+    for the caller to drop.
+    """
+    if not line:
+        return ""
+    flat = re.sub(r"\s+", " ", str(line)).strip()
+    if not flat:
+        return ""
+
+    # Take the text after the LAST derivation connective: a bullet can
+    # chain them ("X, so Y, therefore Z") and only the tail is the bound.
+    tail = flat
+    while True:
+        match = None
+        for candidate in _DERIVATION_JOIN_RE.finditer(tail):
+            match = candidate
+        if not match or not tail[match.end():].strip():
+            break
+        tail = tail[match.end():].strip()
+
+    # Then peel a leading "Since ..., " style subordinate clause.
+    peeled = _DERIVATION_PREFIX_RE.sub("", tail).strip()
+    if peeled:
+        tail = peeled
+
+    if not _NORMATIVE_RE.search(tail):
+        # Nothing was derived here -- it is a restatement of the problem.
+        # Keep it only if the original had no derivation structure at all,
+        # since a plain noun-phrase bullet ("Python 3.11") is still a
+        # constraint.
+        if tail != flat:
+            return ""
+
+    return tail[:1].upper() + tail[1:]
+
+
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^\s>]{0,40}\|>")
 _SCAFFOLD_LINE_RE = re.compile(
     r"^[ \t]*(?:ACTION|PAYLOAD)\s*:.*$"

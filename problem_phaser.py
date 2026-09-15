@@ -2,7 +2,12 @@ import re
 import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from text_utils import dedupe_global_and_cap, dedupe_list_exact
+from text_utils import (
+    dedupe_global_and_cap,
+    dedupe_list_exact,
+    final_derived_constraint,
+    strip_code_fences,
+)
 
 class Problem_Phaser:
     """
@@ -94,12 +99,31 @@ class Problem_Phaser:
             # Strip bold tags if model tries to bold the start of a bullet
             cleaned_line = re.sub(r'^\*\*(.*?)\*\*:\s*', r'\1: ', cleaned_line).strip()
             
+            # FIX: keep only the constraint, not the derivation that
+            # produced it. The prompt asks for bare bullets, but the inputs
+            # this runs on ask for shown reasoning, and the extractor reads
+            # that register back out: "The base alloy cannot survive 1400C
+            # alone, therefore an internal cooling scheme is required." The
+            # derivation half is then embedded into requirement_vectors,
+            # counted by _estimate_by_constraints (inflating the budget) and
+            # threaded into every child agent's "Constraints you must
+            # satisfy" block, where prose reads as context to continue
+            # rather than as a bound to meet. A bullet that turns out to be
+            # pure derivation comes back empty and is dropped.
+            cleaned_line = final_derived_constraint(cleaned_line)
+
             if cleaned_line and cleaned_line.lower() not in exact_none_matches:
                 cleaned_items.append(cleaned_line)
                 
         # If model outputs a single comma-separated line instead of bullets
         if len(cleaned_items) == 1 and "," in cleaned_items[0]:
-            comma_split = [item.strip() for item in cleaned_items[0].split(',') if item.strip()]
+            comma_split = [
+                constraint
+                for item in cleaned_items[0].split(',')
+                if item.strip()
+                for constraint in [final_derived_constraint(item)]
+                if constraint
+            ]
             if len(comma_split) > 1:
                 return dedupe_list_exact(comma_split)
 
@@ -156,6 +180,16 @@ Output:"""
             )
             goal_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             goal_sentence = self._sanitize_generation(goal_sentence)
+
+            # Sampling stops the model emitting a whole function body for a
+            # code-shaped input (see above), but it still sometimes wraps the
+            # one sentence it does produce in a code fence -- and the
+            # max_new_tokens cap usually cuts the block before its closing
+            # fence, so what arrives is an unbalanced marker rather than a
+            # matched pair. Strip before dedupe/encode: the fence would
+            # otherwise be printed as the root task description and embedded
+            # into goal_vector, the tier-2 similarity target.
+            goal_sentence = strip_code_fences(goal_sentence)
 
             # FIX: greedy decoding here occasionally degenerates into a
             # repeated clause/sentence, which then silently pushed real
@@ -234,7 +268,9 @@ RULES:
 1. Output ONLY a Markdown bulleted list using the '-' character.
 2. No introductory text. No concluding text.
 3. Do not invent constraints. Stick strictly to the text.
-4. If no explicit constraints exist, output exactly: NONE
+4. Each bullet states ONLY the constraint itself. Never write the
+   reasoning behind it -- no 'because', 'since', 'therefore', 'so'.
+5. If no explicit constraints exist, output exactly: NONE
 
 EXAMPLES:
 Input: "Build a web scraper in Python. It must use BeautifulSoup and run under 5 seconds. Don't use Selenium."
