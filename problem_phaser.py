@@ -42,6 +42,25 @@ class Problem_Phaser:
     SEMANTIC_BASE = 1.0
     SEMANTIC_COEF = 0.8
 
+    # Repetition penalty for every extraction call below. Raised from 1.15:
+    # at that strength these four extractions still degenerated often
+    # enough that the cleanup downstream of them (dedupe_global_and_cap on
+    # the goal, dedupe_list_exact on the constraint bullets) was doing real
+    # work on real runs rather than sitting there as an unused backstop.
+    #
+    # Safe to raise HERE specifically, unlike the other two 1.15s in the
+    # system. main.py's shared judge/synthesizer closure has to stay at
+    # 1.15 because deep_critique structurally repeats the words "accept"/
+    # "reject", and 1.3 fragmented them into subword pieces ("ac ce pt")
+    # that judge.py's verdict regex could not match -- silently discarding
+    # the model's actual determination. Nothing the phaser generates has
+    # that shape: a goal sentence, a context sentence, a bulleted
+    # constraint list and a taxonomy string are parsed structurally (by
+    # bullet, by " > ", by "(Focus:") and none of them needs a specific
+    # keyword emitted more than once, so there is no token here that a
+    # stronger penalty can break by discouraging its repeat.
+    REPETITION_PENALTY = 1.3
+
     def __init__(self, model, tokeniser, embed_model=None):
         self.llm = model
         self.tokeniser = tokeniser
@@ -176,7 +195,7 @@ Output:"""
                 **inputs, max_new_tokens=100, min_new_tokens=5,
                 do_sample=True, temperature=0.7, top_p=0.9,
                 pad_token_id=self.tokeniser.eos_token_id,
-                repetition_penalty=1.15, no_repeat_ngram_size=4,
+                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
             )
             goal_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             goal_sentence = self._sanitize_generation(goal_sentence)
@@ -243,7 +262,7 @@ Output:"""
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=100, min_new_tokens=2, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
-                repetition_penalty=1.15, no_repeat_ngram_size=4,
+                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
             )
             context_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             context_sentence = self._sanitize_generation(context_sentence)
@@ -299,7 +318,7 @@ Output:
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=120, min_new_tokens=2, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
-                repetition_penalty=1.15, no_repeat_ngram_size=4,
+                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
             )
             req_output = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             req_output = self._sanitize_generation(req_output)
@@ -338,7 +357,7 @@ Output:"""
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=60, min_new_tokens=5, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
-                repetition_penalty=1.15, no_repeat_ngram_size=4,
+                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
             )
             domain_str = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             
