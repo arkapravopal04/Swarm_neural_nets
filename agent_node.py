@@ -211,6 +211,36 @@ class Agent:
     THINK_TEMPERATURE = 0.7
     THINK_TOP_P = 0.9
 
+    # Ported from decide()'s generate() call, where it has been carrying
+    # repetition control on its own since no_repeat_ngram_size was
+    # reverted. think() got the sampling half of that profile
+    # (temperature/top_p above) but not the anti-repetition half, which is
+    # the gap that let a room-booking THINK cycle emit the same sentence
+    # eight times verbatim at temperature 0.7 -- sampling alone does not
+    # break a loop once the model has locked onto a clause, it just picks
+    # the same high-probability continuation again from a slightly wider
+    # set. Same value as decide() so the two paths degrade identically.
+    THINK_REPETITION_PENALTY = 1.15
+
+    # How far back the penalty looks. model.generate() penalizes against
+    # the entire context; here the context is a KV cache that survives
+    # across cycles and can reach MAX_TOTAL_THINK_TOKENS, and penalizing
+    # every token an agent has ever produced would tax the task's own
+    # vocabulary (the words it legitimately needs to repeat) as hard as
+    # the loop. A sliding window penalizes the loop -- which is local by
+    # construction -- and leaves long-range reuse alone. Prompt tokens are
+    # deliberately excluded for the same reason.
+    THINK_REPETITION_WINDOW = 256
+
+    # Degeneracy check cadence for think()'s early stop. _looks_degenerate
+    # re-splits the whole chunk on sentence boundaries, so it is not worth
+    # running per-token; every 16 tokens bounds the wasted generation at
+    # 15 tokens past the repeat while keeping the regex work off the hot
+    # path. The minimum exists because two sentences have to EXIST before
+    # one can repeat.
+    THINK_DEGEN_CHECK_EVERY = 16
+    THINK_DEGEN_MIN_TOKENS = 48
+
     MAX_TOTAL_THINK_TOKENS = 4096
     THINK_CYCLES_BEFORE_DECIDE = 1
 
@@ -251,6 +281,12 @@ class Agent:
         self.disabled_tool_attempts = 0
         self.last_token_id = None
         self._total_generated = 0
+        # Sliding window of recently generated token ids, used to apply
+        # THINK_REPETITION_PENALTY by hand in think(). Lives on the
+        # instance, not the loop, because the KV cache it mirrors survives
+        # across think() cycles -- a loop that straddles a cycle boundary
+        # has to stay penalized.
+        self._think_recent_ids = deque(maxlen=self.THINK_REPETITION_WINDOW)
         # actions
         self.action_tokens = ["THINK", "SPAWN", "TOOL", "REPORT", "DIE"]
         # Set by run() to whatever available_tools it was actually called
@@ -335,14 +371,30 @@ class Agent:
 
 
     def _get_role_cap(self):
-        """Actual cap of number of tokens....add more when ever"""
+        """Per-role ceiling on think()'s generation....add more when ever
+
+        Halved (decomposer 128->64, executor 256->128, verifier 128->64).
+        These were sized as "how long may a reasoning cycle run", but
+        think() has no natural stop -- it is a hand-rolled forward-pass
+        loop with no EOS check, so it ALWAYS runs the full cap, every
+        cycle, for every agent. The budget was therefore not a ceiling
+        that occasionally bound; it was the exact length of every single
+        generation, and the back half of it was filler: restatement of
+        the seed prompt, then the same sentence looping until the counter
+        ran out.
+
+        The cap truncates mid-sentence either way (nothing here waits for
+        a sentence boundary), so spending fewer tokens to reach the same
+        truncation is strictly cheaper. The degeneracy check in think()
+        now usually stops the loop before even this lower cap is reached.
+        """
         if self.role == "decomposer":
-            return 128
+            return 64
         if self.role == "executor":
-            return 256
-        if self.role == "verifier":
             return 128
-        return 256  # safety default for any role not yet in this map
+        if self.role == "verifier":
+            return 64
+        return 128  # safety default for any role not yet in this map
 
     def _default_available_tools(self):
         try:
@@ -742,6 +794,7 @@ Your next action:"""
             inputs = self.tokeniser(prompt, return_tensors="pt").to(self.model.device)
             input_ids = inputs["input_ids"]
             self._total_generated = 0  # fresh reasoning chain -- reset lifetime counter
+            self._think_recent_ids.clear()  # ...and the repetition window it shares a context with
 
         else:
             if self.last_token_id is not None:
@@ -750,6 +803,7 @@ Your next action:"""
                 raise ValueError("KV_Cache is present, but missing last_token_id to continue generation.")
 
         hit_token_ceiling = False
+        hit_degenerate = False
         generated_chunk = ""
 
         with torch.no_grad():
@@ -778,7 +832,31 @@ Your next action:"""
                 # temperature-scale, keep the smallest set of tokens whose
                 # cumulative probability reaches THINK_TOP_P, renormalize
                 # over just those, draw one.
-                next_token_logits = logits[:, -1, :] / self.THINK_TEMPERATURE
+                # Cloned: the penalty below writes in place, and the raw
+                # slice is a view onto outputs.logits.
+                next_token_logits = logits[:, -1, :].clone()
+
+                # Repetition penalty, applied to the raw logits BEFORE the
+                # temperature divide -- same order model.generate() uses, so
+                # a given penalty value means the same thing here as it does
+                # in decide(). Divide a positive score / multiply a negative
+                # one, which pushes a token that has already appeared toward
+                # -inf from either side (a flat subtraction would invert the
+                # ranking of negative scores).
+                if self._think_recent_ids:
+                    recent = torch.tensor(
+                        list(set(self._think_recent_ids)),
+                        device=next_token_logits.device,
+                        dtype=torch.long,
+                    )
+                    seen = next_token_logits[:, recent]
+                    next_token_logits[:, recent] = torch.where(
+                        seen > 0,
+                        seen / self.THINK_REPETITION_PENALTY,
+                        seen * self.THINK_REPETITION_PENALTY,
+                    )
+
+                next_token_logits = next_token_logits / self.THINK_TEMPERATURE
                 sorted_logits, sorted_indices = torch.sort(
                     next_token_logits, descending=True, dim=-1
                 )
@@ -794,18 +872,43 @@ Your next action:"""
                 next_token_tensor = sorted_indices.gather(-1, choice).squeeze(-1)
                 self.last_token_id = next_token_tensor.item()
                 self._total_generated += 1
+                self._think_recent_ids.append(self.last_token_id)
 
                 token_text = self.tokeniser.decode([self.last_token_id], skip_special_tokens=True)
                 generated_chunk += token_text
 
                 input_ids = next_token_tensor.unsqueeze(0)
 
+                # Early stop on a collapsed generation. The penalty above
+                # makes a verbatim loop much less likely; it does not make
+                # it impossible, and when one does start there is nothing
+                # else in this loop that can end it -- there is no EOS check
+                # here, so a degenerate chain otherwise runs out the full
+                # role cap and files every repeat into thought_process.
+                # _looks_degenerate is the same check decide() retries on
+                # (repeated sentence, or a tail of bracket/backtick noise);
+                # here there is no retry to fall back on, so the cycle just
+                # ends and the accumulated text is kept as-is.
+                if (self._total_generated >= self.THINK_DEGEN_MIN_TOKENS
+                        and step % self.THINK_DEGEN_CHECK_EVERY == 0
+                        and self._looks_degenerate(generated_chunk)):
+                    hit_degenerate = True
+                    print(f"  [think() early-stop] agent={self.agent_id} role={self.role} "
+                          f"generation looked degenerate at step={step}/{max_tokens} "
+                          f"-- ending cycle instead of spending the remaining budget.")
+                    break
+
         # Sanitize the whole cycle's output before storing it -- scaffolding
         # lines (ACTION:/PAYLOAD:/etc.) can only be recognized reliably once
         # a full line has accumulated, not token-by-token mid-line.
         self.thought_process += strip_scaffolding_lines(strip_special_tokens(generated_chunk))
 
-        if self.think_cycle <= self.THINK_CYCLES_BEFORE_DECIDE and not hit_token_ceiling:
+        # A cycle that collapsed is treated like the token ceiling: another
+        # THINK continues the same KV cache that just produced the loop, so
+        # it would most likely reproduce it. Hand control to decide()
+        # instead, which has its own retry loop and can re-roll.
+        if (self.think_cycle <= self.THINK_CYCLES_BEFORE_DECIDE
+                and not hit_token_ceiling and not hit_degenerate):
             return "THINK"
         else:
             return "FORCE_DECIDE"
