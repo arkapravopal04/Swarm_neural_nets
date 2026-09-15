@@ -362,3 +362,136 @@ def drop_incomplete_tail(text):
     if last_end is None or last_end == len(stripped):
         return text
     return stripped[:last_end]
+
+
+# ---------------------------------------------------------------------------
+# Closer-cycling degeneration
+#
+# A third repetition shape, distinct from the two the dedupe helpers above
+# handle and invisible to both. Observed verbatim at the end of a REPORT:
+#
+#   "...Ready. Finalized. Deploying. Deployment. Done. Ready for review.
+#    Submitted. Confirmed. Completed."
+#
+# No SENTENCE repeats, so dedupe_and_cap and dedupe_global_and_cap both
+# pass it through untouched. No TOKEN repeats either, so a token-level
+# repetition_penalty has nothing to bite on. The model is cycling
+# synonyms for "finished": semantically stuck while lexically novel at
+# every step, which is precisely the blind spot between those two
+# mechanisms.
+#
+# DETECTION IS DELIBERATELY NARROW. The first attempt here used prosody
+# alone -- a run of N consecutive sub-four-word sentences -- on the theory
+# that real prose does not do that. It does: "Here are the steps. 1. Buy
+# milk. 2. Buy eggs. 3. Buy flour." splits into exactly that shape (the
+# enumerators become their own one-word sentences), and the tail-trimmer
+# below cut a real shopping list down to "Here are the steps." A short
+# list and a closer-cycle are genuinely indistinguishable by length, so
+# length is used only as a gate, and the actual decision is made against
+# a vocabulary of completion/status stems.
+#
+# The cost of that choice, stated plainly: this catches the COMPLETION
+# flavour of synonym-cycling and nothing else. A model that cycles
+# synonyms in some other register ("Furthermore. Moreover. Additionally.")
+# passes straight through. Extending _CLOSER_STEMS is how that gets
+# handled; a general semantic-redundancy check needs embeddings, which
+# this module deliberately does not depend on (see the module docstring --
+# re only). Precision was chosen over recall on purpose: a false negative
+# leaves filler in the output, a false positive silently deletes a real
+# answer.
+# ---------------------------------------------------------------------------
+
+CLOSER_MIN_RUN = 4    # consecutive closer sentences before it counts
+CLOSER_MAX_WORDS = 3  # a closer sentence is short; longer ones are real prose
+
+# Matched as PREFIXES, so one entry covers a word's inflections
+# ("deploy" -> deploying / deployed / deployment). Over-broad matches are
+# possible in principle ("end" also prefixes "endorse") but are gated by
+# the all-content-words rule and the length limit below, which together
+# require the ENTIRE sentence to be nothing but closers.
+_CLOSER_STEMS = (
+    "done", "ready", "complet", "finish", "final", "submit", "confirm",
+    "deploy", "verif", "approv", "review", "acknowledg", "understood",
+    "noted", "ok", "yes", "end", "clos", "sent", "deliver", "ship",
+    "resolv", "success", "pending", "process", "execut", "initiat",
+    "start", "launch", "accept", "valid", "check", "sign",
+)
+
+# Function words that carry no content, so they neither make a sentence a
+# closer nor disqualify it ("Ready for review" is still a pure closer).
+_CLOSER_STOPWORDS = frozenset((
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "to", "for", "of", "in", "on", "at", "as", "and", "or", "it", "its",
+    "this", "that", "these", "those", "all", "we", "i", "you", "now",
+    "has", "have", "had", "will", "would", "can", "not", "no", "up",
+))
+
+_WORD_CLEAN_RE = re.compile(r"[^a-z]")
+
+
+def _sentence_list(text):
+    """Sentences as split everywhere else in this module, blanks dropped."""
+    return [s for s in re.split(r'(?<=[.!?])\s+', str(text).strip()) if s.strip()]
+
+
+def _is_closer_sentence(sentence, max_words=CLOSER_MAX_WORDS):
+    """True when a sentence is short AND made of nothing but completion words.
+
+    Both halves are required. "Confirmed." qualifies; "Buy milk."  fails on
+    vocabulary (buy/milk are not closers); "The migration completed
+    successfully after all four services restarted." fails on length even
+    though it is about completion -- it is a real sentence carrying real
+    information, and length is the cheapest signal that says so.
+    """
+    words = [w for w in (_WORD_CLEAN_RE.sub("", w.lower()) for w in sentence.split()) if w]
+    if not words or len(words) > max_words:
+        return False
+    content = [w for w in words if w not in _CLOSER_STOPWORDS]
+    if not content:
+        return False
+    return all(w.startswith(_CLOSER_STEMS) for w in content)
+
+
+def has_closer_run(text, min_run=CLOSER_MIN_RUN, max_words=CLOSER_MAX_WORDS):
+    """True when `text` contains a run of `min_run` consecutive closer sentences.
+
+    Used as a degeneracy SIGNAL (see Agent._looks_degenerate), so it looks
+    anywhere rather than only at the tail: during streaming generation the
+    run is at the tail by construction, and after the fact a run buried
+    mid-answer is just as much evidence that the generation collapsed.
+    """
+    if not text:
+        return False
+    run = 0
+    for s in _sentence_list(text):
+        run = run + 1 if _is_closer_sentence(s, max_words) else 0
+        if run >= min_run:
+            return True
+    return False
+
+
+def trim_closer_tail(text, min_run=CLOSER_MIN_RUN, max_words=CLOSER_MAX_WORDS):
+    """Drop a TRAILING run of closer sentences.
+
+    Trimming is restricted to the tail even though detection is not: a run
+    buried mid-text has real content after it that cutting there would
+    destroy, whereas a run reaching the end of the text has nothing after
+    it to preserve. Returns the text unchanged when the trailing run is
+    shorter than min_run, and when trimming would leave nothing behind --
+    an answer that is ENTIRELY closers is a failure the judge's own
+    emptiness checks should see, not something to silently blank out here
+    (same reasoning as drop_incomplete_tail).
+    """
+    if not text:
+        return text
+    sentences = _sentence_list(text)
+    if not sentences:
+        return text
+
+    cut = len(sentences)
+    while cut > 0 and _is_closer_sentence(sentences[cut - 1], max_words):
+        cut -= 1
+
+    if len(sentences) - cut < min_run or cut == 0:
+        return text
+    return " ".join(sentences[:cut])

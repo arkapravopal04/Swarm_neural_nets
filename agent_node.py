@@ -19,9 +19,11 @@ from colony_state import AgentNode
 from tools import ToolRegistry
 from text_utils import (
     dedupe_and_cap as _dedupe_repeated_sentences,
+    has_closer_run,
     normalize_identifier,
     strip_special_tokens,
     strip_scaffolding_lines,
+    trim_closer_tail,
 )
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList
@@ -402,7 +404,7 @@ class Agent:
         except Exception:
             return []
 
-    def _get_format_example(self):
+    def _get_format_example(self, available_tools=None):
         examples = {
             "decomposer": (
                 'ACTION: SPAWN\n'
@@ -417,13 +419,17 @@ class Agent:
                 'PAYLOAD: {"tool_name": "run_code", "args": {"code_string": "print(\'hello\')"}}'
             ),
         }
+        tools_blocked = self._tools_blocked(available_tools)
+
         positive = examples.get(self.role, examples["executor"])
-        if (
-            (self.tool_circuit_open or self.disabled_tool_closed)
-            and positive.startswith("ACTION: TOOL")
-        ):
+        if tools_blocked and positive.startswith("ACTION: TOOL"):
             # Showing a TOOL example while TOOL is refused is the single
             # strongest nudge back into the loop we are trying to break.
+            # Widened from (circuit_open or disabled_closed) to the shared
+            # gate: with tools disabled for the run, EVERY executor was
+            # still being shown a run_code call as its one worked example
+            # of a valid response, which is why so many of them opened
+            # with one.
             positive = examples["verifier"]
 
         executor_spawn_example = (
@@ -495,7 +501,11 @@ class Agent:
         # content at all.
         negative = "<free-form reasoning with no ACTION: line -- placeholder, not a task>"
 
-        tool_arg_reference = (
+        # Dropped wholesale when TOOL cannot fire. This table is five
+        # lines of exact-key JSON for tools the agent is not permitted to
+        # call -- it is both the largest tool-shaped block in the prompt
+        # and an implicit claim that calling them is on the table.
+        tool_arg_reference = "" if tools_blocked else (
             "Tool argument reference (use the EXACT keys shown for each "
             "tool -- they are NOT interchangeable):\n"
             '- run_code: {"tool_name": "run_code", "args": {"code_string": "..."}}\n'
@@ -517,7 +527,12 @@ class Agent:
             f"{tool_arg_reference}"
         )
 
-    def _get_role_constraint_str(self):
+    def _get_role_constraint_str(self, available_tools=None):
+        # Same gate as the prompt builders, taking the caller's
+        # effective tool set rather than re-deriving one from
+        # _run_available_tools, which a direct decide()/think() call
+        # that skipped run() would never have set.
+        tools_blocked = self._tools_blocked(available_tools)
         if self.role == "decomposer":
             base_rule = (
                 "CRITICAL RULE: You are FORBIDDEN from solving the problem "
@@ -589,7 +604,9 @@ class Agent:
                     "You are a NON-ROOT decomposer. SPAWN ONLY \"executor\" "
                     "children here, and make each one's task GRANULAR -- "
                     "small enough that it should take an executor no more "
-                    "than 2-3 think cycles and at most one TOOL call to "
+                    + ("than 2-3 think cycles to "
+                       if tools_blocked else
+                       "than 2-3 think cycles and at most one TOOL call to ") +
                     "finish (e.g. \"calculate X given these inputs\", "
                     "\"look up the density of Y\", \"print the result of "
                     "this formula\") -- never a whole sub-project like "
@@ -615,8 +632,12 @@ class Agent:
             "SPAWN children yourself -- instead, ACTION: DIE with a PAYLOAD "
             "that starts with the exact phrase \"TASK TOO LARGE:\" followed "
             "by why. You will be replaced by a decomposer that breaks your "
-            "task down properly. Use TOOL/REPORT when you can produce the "
-            "answer yourself in one pass -- reserve this DIE for when the "
+            "task down properly. "
+            + ("Use REPORT when you can produce the answer yourself in one "
+               "pass" if tools_blocked else
+               "Use TOOL/REPORT when you can produce the answer yourself in "
+               "one pass") +
+            " -- reserve this DIE for when the "
             "task is genuinely several tasks wearing one description.\n"
             "IMPORTANT: if a task asks you to estimate, specify, or "
             "calculate a real-world value (a material property, a physical "
@@ -634,15 +655,15 @@ class Agent:
             requirements = self.requirements or []
         if available_tools is None:
             available_tools = self._default_available_tools()
-        role_constraint_str = self._get_role_constraint_str()
+        role_constraint_str = self._get_role_constraint_str(available_tools)
         requirements_str = (
             "Constraints you must satisfy:\n" + "\n".join(f"- {r}" for r in requirements) + "\n"
             if requirements else ""
         )
+        tools_blocked = self._tools_blocked(available_tools)
         tools_str = (
             f"Tools actually available to you: {available_tools}\n"
-            if available_tools and not self.tool_circuit_open
-            and not self.disabled_tool_closed else ""
+            if available_tools and not tools_blocked else ""
         )
         if self.tool_circuit_open:
             actions_str = (
@@ -655,6 +676,22 @@ class Agent:
                 "Real actions that exist: THINK, SPAWN, REPORT, DIE (TOOL is "
                 "closed to you for the rest of this run -- do not attempt "
                 "it).\n"
+            )
+        elif tools_blocked:
+            # Tools disabled for the whole run. This branch did not
+            # exist: an empty available_tools silenced tools_str above
+            # (so the agent was never told WHICH tools it had) and then
+            # fell through to the line below, which advertises TOOL as a
+            # real action anyway. The agent therefore knew TOOL existed,
+            # knew nothing about what it could call, and guessed --
+            # run_code and write_file, the two it had just seen in the
+            # format example. Every guess cost a full think() cycle to
+            # compose and another to recover from the rejection.
+            actions_str = (
+                "Real actions that exist: THINK, SPAWN, REPORT, DIE. "
+                "There are NO tools in this run -- TOOL is not an "
+                "available action and any tool call will be refused. "
+                "Produce the answer from your own reasoning.\n"
             )
         else:
             actions_str = "Real actions that exist: THINK, SPAWN, TOOL, REPORT, DIE (no others exist).\n"
@@ -718,8 +755,8 @@ class Agent:
             "Constraints you must satisfy:\n" + "\n".join(f"- {r}" for r in requirements) + "\n"
             if requirements else ""
         )
-        format_example_str = self._get_format_example()
-        role_constraint_str = self._get_role_constraint_str()
+        format_example_str = self._get_format_example(available_tools)
+        role_constraint_str = self._get_role_constraint_str(available_tools)
 
         # Circuit breaker open: TOOL is refused by request_tool anyway, so
         # advertising it here only invites another wasted decide() cycle that
@@ -744,7 +781,11 @@ class Agent:
                 "run. Do not attempt one.\n"
             )
             tool_format_line = ""
-        elif not available_tools:
+        elif self._tools_blocked(available_tools):
+            # Same gate the thinking seed and the format example use now,
+            # so a run with tools disabled produces a consistent prompt at
+            # all three sites instead of one that drops TOOL here while
+            # still advertising it during think().
             tool_action_line = ""
             tool_format_line = ""
         else:
@@ -813,8 +854,15 @@ Your next action:"""
                     break
 
                 if step % 25 == 0:
+                    # rep= reports the penalty actually in force and how many
+                    # distinct token ids it is currently suppressing. The
+                    # early-stop below only prints when it FIRES, so a clean
+                    # run produced no think()-side evidence at all that either
+                    # mechanism was wired in -- this makes the penalty visible
+                    # on every heartbeat instead of only on failure.
                     print(f"  [think() heartbeat] agent={self.agent_id} role={self.role} "
-                          f"step={step}/{max_tokens} total_generated={self._total_generated}")
+                          f"step={step}/{max_tokens} total_generated={self._total_generated} "
+                          f"rep={self.THINK_REPETITION_PENALTY}/{len(set(self._think_recent_ids))}")
 
                 outputs = self.model(
                 input_ids=input_ids,
@@ -1014,6 +1062,16 @@ Your next action:"""
         tail = text[-120:]
         noise_chars = sum(1 for c in tail if c in "{}[]<>`")
         if noise_chars > 40:
+            return True
+
+        # Third shape: closer-cycling. Neither check below sees it -- every
+        # sentence is unique, so the repeated-sentence counter never climbs
+        # past 1, and it is plain prose, so the bracket-noise count stays at
+        # 0. A REPORT that trailed off into "Ready. Finalized. Deploying.
+        # Deployment. Done. Submitted. Confirmed. Completed." was therefore
+        # scored as a perfectly healthy generation by this function, which
+        # is why decide() never retried it and think() never cut it short.
+        if has_closer_run(text):
             return True
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 15]
         counts = {}
@@ -1246,7 +1304,16 @@ Your next action:"""
                 # a REPORT's result untouched. This is the source-side fix
                 # complementing the orchestrator's own dedupe-before-judging
                 # pass on handle_completion's result.
-                payload = _dedupe_repeated_sentences(payload_raw, max_chars=2000)
+                # trim_closer_tail runs FIRST, on the raw text: it works
+                # on sentence boundaries, and the dedupe's length cap can
+                # append an ellipsis that changes where the last sentence
+                # appears to end. Removes the "Ready. Done. Submitted."
+                # tail that _looks_degenerate now also flags upstream --
+                # both are needed, since the flag only triggers a retry and
+                # a retry can come back with filler of its own.
+                payload = _dedupe_repeated_sentences(
+                    trim_closer_tail(payload_raw), max_chars=2000
+                )
 
         if not payload and not (isinstance(payload, dict)):
             if generated_text.strip():
@@ -1473,6 +1540,38 @@ Your next action:"""
         TOOL at all.
         """
         return self.disabled_tool_attempts >= self.MAX_DISABLED_TOOL_ATTEMPTS
+
+    def _tools_blocked(self, available_tools=None):
+        """True when no TOOL call this agent makes can possibly succeed.
+
+        Three separate gates all end in the same place -- request_tool()
+        refusing the call -- and every one of them used to be handled at a
+        different subset of the prompt-building sites:
+
+          - tool_circuit_open      (too many consecutive tool errors)
+          - disabled_tool_closed   (too many out-of-set tool attempts)
+          - run(available_tools=[])  tools disabled for the whole run
+
+        The third was the one nothing checked consistently. An empty list
+        is enforced at request_tool() via _run_available_tools, but the
+        thinking seed still listed TOOL among "real actions that exist",
+        and the format example still handed every executor a run_code
+        call to copy. So agents did exactly what the prompt showed them:
+        spend a full think() cycle composing a run_code/write_file call,
+        get it bounced, then spend another full cycle recovering from the
+        rejection. At least five agents did this in one run and one did it
+        three times -- pure dead weight in the loop that is 85% of spend.
+
+        Note the None/[] distinction, which is load-bearing: `None` means
+        "no restriction" (the default, and what direct decide()/think()
+        calls fall back to), `[]` means "explicitly nothing". Only the
+        latter blocks.
+        """
+        if self.tool_circuit_open or self.disabled_tool_closed:
+            return True
+        if available_tools is None:
+            available_tools = self._run_available_tools
+        return available_tools is not None and len(available_tools) == 0
 
     def _accumulated_tool_errors_text(self):
         """The error text behind an open circuit, oldest first."""

@@ -20,7 +20,11 @@ synthesizer doesn't own a model instance, the orchestrator wires in whatever
 already wraps the shared model.
 """
 
-from text_utils import dedupe_and_cap as _dedupe_and_cap
+from text_utils import (
+    dedupe_global_and_cap as _dedupe_and_cap,
+    drop_incomplete_tail as _drop_incomplete_tail,
+    trim_closer_tail as _trim_closer_tail,
+)
 
 
 class Synthesizer:
@@ -173,7 +177,31 @@ class Synthesizer:
         # the user reads as the finished answer instead of getting caught
         # partway through the pipeline. Capped at the same budget as the
         # input side (MAX_RESULTS_BLOCK_CHARS) for symmetry.
-        return _dedupe_and_cap(self.llm_call_fn(prompt), max_chars=self.MAX_RESULTS_BLOCK_CHARS)
+        #
+        # FIX (repeat survived into the final answer): a real run ended with
+        # "THESE ACTIONS DIRECTLY ADDRESS THE TWO PRIMARY" repeated verbatim
+        # at the very end, past a single dedupe pass. Three separate holes,
+        # all of which had to be open at once for that to happen:
+        #
+        #   1. the repeat was ADJACENT but not IDENTICAL -- the second copy
+        #      was cut off mid-sentence by the generation budget, so
+        #      "...THE TWO PRIMARY GOALS." and "...THE TWO PRIMARY" compared
+        #      unequal and dedupe_and_cap kept both. A trailing fragment has
+        #      no terminator, so dropping it first is what actually removes
+        #      this shape.
+        #   2. dedupe_and_cap only collapses ADJACENT duplicates. A repeat
+        #      separated by even one intervening sentence survived it.
+        #      dedupe_global_and_cap is the same function without that
+        #      restriction, and there is no reason the LAST decode in the
+        #      run should be the one using the weaker of the two.
+        #   3. nothing here caught closer-cycling at all.
+        #
+        # Order is load-bearing: clean on sentence boundaries first, cap
+        # last, because the cap appends an ellipsis that later passes would
+        # misread as a sentence terminator.
+        raw = self.llm_call_fn(prompt)
+        cleaned = _trim_closer_tail(_drop_incomplete_tail(raw))
+        return _dedupe_and_cap(cleaned, max_chars=self.MAX_RESULTS_BLOCK_CHARS)
 
     # ------------------------------------------------------------------
     # Entry point
