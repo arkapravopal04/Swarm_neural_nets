@@ -475,7 +475,7 @@ def test_open_circuit_removes_tool_from_the_prompt():
     assert "- REPORT" in prompt_after and "- DIE" in prompt_after
 
     seed = agent._build_thinking_seed(available_tools=["run_code"])
-    assert "THINK, SPAWN, REPORT, DIE" in seed
+    assert "THINK, REPORT, DIE" in seed and "SPAWN" not in seed
     assert "Tools actually available to you" not in seed
 
 
