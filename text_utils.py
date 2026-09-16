@@ -229,6 +229,42 @@ def strip_code_fences(text):
     return text.strip()
 
 
+_OPENING_FENCE_RE = re.compile(
+    rf"{_FENCE}[ \t]*(?:{_FENCE_INFO}\b)?", re.IGNORECASE
+)
+_ANY_FENCE_RE = re.compile(_FENCE)
+
+
+def cut_at_code_block(text):
+    """
+    Keeps only the prose of a one-sentence generation, discarding any code
+    block the model opened alongside it.
+
+    strip_code_fences removes fence MARKERS at line/text edges, and so
+    misses the shape that actually leaked into the goal string: the model
+    finishes its sentence and opens a block on the same line --
+    "Generate a parser. ```python def extract(text): ..." -- with a
+    newline and a code body after. The fence is mid-line and not at the
+    end of the text, so no edge pattern matches; both the fence and the
+    code behind it survived into the root task description and goal_vector.
+
+    If the text OPENS with a fence, the sentence is inside the block: the
+    opener (and its info string) is dropped and the text is cut at the next
+    fence. Otherwise it is cut at the first fence. Run strip_code_fences
+    afterwards for any leftover edge markers.
+    """
+    if not text:
+        return text
+    stripped = text.lstrip()
+    opener = _OPENING_FENCE_RE.match(stripped)
+    if opener:
+        stripped = stripped[opener.end():]
+    closer = _ANY_FENCE_RE.search(stripped)
+    if closer:
+        stripped = stripped[:closer.start()]
+    return stripped.strip()
+
+
 # Connectives that separate the reasoning from the constraint it
 # produced. Everything before the LAST one is derivation; what follows is
 # the constraint itself.
@@ -307,6 +343,114 @@ def final_derived_constraint(line):
             return ""
 
     return tail[:1].upper() + tail[1:]
+
+
+# Self-correction markers that never occur in a constraint, wherever they
+# sit in the line. "wait" only counts as an interjection ("Wait," / "wait...")
+# so "Wait time must be under 2 s" is not self-talk.
+_STRONG_REASONING_RE = re.compile(
+    r"(?:^|[^\w])(?:wait\s*(?:[,!]|\.{2,}|…)|hmm+\b|let me\b|on second thought\b|"
+    r"fix this\b|we need to check\b)",
+    re.IGNORECASE,
+)
+# First-person / filler openers. These DO occur mid-sentence in real
+# constraints ("..., okay, and throughput above 1k rps", "the API I can
+# call"), so they only count when they open a clause: start of the line or
+# right after a sentence terminator.
+_CLAUSE_OPENER_REASONING_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:let's\b|i need to\b|i should\b|i think\b|i'll\b|"
+    r"i will\b|i'm\b|i am\b|i must\b|i can\b|actually,|okay,|ok,)",
+    re.IGNORECASE,
+)
+# First-person anywhere in the line: not enough on its own, but together
+# with excessive length it marks narrated reasoning rather than a clause.
+_FIRST_PERSON_RE = re.compile(r"\b(?:i|i'm|i'll|i've|me|my|let's)\b", re.IGNORECASE)
+# A numeric range written with an ellipsis ("1...10", "0 … 255").
+_NUMERIC_RANGE_RE = re.compile(r"\d\s*(?:\.{3}|…)\s*[-+]?\d")
+REASONING_MAX_WORDS = 40
+
+
+def reasoning_reason(line):
+    """
+    Why an extracted "constraint" looks like the model thinking out loud,
+    or None if it reads as a constraint. See looks_like_model_reasoning.
+    """
+    if not line:
+        return None
+    flat = re.sub(r"\s+", " ", str(line)).strip()
+    if _STRONG_REASONING_RE.search(flat):
+        return "self-correction marker"
+    if _CLAUSE_OPENER_REASONING_RE.search(flat):
+        return "first-person/filler clause opener"
+    if flat.endswith("?"):
+        return "phrased as a question"
+    if "..." in _NUMERIC_RANGE_RE.sub("", flat).replace("…", "..."):
+        return "trailing-off ellipsis"
+    if len(flat.split()) > REASONING_MAX_WORDS and _FIRST_PERSON_RE.search(flat):
+        return f"over {REASONING_MAX_WORDS} words of first-person narration"
+    return None
+
+
+def looks_like_model_reasoning(line):
+    """
+    True when an extracted "constraint" is really a line of the model
+    thinking out loud, not a constraint.
+
+    Observed: "Wait, I need to check if there's an explicit constraint on
+    scheduling... Let me fix this." came out of the phaser's extractor as a
+    bullet, survived final_derived_constraint (it contains "need to", which
+    reads as normative), and was threaded into child agents' "Constraints
+    you must satisfy" block -- where it could never be satisfied and cost
+    the run a hard task abandonment.
+
+    Rejected: self-correction markers anywhere; first-person or filler
+    words only where they OPEN a clause (mid-sentence "okay," / "I can" is
+    ordinary constraint prose); a question; an ellipsis that is not a
+    numeric range; and long lines only when they are also first-person --
+    length alone never drops a constraint. Callers log every rejection
+    (reasoning_reason gives the why), so a wrongly dropped constraint is
+    visible in the run log.
+    """
+    return reasoning_reason(line) is not None
+
+
+# Lines that can only be source code: a definition/import statement.
+_CODE_STATEMENT_RE = re.compile(
+    r"^[ \t]*(?:def\s+\w+\s*\(|class\s+\w+\s*[:(]|import\s+[\w.]+\s*$|"
+    r"from\s+[\w.]+\s+import\s+\w|#include\s*<|function\s+\w+\s*\(|"
+    r"(?:const|let|var)\s+\w+\s*=)",
+    re.MULTILINE,
+)
+# Weaker signals: each can show up in a goal sentence on its own ("compute
+# f(x) = x + 1"), so it takes two of them.
+_CODE_SIGNAL_RES = (
+    re.compile(r"\breturn\s+[\w\[\(\{\"'-]"),        # return <expr>
+    re.compile(r"\w\([^()]*\)\s*:"),                  # f(x):
+    re.compile(r"[=!<>]=|:=|->|=>"),                  # comparison / arrows
+    re.compile(r";\s*$", re.MULTILINE),               # statement terminator
+    re.compile(r"[{}]"),                              # braces
+    re.compile(r"\bself\.\w"),                        # attribute access on self
+    re.compile(r"^(?: {4}|\t)\S", re.MULTILINE),      # indented body line
+    re.compile(r"\b\w+\s*=\s*[\w\[\{\(\"']"),         # assignment
+)
+
+
+def looks_like_source_code(text):
+    """
+    True when a generated goal "sentence" is actually code.
+
+    cut_at_code_block/strip_code_fences remove fence MARKERS; when the model
+    put code (not prose) inside the fence -- "```python def extract(text):
+    return 1" -- stripping leaves the code itself as the root task
+    description and goal_vector target. A definition/import statement is
+    decisive; otherwise two independent code signals are required, so a
+    goal that merely mentions "f(x) = x + 1" is not rejected.
+    """
+    if not text:
+        return False
+    if _CODE_STATEMENT_RE.search(text):
+        return True
+    return sum(1 for r in _CODE_SIGNAL_RES if r.search(text)) >= 2
 
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^\s>]{0,40}\|>")

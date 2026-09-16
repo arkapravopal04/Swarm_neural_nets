@@ -3,9 +3,12 @@ import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from text_utils import (
+    cut_at_code_block,
     dedupe_global_and_cap,
     dedupe_list_exact,
     final_derived_constraint,
+    looks_like_source_code,
+    reasoning_reason,
     strip_code_fences,
 )
 
@@ -94,6 +97,17 @@ class Problem_Phaser:
                 text = text[:idx]
         return text.strip()
 
+    @staticmethod
+    def _is_dropped_reasoning(line, path):
+        """True (and logged) when a candidate constraint is model self-talk.
+        Every path that filters constraints goes through here, so a
+        wrongly dropped constraint always shows up in the run log."""
+        reason = reasoning_reason(line)
+        if reason is None:
+            return False
+        print(f"[Problem_Phaser] dropped {path} constraint ({reason}): {line[:120]!r}")
+        return True
+
     def _clean_requirements(self, raw_reqs_str):
         """Safely parses bulleted/comma-separated strings into lists, bypassing false positives."""
         raw_reqs_str = raw_reqs_str.strip()
@@ -133,18 +147,33 @@ class Problem_Phaser:
 
             if cleaned_line and cleaned_line.lower() not in exact_none_matches:
                 cleaned_items.append(cleaned_line)
-                
+
+        # Model self-talk ("Wait, I need to check... Let me fix this.") is
+        # not a bound anyone can meet, and it rides into every child's
+        # constraints block -- so it is filtered out below. Filtering
+        # happens AFTER the comma-split decision: filtering the single line
+        # first dropped a whole comma-separated list because one of its
+        # items was self-talk.
+
         # If model outputs a single comma-separated line instead of bullets
         if len(cleaned_items) == 1 and "," in cleaned_items[0]:
-            comma_split = [
+            fragments = [
                 constraint
                 for item in cleaned_items[0].split(',')
                 if item.strip()
                 for constraint in [final_derived_constraint(item)]
                 if constraint
             ]
-            if len(comma_split) > 1:
+            if len(fragments) > 1:
+                comma_split = [
+                    c for c in fragments
+                    if not self._is_dropped_reasoning(c, "comma-split")
+                ]
                 return dedupe_list_exact(comma_split)
+
+        cleaned_items = [
+            c for c in cleaned_items if not self._is_dropped_reasoning(c, "bullet")
+        ]
 
         # FIX: greedy decoding can repeat an entire bullet verbatim (distinct
         # from the sentence-level dedupe used for goal/context text above --
@@ -161,6 +190,54 @@ class Problem_Phaser:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return np.dot(vec_a, vec_b) / (norm_a * norm_b)
+
+    # Extra goal samples drawn when a sample is still source code after
+    # fence stripping, before falling back to the user's own text.
+    GOAL_CODE_RESAMPLES = 2
+
+    def _clean_goal_text(self, goal_sentence):
+        # Code block cut BEFORE _sanitize_generation: sanitize stops at
+        # the first blank line, so "```python\n\nGenerate X." would
+        # otherwise be cut down to the bare fence and lose the goal.
+        goal_sentence = cut_at_code_block(goal_sentence)
+        goal_sentence = self._sanitize_generation(goal_sentence)
+
+        # Sampling stops the model emitting a whole function body for a
+        # code-shaped input (see _get_goal_prompt), but it still sometimes
+        # wraps the one sentence it does produce in a code fence -- and the
+        # max_new_tokens cap usually cuts the block before its closing
+        # fence, so what arrives is an unbalanced marker rather than a
+        # matched pair. Strip before dedupe/encode: the fence would
+        # otherwise be printed as the root task description and embedded
+        # into goal_vector, the tier-2 similarity target.
+        return strip_code_fences(goal_sentence)
+
+    def _pick_goal(self, sample, raw_text):
+        """
+        First sample whose cleaned text is prose, not code.
+
+        Fence stripping cannot help when the model put CODE inside the
+        fence ("```python def extract(text): return 1") -- what survives is
+        the code body, which would become the root task description and
+        the goal_vector target. Such a sample is re-drawn (sampling is
+        stochastic, a retry usually yields the sentence); if every attempt
+        is code, the user's own text stands in as the goal -- verbose, but
+        on-topic, which a function body is not.
+        """
+        for attempt in range(1 + self.GOAL_CODE_RESAMPLES):
+            goal_sentence = self._clean_goal_text(sample())
+            if not looks_like_source_code(goal_sentence):
+                return goal_sentence
+            print(
+                f"[Problem_Phaser] WARNING: goal sample {attempt + 1} is source "
+                f"code, not a sentence -- re-sampling: {goal_sentence[:120]!r}"
+            )
+        fallback = strip_code_fences(" ".join(raw_text.split()))
+        print(
+            f"[Problem_Phaser] WARNING: every goal sample was source code; "
+            f"using the user's input as the goal: {fallback[:120]!r}"
+        )
+        return fallback
 
     def _get_goal_prompt(self, raw_text):
         """Extracts the singular core action statement from the user's prompt."""
@@ -191,24 +268,16 @@ Output:"""
             # this call emitted "def extract_intent(text)" as the colony's
             # GOAL, i.e. the root task description and the tier-2 similarity
             # target every child is scored against.
-            outputs = self.llm.generate(
-                **inputs, max_new_tokens=100, min_new_tokens=5,
-                do_sample=True, temperature=0.7, top_p=0.9,
-                pad_token_id=self.tokeniser.eos_token_id,
-                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
-            )
-            goal_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
-            goal_sentence = self._sanitize_generation(goal_sentence)
+            def sample():
+                outputs = self.llm.generate(
+                    **inputs, max_new_tokens=100, min_new_tokens=5,
+                    do_sample=True, temperature=0.7, top_p=0.9,
+                    pad_token_id=self.tokeniser.eos_token_id,
+                    repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
+                )
+                return self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
 
-            # Sampling stops the model emitting a whole function body for a
-            # code-shaped input (see above), but it still sometimes wraps the
-            # one sentence it does produce in a code fence -- and the
-            # max_new_tokens cap usually cuts the block before its closing
-            # fence, so what arrives is an unbalanced marker rather than a
-            # matched pair. Strip before dedupe/encode: the fence would
-            # otherwise be printed as the root task description and embedded
-            # into goal_vector, the tier-2 similarity target.
-            goal_sentence = strip_code_fences(goal_sentence)
+            goal_sentence = self._pick_goal(sample, raw_text)
 
             # FIX: greedy decoding here occasionally degenerates into a
             # repeated clause/sentence, which then silently pushed real

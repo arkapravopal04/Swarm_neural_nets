@@ -236,15 +236,16 @@ def test_every_prompt_exemplar_is_recognized_as_copied():
 
 def test_exemplar_match_survives_padding_and_punctuation():
     assert Orchestrator._matching_exemplar(
-        "First, pick a color palette for the newsletter template, then proceed"
+        "First, independent part A of your task, then proceed"
     ) is not None
-    assert Orchestrator._matching_exemplar("  IMPLEMENT   THE  CORE ALGORITHM  ") is not None
+    assert Orchestrator._matching_exemplar("  <ONE   FOCUSED PIECE OF YOUR TASK>  ") is not None
+    # The model often drops the angle brackets when copying a placeholder.
+    assert Orchestrator._matching_exemplar("step that needs the result of part A") is not None
 
 
 def test_a_real_subtask_extending_a_short_exemplar_is_not_rejected():
-    """"Select the base material" is generic enough that a genuine subtask
-    can legitimately start with it; extending it into project vocabulary is
-    decomposition, not copying."""
+    """The exemplars are placeholders, so a genuine project subtask must
+    never be mistaken for one."""
     assert Orchestrator._matching_exemplar(
         "Select the base material for the turbine blade given the 1450C floor"
     ) is None
@@ -264,7 +265,7 @@ def test_copied_subtask_rejects_the_whole_batch_and_respawns():
         {"parent_id": "dec-1", "subtasks": [
             {"role": "executor", "task": "Compute the coolant flow rate margin",
              "dependencies": []},
-            {"role": "executor", "task": "Pick a color palette for the newsletter template",
+            {"role": "executor", "task": "<independent part B of YOUR task>",
              "dependencies": []},
         ]},
     )
@@ -409,3 +410,155 @@ def test_walkback_feeds_the_existing_report_trim():
     stored = orch.last_partial_result["task-1"]
     assert stored.endswith("."), f"a stump reached the judge: {stored!r}"
     assert "rev" not in stored.split(".")[-1]
+
+
+# ------------------------------------------------ last action block wins
+
+from agent_node import _last_action_match, _payload_match_for
+
+
+def test_last_action_block_wins_over_an_abandoned_draft():
+    text = ('ACTION: REPORT\nPAYLOAD: draft answer\n'
+            'Actually this needs splitting.\n'
+            'ACTION: SPAWN\nPAYLOAD: {"role": "executor", "task": "x"}')
+    match = _last_action_match(text)
+    assert match.group(1).upper() == "SPAWN"
+    assert _payload_match_for(text, match).group(1).startswith('{"role"')
+
+
+def test_prose_action_label_in_a_payload_does_not_displace_the_real_one():
+    text = "ACTION: REPORT\nPAYLOAD: Done. Recommended action: reduce load."
+    assert _last_action_match(text).group(1).upper() == "REPORT"
+
+
+class _TextTokenizer:
+    """decode() returns a fixed generation; ids only need a length."""
+    def __init__(self, text):
+        self.text = text
+
+    def decode(self, ids, skip_special_tokens=True):
+        return self.text
+
+
+def _stop_check(text):
+    """(action the stop check parses, whether it ends generation)."""
+    stop = _ActionPayloadStop(_TextTokenizer(text), prompt_len=0,
+                              extract_balanced_object=Agent._extract_first_balanced_object,
+                              min_new_tokens=0)
+    return stop._parsed_action(text), stop([[0] * 50], None)
+
+
+def test_action_word_inside_a_payload_line_does_not_hijack_the_action():
+    cases = [
+        ("ACTION: REPORT\nPAYLOAD: The recommended action: DIE if pressure > 5 bar.",
+         "REPORT", "The recommended action: DIE"),
+        ("ACTION: THINK\nPAYLOAD: Next action: TOOL to compute density.",
+         "THINK", "Next action: TOOL"),
+        # colon + action-like word, twice, mid-payload
+        ("ACTION: REPORT\nPAYLOAD: Step 1 -- action: SPAWN helpers; step 2 -- ACTION: DIE.",
+         "REPORT", "Step 1"),
+    ]
+    for text, expected, payload_start in cases:
+        match = _last_action_match(text)
+        assert match.group(1).upper() == expected, text
+        assert _payload_match_for(text, match).group(1).startswith(payload_start), text
+        assert _stop_check(text) == (expected, False), text
+        # A finished plain-text payload still ends generation on the real block.
+        assert _stop_check(text + "\n\n") == (expected, True), text
+
+
+def test_markdown_decorated_label_still_parses():
+    assert _last_action_match("**ACTION: SPAWN**\nPAYLOAD: {}").group(1).upper() == "SPAWN"
+    assert _last_action_match("reasoning\n- ACTION: REPORT\nPAYLOAD: x").group(1).upper() == "REPORT"
+
+
+def test_bare_keyword_fallback_ignores_prose_lines():
+    assert _last_action_match("Spawn\n{}").group(1).upper() == "SPAWN"
+    text = "SPAWN\n{}\nThink about the dependencies first."
+    assert _last_action_match(text).group(1).upper() == "SPAWN"
+    assert _last_action_match("some reasoning\nREPORT\nthe answer").group(1) == "REPORT"
+
+
+# ------------------------------------------------ role-scoped action menu
+
+def _prompt_for(role, generation=1):
+    from colony_state import AgentNode
+    node = AgentNode(agent_id="a-1", role=role, status="active", parent_id="root",
+                     task="do the thing", task_id="t-1", generation=generation)
+    return Agent(tokeniser=None, model=None, message=None, node=node)
+
+
+def test_only_decomposers_are_offered_spawn():
+    for role in ("executor", "verifier"):
+        agent = _prompt_for(role)
+        prompt = agent._build_prompt(available_tools=["run_code"], requirements=[])
+        seed = agent._build_thinking_seed(requirements=[], available_tools=["run_code"])
+        assert "- SPAWN" not in prompt and "If SPAWN" not in prompt, role
+        assert "ACTION: SPAWN" not in prompt, role
+        assert "SPAWN" not in seed.split("Real actions")[1], role
+
+    agent = _prompt_for("decomposer")
+    prompt = agent._build_prompt(available_tools=["run_code"], requirements=[])
+    assert "- SPAWN" in prompt and "ACTION: SPAWN" in prompt
+    assert "- TOOL" not in prompt
+    assert "Give the answer itself first" not in prompt
+
+
+def test_task_too_large_escape_hatch_is_executor_only():
+    for role, expected in (("executor", True), ("verifier", False), ("decomposer", False)):
+        agent = _prompt_for(role)
+        for tools in (["run_code"], []):
+            prompt = agent._build_prompt(available_tools=tools, requirements=[])
+            seed = agent._build_thinking_seed(requirements=[], available_tools=tools)
+            assert ("TASK TOO LARGE" in prompt) is expected, (role, tools)
+            assert ("TASK TOO LARGE" in seed) is expected, (role, tools)
+
+
+# ------------------------------------ TOOL access: prompt and enforcement agree
+
+def _tool_orchestrator(agent, monkeypatch):
+    import orchestrator as orchestrator_module
+    executed = []
+    monkeypatch.setattr(
+        orchestrator_module.ToolRegistry, "execute",
+        staticmethod(lambda name, args, **kw: executed.append(name) or {"status": "ok", "output": "1"}),
+    )
+    orch = Orchestrator.__new__(Orchestrator)
+    orch.spec = {"domain": "General Discourse"}
+    orch.judge = None
+    orch.live_agents = {agent.agent_id: agent}
+    orch.messenger = Messenger()
+    return orch, executed
+
+
+def _tool_request_from(agent):
+    from event_queue import Event
+    event = Event(type="tool_request", from_agent=agent.agent_id)
+    event.payload.update({"agent_id": agent.agent_id, "tool_name": "run_code",
+                          "args": {"code_string": "print(1)"}})
+    return event
+
+
+def test_tool_prompt_and_orchestrator_enforcement_agree(monkeypatch):
+    from agent_node import role_may_use_tools
+    for role in ("decomposer", "executor", "verifier"):
+        agent = _prompt_for(role)
+        prompt = agent._build_prompt(available_tools=["run_code"], requirements=[])
+        offered = "- TOOL" in prompt
+        assert offered is role_may_use_tools(role), role
+
+        orch, executed = _tool_orchestrator(agent, monkeypatch)
+        orch.handle_tool_request(_tool_request_from(agent))
+        assert bool(executed) is offered, role
+
+    assert not role_may_use_tools("decomposer")
+
+
+def test_refused_decomposer_tool_call_does_not_trip_the_circuit_breaker(monkeypatch):
+    agent = _prompt_for("decomposer")
+    orch, executed = _tool_orchestrator(agent, monkeypatch)
+    for _ in range(agent.MAX_CONSECUTIVE_TOOL_FAILURES + 1):
+        orch.handle_tool_request(_tool_request_from(agent))
+    assert executed == []
+    assert not agent.tool_circuit_open
+    assert "REJECTED" in agent.fail_reason and "SPAWN" in agent.fail_reason

@@ -27,6 +27,7 @@ from agent_node import (
     Agent,
     _dedupe_repeated_sentences,
     EXEMPLAR_SUBTASK_DESCRIPTIONS,
+    role_may_use_tools,
 )
 from tools import ToolRegistry
 from text_utils import (
@@ -1572,6 +1573,37 @@ class Orchestrator:
         reason_str = f" ({reason})" if reason else ""
         return f"ERROR{reason_str}: {message}"
 
+    def _tool_request_allowed(self, event: Event) -> bool:
+        """
+        Returns True if this tool request may run, False if it was refused.
+
+        Decomposers are not offered TOOL in their prompt (see
+        agent_node.role_may_use_tools); prompt-only enforcement of a
+        structural rule does not hold (see handle_spawn), so it is refused
+        here too. The refusal is NOT routed through receive_tool_result: the
+        tool never ran, so it must not count toward the agent's
+        consecutive-tool-failure circuit breaker.
+        """
+        agent_id = event.from_agent
+        live_agent = self.live_agents.get(agent_id)
+        colony = getattr(self, "colony", None)
+        record = colony.get_agent(agent_id) if colony is not None and agent_id else None
+        role = live_agent.role if live_agent is not None else getattr(record, "role", None)
+        # Orchestrator-originated requests have no agent record to check.
+        if role is None or role_may_use_tools(role):
+            return True
+
+        tool_name = event.payload.get("tool_name")
+        print(f"REJECT (structural) on {agent_id}: a '{role}' agent requested "
+              f"TOOL '{tool_name}', which its role may not call -- not executed.")
+        if live_agent is not None:
+            live_agent.fail_reason = (
+                f"Previous attempt was REJECTED: you issued TOOL '{tool_name}', "
+                f"but a {role} never calls tools -- it SPAWNs the work to "
+                f"executors. SPAWN a subtask for it, or REPORT/DIE."
+            )
+        return False
+
     def handle_tool_request(self, event: Event):
         """Handles external tool execution requests from agents."""
         payload = event.payload
@@ -1579,6 +1611,9 @@ class Orchestrator:
         tool_name = payload.get("tool_name")
         args = payload.get("args", {}) or {}
         domain = self.spec.get("domain", "General Discourse") if self.spec else "General Discourse"
+
+        if not self._tool_request_allowed(event):
+            return
 
         print(f"Executing tool '{tool_name}' for agent {agent_id}...")
 

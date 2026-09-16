@@ -46,11 +46,72 @@ from collections import deque
 # cycle (three of them on the root, before any work started, in one run).
 # Any run of repeated ACTION:/PAYLOAD: labels is now skipped, so the
 # captured group is the token AFTER the label rather than the label itself.
+#
+# Anchored to the start of a line (after optional markdown decoration such
+# as "**" or "- "). Unanchored, the label matched anywhere -- including
+# inside a PAYLOAD -- and once decide() started taking the LAST block,
+# prose like "PAYLOAD: The recommended action: DIE if pressure > 5 bar."
+# was parsed as ACTION: DIE. A real label always opens its own line.
 _ACTION_LINE_RE = re.compile(
-    r"ACTION\s*:\s*(?:(?:ACTION|PAYLOAD)\b\s*:?\s*)*([A-Za-z]+)",
-    re.IGNORECASE,
+    r"^[ \t>*_#-]*ACTION\s*:\s*(?:(?:ACTION|PAYLOAD)\b\s*:?\s*)*([A-Za-z]+)",
+    re.IGNORECASE | re.MULTILINE,
 )
-_BARE_ACTION_RE = re.compile(r"\s*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECASE)
+_ACTION_TOKENS = ("THINK", "SPAWN", "TOOL", "REPORT", "DIE")
+# A bare keyword opening a line, no "ACTION:" label.
+_BARE_ACTION_RE = re.compile(
+    r"^[ \t]*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECASE | re.MULTILINE
+)
+_PAYLOAD_RE = re.compile(r"PAYLOAD:\s*(.*)", re.DOTALL | re.IGNORECASE)
+
+
+def _last_action_match(text):
+    """
+    The action block decide() acts on: the LAST one in the generation, not
+    the first.
+
+    A model that drafts a block and then corrects itself ("ACTION: REPORT
+    ... wait, this needs splitting ... ACTION: SPAWN") means the later
+    block; first-match acted on the abandoned draft.
+
+    Labelled lines win over bare keywords. A label only counts at the start
+    of a line (see _ACTION_LINE_RE), so payload prose ("the recommended
+    action: DIE if ...") is never a candidate. Among labelled lines, the
+    last one whose token is a real action is preferred -- only if no
+    labelled token is a real action does the last labelled match stand
+    (decide() then fuzzy-matches or THINKs it).
+
+    Bare-keyword fallback: the last line opening with an UPPERCASE keyword,
+    or the text's own leading word in any case (the pre-existing recovery
+    for "Spawn\\n{...}"). Mid-text lines need uppercase because "Think
+    about..." / "Report the..." open ordinary prose lines constantly.
+    """
+    labelled = list(_ACTION_LINE_RE.finditer(text))
+    if labelled:
+        real = [m for m in labelled if m.group(1).strip().upper() in _ACTION_TOKENS]
+        return (real or labelled)[-1]
+    bare = [
+        m for m in _BARE_ACTION_RE.finditer(text)
+        if m.group(1).isupper() or not text[:m.start(1)].strip()
+    ]
+    return bare[-1] if bare else None
+
+
+def role_may_use_tools(role):
+    """Single source of truth for TOOL access by role: the prompt menu
+    (Agent._role_may_tool) and the orchestrator's enforcement both read it."""
+    return role != "decomposer"
+
+
+def _payload_match_for(text, action_match):
+    """PAYLOAD: belonging to action_match -- the first one AFTER it. A
+    PAYLOAD: earlier in the text belongs to an earlier (discarded) block.
+    With no action at all, the last PAYLOAD: in the text."""
+    if action_match is not None:
+        return _PAYLOAD_RE.search(text, action_match.end())
+    last = None
+    for last in re.finditer(r"PAYLOAD:", text, re.IGNORECASE):
+        pass
+    return _PAYLOAD_RE.search(text, last.start()) if last else None
 
 
 # ---------------------------------------------------------------------------
@@ -61,36 +122,32 @@ _BARE_ACTION_RE = re.compile(r"\s*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECAS
 # spawned subtask whose description near-matches one of them. Three separate
 # attempts to fix this by rewording the prompt have failed: a decomposer
 # under load copies the example's task text verbatim into its own SPAWN
-# payload, and the colony then spends real agents building a newsletter
-# palette for a turbine-blade problem. The guard is in code now, and a guard
-# that can drift out of sync with the prompt it guards is worse than no
-# guard -- so the prompt reads its strings from here too.
+# payload, and the colony then spends real agents on a subtask that belongs
+# to the EXAMPLE's problem rather than its own. The guard is in code now, and
+# a guard that can drift out of sync with the prompt it guards is worse than
+# no guard -- so the prompt reads its strings from here too.
+#
+# Deliberately domain-free placeholders, not realistic tasks. The previous
+# exemplars (a newsletter template, a turbine blade's material/coating,
+# coolant channel geometry) were concrete enough to be lifted into a real
+# plan, and concrete enough to drag an unrelated colony's vocabulary toward
+# that domain even when not copied verbatim. A placeholder only teaches the
+# SHAPE of a batch; copied literally it is unmistakable, and the guard
+# rejects it.
 #
 # Add a task string to a prompt example ONLY by adding it here.
-_EX_CORE_ALGORITHM = "Implement the core algorithm"
-_EX_COOLANT_GEOMETRY = ("Analyze coolant channel geometry independently of "
-                        "the flow rate calculation")
-_EX_WELCOME_COPY_LONG = "Draft the welcome email copy for new newsletter subscribers"
-_EX_WELCOME_COPY = "Draft the welcome email copy"
-_EX_PALETTE = "Pick a color palette for the newsletter template"
-_EX_ASSEMBLE = "Assemble the final template using the chosen palette and copy"
-_EX_MATERIAL = "Select the base material"
-_EX_GEOMETRY = "Define the geometry bounds"
-_EX_COATING = "Size the protective coating using the selected material's properties"
-_EX_FINAL_CHECK = ("Run the final combined check using material, geometry, "
-                   "and coating results")
+_EX_ONE_PIECE = "<one focused piece of YOUR task>"
+_EX_PART_A = "<independent part A of YOUR task>"
+_EX_PART_B = "<independent part B of YOUR task>"
+_EX_NEEDS_A = "<step that needs the result of part A>"
+_EX_FINAL_ABC = "<final step that needs the results of parts A, B and C>"
 
 EXEMPLAR_SUBTASK_DESCRIPTIONS = (
-    _EX_CORE_ALGORITHM,
-    _EX_COOLANT_GEOMETRY,
-    _EX_WELCOME_COPY_LONG,
-    _EX_WELCOME_COPY,
-    _EX_PALETTE,
-    _EX_ASSEMBLE,
-    _EX_MATERIAL,
-    _EX_GEOMETRY,
-    _EX_COATING,
-    _EX_FINAL_CHECK,
+    _EX_ONE_PIECE,
+    _EX_PART_A,
+    _EX_PART_B,
+    _EX_NEEDS_A,
+    _EX_FINAL_ABC,
 )
 
 
@@ -158,9 +215,7 @@ class _ActionPayloadStop(StoppingCriteria):
         recovers from a missing label that way, so the budget below has
         to recognize the same generations decide() will.
         """
-        match = _ACTION_LINE_RE.search(text)
-        if match is None:
-            match = _BARE_ACTION_RE.match(text)
+        match = _last_action_match(text)
         return match.group(1).strip().upper() if match else None
 
     def __call__(self, input_ids, scores, **kwargs):
@@ -180,9 +235,13 @@ class _ActionPayloadStop(StoppingCriteria):
         if action == "REPORT" and len(new_ids) >= self.report_max_new_tokens:
             return True
 
-        if not _ACTION_LINE_RE.search(text):
+        action_match = _last_action_match(text)
+        if action_match is None or action_match.re is not _ACTION_LINE_RE:
             return False
-        payload_match = re.search(r"PAYLOAD:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+        # The payload of the LAST block, same as decide() reads -- a
+        # complete earlier block no longer ends generation on its own if
+        # the model has already opened a newer one.
+        payload_match = _payload_match_for(text, action_match)
         if not payload_match:
             return False
         payload_raw = payload_match.group(1).strip()
@@ -312,6 +371,14 @@ class Agent:
         return self.node.role
 
     @property
+    def _role_may_tool(self):
+        # Decomposers plan and never work the problem themselves, so TOOL
+        # is left off their menu entirely -- and the orchestrator refuses
+        # their tool requests (Orchestrator.handle_tool_request), both via
+        # role_may_use_tools so prompt and enforcement cannot drift apart.
+        return role_may_use_tools(self.role)
+
+    @property
     def task(self):
         return self.node.task
 
@@ -408,7 +475,7 @@ class Agent:
         examples = {
             "decomposer": (
                 'ACTION: SPAWN\n'
-                'PAYLOAD: {"role": "executor", "task": "' + _EX_CORE_ALGORITHM + '"}'
+                'PAYLOAD: {"role": "executor", "task": "' + _EX_ONE_PIECE + '"}'
             ),
             "verifier": (
                 'ACTION: REPORT\n'
@@ -432,14 +499,6 @@ class Agent:
             # with one.
             positive = examples["verifier"]
 
-        executor_spawn_example = (
-            'Example of a valid response when YOUR task turns out to be too '
-            'large for one agent (several independent sub-parts, not just '
-            'one focused piece of work):\n'
-            'ACTION: SPAWN\n'
-            'PAYLOAD: {"role": "executor", "task": "' + _EX_COOLANT_GEOMETRY + '"}\n\n'
-        )
-
         decomposer_batch_example = (
             'Every subtask you SPAWN in a batch MUST include an explicit '
             '"dependencies" field -- treat this as producing a topological '
@@ -452,8 +511,8 @@ class Agent:
             'list, not a missing field):\n'
             'ACTION: SPAWN\n'
             'PAYLOAD: {"subtasks": [\n'
-            '  {"label": "copy", "role": "executor", "task": "' + _EX_WELCOME_COPY_LONG + '", "dependencies": []},\n'
-            '  {"label": "palette", "role": "executor", "task": "' + _EX_PALETTE + '", "dependencies": []}\n'
+            '  {"label": "a", "role": "executor", "task": "' + _EX_PART_A + '", "dependencies": []},\n'
+            '  {"label": "b", "role": "executor", "task": "' + _EX_PART_B + '", "dependencies": []}\n'
             ']}\n\n'
             'Example of a batch with a real SEQUENTIAL dependency (one '
             'piece genuinely cannot start until another\'s result exists) '
@@ -461,9 +520,8 @@ class Agent:
             'label in the dependent piece\'s "dependencies":\n'
             'ACTION: SPAWN\n'
             'PAYLOAD: {"subtasks": [\n'
-            '  {"label": "palette", "role": "executor", "task": "' + _EX_PALETTE + '", "dependencies": []},\n'
-            '  {"label": "copy", "role": "executor", "task": "' + _EX_WELCOME_COPY + '", "dependencies": []},\n'
-            '  {"role": "executor", "task": "' + _EX_ASSEMBLE + '", "dependencies": ["palette", "copy"]}\n'
+            '  {"label": "a", "role": "executor", "task": "' + _EX_PART_A + '", "dependencies": []},\n'
+            '  {"role": "executor", "task": "' + _EX_NEEDS_A + '", "dependencies": ["a"]}\n'
             ']}\n\n'
             'Example combining all three shapes in ONE batch -- some '
             'subtasks start immediately (empty dependencies), one needs '
@@ -471,10 +529,10 @@ class Agent:
             'several earlier ones done first (terminal):\n'
             'ACTION: SPAWN\n'
             'PAYLOAD: {"subtasks": [\n'
-            '  {"label": "material", "role": "executor", "task": "' + _EX_MATERIAL + '", "dependencies": []},\n'
-            '  {"label": "geometry", "role": "executor", "task": "' + _EX_GEOMETRY + '", "dependencies": []},\n'
-            '  {"label": "coating", "role": "executor", "task": "' + _EX_COATING + '", "dependencies": ["material"]},\n'
-            '  {"role": "executor", "task": "' + _EX_FINAL_CHECK + '", "dependencies": ["material", "geometry", "coating"]}\n'
+            '  {"label": "a", "role": "executor", "task": "' + _EX_PART_A + '", "dependencies": []},\n'
+            '  {"label": "b", "role": "executor", "task": "' + _EX_PART_B + '", "dependencies": []},\n'
+            '  {"label": "c", "role": "executor", "task": "' + _EX_NEEDS_A + '", "dependencies": ["a"]},\n'
+            '  {"role": "executor", "task": "' + _EX_FINAL_ABC + '", "dependencies": ["a", "b", "c"]}\n'
             ']}\n\n'
             'Watch for this mistake: a subtask worded "the proposed/chosen/'
             'selected X" implies another subtask produces X first -- make '
@@ -495,7 +553,7 @@ class Agent:
         # a task: a real-sounding sentence here gets copied verbatim into
         # a SPAWN payload (confirmed -- one agent spawned "Implement the
         # binomial probability mass function..." into an unrelated
-        # turbine-blade colony straight out of the previous wording here,
+        # engineering colony straight out of the previous wording here,
         # killing four downstream agents on the contradiction). The
         # example only has to demonstrate SHAPE, so it carries no domain
         # content at all.
@@ -505,7 +563,7 @@ class Agent:
         # lines of exact-key JSON for tools the agent is not permitted to
         # call -- it is both the largest tool-shaped block in the prompt
         # and an implicit claim that calling them is on the table.
-        tool_arg_reference = "" if tools_blocked else (
+        tool_arg_reference = "" if tools_blocked or not self._role_may_tool else (
             "Tool argument reference (use the EXACT keys shown for each "
             "tool -- they are NOT interchangeable):\n"
             '- run_code: {"tool_name": "run_code", "args": {"code_string": "..."}}\n'
@@ -515,12 +573,15 @@ class Agent:
             '- query_dataframe: {"tool_name": "query_dataframe", "args": {"filepath": "...", "action": "summary"}}\n'
         )
 
-        spawn_alternative = executor_spawn_example if self.role == "executor" else ""
-        batch_alternative = decomposer_batch_example if self.role in ("decomposer", "executor") else ""
+        # SPAWN examples go to decomposers only. A SPAWN from any other role
+        # is refused by orchestrator._reject_spawn_from_non_decomposer, so
+        # showing executors a worked SPAWN (they used to get a single-child
+        # example AND the whole batch set) only taught a move that bounces.
+        batch_alternative = decomposer_batch_example if self.role == "decomposer" else ""
 
         return (
             f"Example of a VALID response:\n{positive}\n\n"
-            f"{spawn_alternative}{batch_alternative}"
+            f"{batch_alternative}"
             f"Example of an INVALID response (do NOT do this -- free-form "
             f"reasoning with no ACTION: line is never an acceptable output):\n"
             f"{negative}\n\n"
@@ -550,10 +611,9 @@ class Agent:
                 "DIE. Only DIE if the task itself is impossible regardless "
                 "of how it's decomposed.\n"
                 "IMPORTANT: if you can already identify SEVERAL independent "
-                "pieces of work up front (e.g. a turbine blade problem "
-                "obviously splits into material selection, structural/"
-                "stress analysis, and cooling design -- none of these "
-                "depend on each other), SPAWN all of them in ONE action "
+                "pieces of work up front (parts of the task that can each "
+                "be worked out without waiting for another's result), "
+                "SPAWN all of them in ONE action "
                 "using the \"subtasks\" list format shown below, instead of "
                 "spawning one, waiting for it to finish, then spawning the "
                 "next. Independent work should run in parallel, not "
@@ -565,8 +625,7 @@ class Agent:
                 tier_rule = (
                     "You are the ROOT decomposer (generation 0). SPAWN ONLY "
                     "\"decomposer\" children here, one per large independent "
-                    "chunk of the problem (e.g. \"material selection\", "
-                    "\"cooling design\", \"fatigue analysis\") -- do NOT spawn "
+                    "chunk of the problem -- do NOT spawn "
                     "\"executor\" children directly yourself. Each decomposer "
                     "child you create will handle breaking its chunk down "
                     "further into small, concrete pieces of work.\n"
@@ -576,25 +635,22 @@ class Agent:
                     "\"dependencies\" field -- never omit it, even for a "
                     "chunk with no prerequisites (give it \"dependencies\": "
                     "[] explicitly instead of leaving the key out). A "
-                    "typical engineering problem has THREE kinds of "
+                    "typical problem has THREE kinds of "
                     "structure, and you should use whichever apply:\n"
                     "  1. PARALLEL stage: chunks with no dependency on each "
-                    "other (e.g. \"material selection\" and \"geometry "
-                    "bounds\" can both start immediately) -- give these "
+                    "other (they can all start immediately) -- give these "
                     "\"dependencies\": [] explicitly.\n"
                     "  2. SEQUENTIAL stage: a chunk that genuinely needs "
                     "another chunk's actual computed result as an input "
-                    "(e.g. \"internal cooling layout\" needs the heat load "
-                    "left over after \"TBC thickness\" is decided) -- give "
+                    "(it cannot even start without that value) -- give "
                     "it \"dependencies\": [\"<the label of the chunk it "
                     "needs>\"]. Its agent will automatically receive that "
                     "prerequisite's real result once it's done -- do not "
                     "invent placeholder numbers for something a dependency "
                     "will actually compute.\n"
                     "  3. TERMINAL stage: a final chunk that can only run "
-                    "once several earlier chunks are ALL done (e.g. "
-                    "\"fatigue life\" needs the compiled geometry, material "
-                    "constants, AND thermal stresses from earlier stages) -- "
+                    "once several earlier chunks are ALL done (it combines "
+                    "or checks their results) -- "
                     "list every one of those chunks in its \"dependencies\".\n"
                     "Use \"label\" on every chunk so later chunks can "
                     "reference it by name in their own \"dependencies\".\n"
@@ -609,27 +665,20 @@ class Agent:
                        "than 2-3 think cycles and at most one TOOL call to ") +
                     "finish (e.g. \"calculate X given these inputs\", "
                     "\"look up the density of Y\", \"print the result of "
-                    "this formula\") -- never a whole sub-project like "
-                    "\"design the cooling system\". If you can't picture an "
+                    "this formula\") -- never a whole sub-project. If you "
+                    "can't picture an "
                     "executor finishing it almost immediately, break it "
                     "down further into more, smaller pieces instead.\n"
                 )
             return base_rule + tier_rule
-        return (
-            "IMPORTANT: the constraints listed below apply to the PROJECT "
-            "as a whole -- not every constraint necessarily applies to "
-            "YOUR specific task. If a constraint is clearly outside what "
-            "you were asked to do (e.g. a hardware/analog constraint for a "
-            "pure software task), it belongs to a different specialized "
-            "agent. Do your best on what's relevant to your task, and note "
-            "any out-of-scope constraints as open items in your REPORT "
-            "rather than treating them as a reason to DIE.\n"
+        # Executors only. handle_failure re-plans a "TASK TOO LARGE:" DIE as
+        # a decomposer only when it comes from an executor, so offering the
+        # move to a verifier taught it a DIE that just fails its task.
+        too_large_rule = (
             "IMPORTANT: your task may be larger than a single agent should "
             "handle directly. If it genuinely contains multiple substantial, "
-            "independent pieces of work (e.g. \"design the cooling system\" "
-            "actually requires separately analyzing channel geometry, "
-            "coolant flow, AND manufacturing tolerances), do NOT try to "
-            "SPAWN children yourself -- instead, ACTION: DIE with a PAYLOAD "
+            "independent pieces of work, you cannot split it yourself. "
+            "Instead, ACTION: DIE with a PAYLOAD "
             "that starts with the exact phrase \"TASK TOO LARGE:\" followed "
             "by why. You will be replaced by a decomposer that breaks your "
             "task down properly. "
@@ -639,6 +688,17 @@ class Agent:
                "one pass") +
             " -- reserve this DIE for when the "
             "task is genuinely several tasks wearing one description.\n"
+        ) if self.role == "executor" else ""
+        return (
+            "IMPORTANT: the constraints listed below apply to the PROJECT "
+            "as a whole -- not every constraint necessarily applies to "
+            "YOUR specific task. If a constraint is clearly outside what "
+            "you were asked to do (e.g. a hardware/analog constraint for a "
+            "pure software task), it belongs to a different specialized "
+            "agent. Do your best on what's relevant to your task, and note "
+            "any out-of-scope constraints as open items in your REPORT "
+            "rather than treating them as a reason to DIE.\n"
+            + too_large_rule +
             "IMPORTANT: if a task asks you to estimate, specify, or "
             "calculate a real-world value (a material property, a physical "
             "constant, a typical engineering figure) and you don't have an "
@@ -663,19 +723,24 @@ class Agent:
         tools_blocked = self._tools_blocked(available_tools)
         tools_str = (
             f"Tools actually available to you: {available_tools}\n"
-            if available_tools and not tools_blocked else ""
+            if available_tools and not tools_blocked and self._role_may_tool else ""
         )
-        if self.tool_circuit_open:
+        if self.role == "decomposer":
+            # Role-scoped menu: a decomposer plans and never runs tools
+            # (its role rule forbids working the problem itself), so the
+            # tool-state branches below do not apply to it at all.
+            actions_str = "Real actions that exist for your role: THINK, SPAWN, REPORT, DIE (no others exist).\n"
+        elif self.tool_circuit_open:
             actions_str = (
-                "Real actions that exist: THINK, SPAWN, REPORT, DIE (TOOL is "
-                "closed to you after repeated tool failures -- do not attempt "
-                "it).\n"
+                "Real actions that exist for your role: THINK, REPORT, DIE "
+                "(TOOL is closed to you after repeated tool failures -- do "
+                "not attempt it).\n"
             )
         elif self.disabled_tool_closed:
             actions_str = (
-                "Real actions that exist: THINK, SPAWN, REPORT, DIE (TOOL is "
-                "closed to you for the rest of this run -- do not attempt "
-                "it).\n"
+                "Real actions that exist for your role: THINK, REPORT, DIE "
+                "(TOOL is closed to you for the rest of this run -- do not "
+                "attempt it).\n"
             )
         elif tools_blocked:
             # Tools disabled for the whole run. This branch did not
@@ -688,13 +753,13 @@ class Agent:
             # format example. Every guess cost a full think() cycle to
             # compose and another to recover from the rejection.
             actions_str = (
-                "Real actions that exist: THINK, SPAWN, REPORT, DIE. "
+                "Real actions that exist for your role: THINK, REPORT, DIE. "
                 "There are NO tools in this run -- TOOL is not an "
                 "available action and any tool call will be refused. "
                 "Produce the answer from your own reasoning.\n"
             )
         else:
-            actions_str = "Real actions that exist: THINK, SPAWN, TOOL, REPORT, DIE (no others exist).\n"
+            actions_str = "Real actions that exist for your role: THINK, TOOL, REPORT, DIE (no others exist).\n"
         ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
@@ -766,7 +831,12 @@ class Agent:
         # request_tool() now (see _run_available_tools), so don't advertise
         # it as an option here either -- drop the action and its PAYLOAD
         # format line entirely rather than showing "Available tools: []".
-        if self.tool_circuit_open:
+        if not self._role_may_tool:
+            # Decomposers plan; they never call tools. Not "UNAVAILABLE"
+            # -- simply not on this role's menu.
+            tool_action_line = ""
+            tool_format_line = ""
+        elif self.tool_circuit_open:
             tool_action_line = (
                 "- TOOL   — UNAVAILABLE. Your last "
                 f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} tool calls all failed; "
@@ -794,6 +864,37 @@ class Agent:
             )
             tool_format_line = '- If TOOL: Provide a JSON object: {"tool_name": "name", "args": {...}}\n'
 
+        # Role-scoped menu. Only a decomposer may SPAWN (the orchestrator
+        # refuses anyone else's), so executors and verifiers are not shown
+        # it; and a decomposer's REPORT is the roll-up of its children's
+        # results, not the "give the answer itself" line written for the
+        # agents that actually do the work.
+        if self.role == "decomposer":
+            spawn_action_line = (
+                f"- SPAWN  — create sub-agents to handle sub-tasks. Available roles: {available_roles}.\n"
+            )
+            spawn_format_line = (
+                '- If SPAWN: Provide a JSON object: {"role": "chosen_role", "task": "specific task definition"}, '
+                'or a {"subtasks": [...]} batch as shown below\n'
+            )
+            report_action_line = (
+                "- REPORT — your children have reported back; submit their combined result to your parent.\n"
+            )
+            report_format_line = (
+                "- If REPORT: Combine your children's results into one plain-text result. "
+                "Do not solve anything they did not.\n"
+            )
+        else:
+            spawn_action_line = ""
+            spawn_format_line = ""
+            report_action_line = (
+                "- REPORT — your task is complete, submit your final result to your parent.\n"
+            )
+            report_format_line = (
+                "- If REPORT: Provide the final answer or result in plain text. "
+                "Give the answer itself first. Do not introduce it.\n"
+            )
+
         prompt = f"""You are an AI agent in a colony of agents working together to solve problems.
 Your Agent ID: {self.agent_id}
 Your Role: {self.role}
@@ -802,9 +903,7 @@ Your Role: {self.role}
 {requirements_str}{ghost_str}{fail_str}{tool_result_str}{thoughts_str}
 Available actions:
 - THINK  — continue reasoning before acting (Use this to plan your next move).
-- SPAWN  — create a sub-agent to handle a sub-task. Available roles: {available_roles}.
-{tool_action_line}- REPORT — your task is complete, submit your final result to your parent.
-- DIE    — you cannot complete this task, signal failure to your parent.
+{spawn_action_line}{tool_action_line}{report_action_line}- DIE    — you cannot complete this task, signal failure to your parent.
 
 OUTPUT FORMAT INSTRUCTIONS:
 You must respond with EXACTLY ONE action block in the following format:
@@ -812,9 +911,7 @@ You must respond with EXACTLY ONE action block in the following format:
 ACTION: <One of the available actions>
 PAYLOAD: <Depends on the action>
 - If THINK: Provide your reasoning in plain text.
-- If SPAWN: Provide a JSON object: {{"role": "chosen_role", "task": "specific task definition"}}
-{tool_format_line}- If REPORT: Provide the final answer or result in plain text. Give the answer itself first. Do not introduce it.
-- If DIE: Provide the reason you cannot proceed.
+{spawn_format_line}{tool_format_line}{report_format_line}- If DIE: Provide the reason you cannot proceed.
 
 {format_example_str}
 Your next action:"""
@@ -1151,9 +1248,10 @@ Your next action:"""
         self.thought_process += f"\n{strip_special_tokens(generated_text)}\n"
 
         action = "REPORT"  # Safe default fallback
-        action_match = _ACTION_LINE_RE.search(generated_text)
+        # Last block wins -- see _last_action_match.
+        action_match = _last_action_match(generated_text)
 
-        if action_match:
+        if action_match is not None and action_match.re is _ACTION_LINE_RE:
             print(f"  [decide() action-match] raw='{action_match.group(1)}' "
                   f"parsed='{action_match.group(1).strip().upper()}'")
             if action_match.group(1).strip().upper() == "DIE":
@@ -1164,14 +1262,12 @@ Your next action:"""
         else:
             print(f"  [decide() action-match] NO 'ACTION:' LINE FOUND. "
                   f"Tail of generated_text: {generated_text[-200:]!r}")
-            bare_action_match = _BARE_ACTION_RE.match(generated_text)
-            if bare_action_match:
-                action_match = bare_action_match
+            if action_match is not None:
                 print(
                     f"  [decide() action-match RECOVERED] no 'ACTION:' label, "
-                    f"but generated_text leads with bare keyword "
-                    f"'{bare_action_match.group(1).upper()}' -- treating as "
-                    f"the intended action."
+                    f"but generated_text has a line opening with bare keyword "
+                    f"'{action_match.group(1).upper()}' -- treating the last "
+                    f"such line as the intended action."
                 )
 
         if action_match:
@@ -1217,8 +1313,8 @@ Your next action:"""
                     )
 
         payload = ""
-        payload_match = re.search(r"PAYLOAD:\s*(.*)", generated_text, re.DOTALL | re.IGNORECASE)
-        
+        payload_match = _payload_match_for(generated_text, action_match)
+
         if payload_match:
             payload_raw = payload_match.group(1).strip()
             
@@ -1335,8 +1431,11 @@ Your next action:"""
                     # unrecognized-action case above, and it gets the same
                     # treatment: THINK (one wasted cycle, discards nothing),
                     # not REPORT (which ends the task on a parse failure).
+                    # Searched only after the chosen block, so an object
+                    # from an earlier, abandoned draft is never recovered.
                     recovered_payload = self._recover_unlabelled_payload(
-                        action, generated_text
+                        action,
+                        generated_text[action_match.end():] if action_match else generated_text,
                     )
                     if recovered_payload is not None:
                         print(
