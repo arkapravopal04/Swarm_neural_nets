@@ -521,9 +521,14 @@ class Agent:
                 'ACTION: SPAWN\n'
                 'PAYLOAD: {"role": "executor", "task": "' + _EX_ONE_PIECE + '"}'
             ),
+            # Not "The implementation is correct and handles edge cases."
+            # That was the ONLY worked REPORT in the prompt, and every
+            # executor saw it once tools were off -- the one example of a
+            # finished answer it had was a code review. Plain wording, no
+            # subject, so it says nothing about what kind of answer to give.
             "verifier": (
                 'ACTION: REPORT\n'
-                'PAYLOAD: The implementation is correct and handles edge cases.'
+                'PAYLOAD: Both options meet every constraint, and the second costs less, so choose the second.'
             ),
             "executor": (
                 'ACTION: TOOL\n'
@@ -652,13 +657,17 @@ class Agent:
             base_rule = (
                 "CRITICAL RULE: You are FORBIDDEN from solving the problem "
                 "directly. Your ONLY job is to break this into subtasks and "
-                "SPAWN specialized agents. If you find yourself writing code "
-                "or working out the solution, STOP and SPAWN instead.\n"
+                "SPAWN specialized agents. If you find yourself working out "
+                "the solution, STOP and SPAWN instead.\n"
+                "Word every subtask in plain language from the task's own "
+                "subject (decide, choose, list, agree on, calculate, write). "
+                "Only describe a subtask as building a program if the "
+                "original request asked for a program.\n"
                 "IMPORTANT: any constraints listed below apply to the "
                 "PROJECT as a whole, not to you individually -- they will "
                 "be satisfied collectively by the different sub-agents you "
-                "spawn (e.g. a hardware constraint goes to one child, a "
-                "software/algorithm constraint goes to another). Seeing "
+                "spawn (e.g. a cost constraint goes to one child, a "
+                "timing constraint goes to another). Seeing "
                 "constraints that look incompatible with EACH OTHER is "
                 "normal and expected -- that is a reason to split the work "
                 "across multiple specialized children, not a reason to "
@@ -717,9 +726,10 @@ class Agent:
                     + ("than 2-3 think cycles to "
                        if tools_blocked else
                        "than 2-3 think cycles and at most one TOOL call to ") +
-                    "finish (e.g. \"calculate X given these inputs\", "
-                    "\"look up the density of Y\", \"print the result of "
-                    "this formula\") -- never a whole sub-project. If you "
+                    "finish (e.g. \"list the options for X\", "
+                    "\"choose between A and B given constraint Y\", "
+                    "\"calculate X given these inputs\") -- never a whole "
+                    "sub-project. If you "
                     "can't picture an "
                     "executor finishing it almost immediately, break it "
                     "down further into more, smaller pieces instead.\n"
@@ -747,19 +757,22 @@ class Agent:
             "IMPORTANT: the constraints listed below apply to the PROJECT "
             "as a whole -- not every constraint necessarily applies to "
             "YOUR specific task. If a constraint is clearly outside what "
-            "you were asked to do (e.g. a hardware/analog constraint for a "
-            "pure software task), it belongs to a different specialized "
+            "you were asked to do (e.g. a budget constraint on a task that "
+            "only asks for a schedule), it belongs to a different specialized "
             "agent. Do your best on what's relevant to your task, and note "
             "any out-of-scope constraints as open items in your REPORT "
             "rather than treating them as a reason to DIE.\n"
             + too_large_rule +
+            "IMPORTANT: give your answer in the form the task asks for. If "
+            "the task did not ask for a program, answer in plain sentences "
+            "-- no code, file names or function names.\n"
             "IMPORTANT: if a task asks you to estimate, specify, or "
-            "calculate a real-world value (a material property, a physical "
-            "constant, a typical engineering figure) and you don't have an "
-            "exact experimental lookup available, use your general "
-            "engineering/scientific knowledge to give a reasonable, clearly "
-            "labeled ESTIMATE or typical reference value instead. This is "
-            "normal, expected engineering practice, not a reason to DIE -- "
+            "calculate a real-world value (a typical cost, duration, "
+            "quantity, or physical property) and you don't have an "
+            "exact lookup available, use your general knowledge to give a "
+            "reasonable, clearly labeled ESTIMATE or typical reference "
+            "value instead. This is normal, expected practice, not a "
+            "reason to DIE -- "
             "reserve DIE for tasks that are conceptually impossible given "
             "your role, not for 'I don't have an exact measured number.'\n"
         )

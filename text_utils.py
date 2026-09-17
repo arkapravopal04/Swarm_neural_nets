@@ -780,3 +780,145 @@ def trim_closer_tail(text, min_run=CLOSER_MIN_RUN, max_words=CLOSER_MAX_WORDS):
     if len(sentences) - cut < min_run or cut == 0:
         return text
     return " ".join(sentences[:cut])
+
+
+# ---------------------------------------------------------------------------
+# Software framing on projects that are not about software.
+#
+# A 4B instruction-tuned model reads "implement", "logic", "algorithm" and
+# "mechanism" as a request for code, and once one agent words a subtask that
+# way every agent downstream inherits it through its task text and ghost
+# context. Result: a question about how a group should settle disagreements
+# comes back as "scheduler.py, scorer.py, resolver.py", a made-up checksum,
+# and `def select_book(preferences):`. Swapping the SPAWN exemplars for
+# domain-free placeholders did not change that, so the wording is handled
+# here, in code, for any project whose own request never asked for software.
+
+# Words in the USER'S request that mean software really is on the table.
+# Errs toward matching: a false hit only switches the guard off for the run
+# (the old behaviour), while a miss would reword a real coding task.
+_SOFTWARE_REQUEST_RE = re.compile(
+    # Lookarounds rather than \b, so "C++" (ends on a non-word char) matches.
+    r"(?<!\w)(?:code|codes|coding|coder|codebase|script|scripts|scripting|"
+    r"software|programming|programmer|computer program|algorithms?|"
+    r"pseudo-?code|python|javascript|typescript|java|c\+\+|golang|sql|"
+    r"api|apis|endpoint|database|backend|frontend|website|web ?app|app|apps|"
+    r"regex|compiler?|debug|repo|repository|github|docker|kubernetes|json|"
+    r"csv|dataframe|dataset|cli|html|css)(?!\w)",
+    re.IGNORECASE,
+)
+# Everyday words that also have a software sense ("library", "package",
+# "function", "program", "notebook", "source") are deliberately absent:
+# "a book club that meets at the library" is not a software request.
+
+# A file name with a source-code extension: "votetally.py", "resolver.ts".
+_CODE_FILENAME_RE = re.compile(
+    r"\b[\w\-]+\.(?:py|ipynb|js|jsx|ts|tsx|java|cpp|cc|hpp|rb|go|rs|sh|ps1|"
+    r"sql|php|cs|kt|swift|scala|lua|pl)\b",
+    re.IGNORECASE,
+)
+# snake_case identifier called like a function: "select_book(preferences)".
+_SNAKE_CALL_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\s*\(")
+_SOFTWARE_ARTIFACT_WORD_RE = re.compile(
+    r"\b(?:pseudo-?code|checksums?|source code|unit tests?|code snippet)\b",
+    re.IGNORECASE,
+)
+
+
+def asks_for_software(text):
+    """True when a user's request (or goal) itself asks for software. Empty
+    text counts as True, so the guard below fails open."""
+    if not text or not str(text).strip():
+        return True
+    text = str(text)
+    return bool(
+        _SOFTWARE_REQUEST_RE.search(text)
+        or _CODE_FILENAME_RE.search(text)
+        or "```" in text
+        or looks_like_source_code(text)
+    )
+
+
+def software_artifact_reason(text):
+    """
+    Why this subtask/answer is shaped like a software deliverable, or None.
+
+    Only unmistakable markers count -- a code fence, a definition line, a
+    source-file name, a snake_case call, pseudocode, a checksum. Plain words
+    such as "implement" are NOT reasons to reject anything (they are reworded
+    instead, see plain_register): "implement the seating plan" is ordinary
+    English, and rejecting it would cost a respawn for nothing.
+    """
+    if not text:
+        return None
+    text = str(text)
+    if "```" in text:
+        return "contains a code block"
+    match = _CODE_FILENAME_RE.search(text)
+    if match:
+        return f"names a source-code file ({match.group(0)!r})"
+    if _CODE_STATEMENT_RE.search(text):
+        return "contains a code definition"
+    match = _SNAKE_CALL_RE.search(text)
+    if match:
+        return f"contains a function call ({match.group(0).strip()!r})"
+    match = _SOFTWARE_ARTIFACT_WORD_RE.search(text)
+    if match:
+        return f"describes a software artifact ({match.group(0)!r})"
+    if looks_like_source_code(text):
+        return "is written as code"
+    return None
+
+
+# Code-coded word -> plain word. Ordered: longer phrases first.
+_PLAIN_REGISTER_SUBS = (
+    # "a conflict resolver" -> "a way to resolve conflict". The \1 in the
+    # template (the noun) is filled in by plain_register below.
+    (re.compile(r"\b([A-Za-z\-]+) (resolvers?)\b", re.IGNORECASE), r"way to resolve \1"),
+    (re.compile(r"\bimplementation of\b", re.IGNORECASE), "details of"),
+    (re.compile(r"\bimplementations\b", re.IGNORECASE), "plans"),
+    (re.compile(r"\bimplementation\b", re.IGNORECASE), "plan"),
+    (re.compile(r"\bimplementing\b", re.IGNORECASE), "working out"),
+    (re.compile(r"\bimplemented\b", re.IGNORECASE), "worked out"),
+    (re.compile(r"\bimplements\b", re.IGNORECASE), "works out"),
+    (re.compile(r"\bimplement\b", re.IGNORECASE), "work out"),
+    (re.compile(r"\balgorithms\b", re.IGNORECASE), "methods"),
+    (re.compile(r"\balgorithm\b", re.IGNORECASE), "method"),
+    (re.compile(r"\bmechanisms\b", re.IGNORECASE), "methods"),
+    (re.compile(r"\bmechanism\b", re.IGNORECASE), "method"),
+    (re.compile(r"\blogic\b", re.IGNORECASE), "rules"),
+    (re.compile(r"\bpipeline\b", re.IGNORECASE), "process"),
+    (re.compile(r"\bcodify\b", re.IGNORECASE), "write down"),
+)
+
+
+def _match_case(source, replacement):
+    if source[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def plain_register(text):
+    """
+    Rewords code-coded vocabulary in a task description into plain English:
+    "Implement the voting logic" -> "Work out the voting rules".
+
+    Returns (new_text, [original words replaced]). Callers apply this ONLY
+    when the project did not ask for software (see asks_for_software); on a
+    software project these words mean exactly what they say.
+    """
+    if not text:
+        return text, []
+    replaced = []
+    new_text = str(text)
+    for pattern, plain in _PLAIN_REGISTER_SUBS:
+        def _sub(match, plain=plain):
+            if match.re.groups:
+                # Only the code-coded word is recorded, not the noun it took.
+                replaced.append(match.group(match.re.groups))
+                filled = plain.replace(r"\1", match.group(1).lower())
+                return _match_case(match.group(0), filled)
+            replaced.append(match.group(0))
+            return _match_case(match.group(0), plain)
+        new_text = pattern.sub(_sub, new_text)
+    return new_text, replaced
