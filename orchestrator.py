@@ -25,6 +25,7 @@ from task_graph import TaskGraph, TaskNode
 from event_queue import Messenger, Event
 from agent_node import (
     Agent,
+    agent_cycle_tokens,
     _dedupe_repeated_sentences,
     EXEMPLAR_SUBTASK_DESCRIPTIONS,
     role_may_use_tools,
@@ -197,19 +198,38 @@ class Orchestrator:
         # costs. Totals come from ColonyState.task_energy_spent, which keeps
         # accumulating across those agents.
         #
-        # Scaled to the run's starting budget because that ranges 100-3000
-        # (phaser tiers S-XL, plus overrides): a fixed number would either
-        # never fire on a large run or strangle a small one. The floor keeps
-        # a tiny budget from abandoning a task after one ordinary attempt.
-        # Both values are first guesses, not tuned from a run -- the energy
-        # report's TASK ENERGY table is there to tune them.
+        # Measured in AGENTS, not in a slice of the colony budget. A budget
+        # fraction was the original guess and it was unfirable: at the
+        # configured budget_override=2500 it computed to 250, while the worst
+        # case the caps can structurally produce -- 1+MAX_TASK_ATTEMPTS agents
+        # each running MAX_NON_TERMINAL_CYCLES full-cap cycles -- measures 214,
+        # and the real runaway that motivated the check peaked at 111. It could
+        # never fire on any task. It also floated against budget_override, so
+        # the same colony was bounded differently run to run for a reason with
+        # nothing to do with what a task costs.
+        #
+        # Derived instead from what one agent may spend before its OWN caps
+        # stop it (see _agent_energy_allowance), so it tracks the role token
+        # caps and the cycle cap rather than needing a re-tune whenever either
+        # is touched -- both were touched recently. That allowance is a
+        # structural maximum and real cycles come in well under it (stripping,
+        # plus think()'s degeneracy check usually stopping short), so 1.5
+        # full-cap agents is roughly three real ones: it fires before the
+        # fourth attempt without ever threatening an ordinary task. Measured
+        # for reference: a healthy subtask costs 13 and a healthy root
+        # decomposer 22 including its children's injections, against 81.
         #
         # Checked only when deciding whether to respawn, like the attempt
         # cap: a task already at or over the ceiling gets no further agent.
         # The live agent is never killed for crossing it mid-run, so a task
         # can overshoot by at most what that one agent spends, which its own
         # cycle cap bounds.
-        self.TASK_ENERGY_FRACTION = 0.10
+        self.TASK_AGENT_ALLOWANCE = 1.5
+        # Only to turn generated tokens into the chars-per-100 proxy the rest
+        # of the energy model bills in; ~4 chars per token for English BPE.
+        self.ENERGY_CHARS_PER_TOKEN = 4
+        # Safety rail, not a calibration knob: keeps a pathologically small
+        # set of role caps from producing a ceiling that abandons everything.
         self.TASK_ENERGY_FLOOR = 50
 
         self.SHORT_ANSWER_WORD_THRESHOLD = 12
@@ -1629,6 +1649,32 @@ class Orchestrator:
 
         if verdict["verdict"] == "warn":
             print(f"Judge WARN on {agent_id}/{task_id}: {verdict['reason']}")
+            self.colony.record_verdict("judge_warn")
+
+            # A WARN is a non-terminal cycle by the same definition the agent
+            # already applies to THINK: nothing finished and it is going back
+            # around. This was the one decision point in the system that
+            # counted nothing -- a task has respawn_counts, an agent has
+            # non_terminal_cycles, a WARN had neither -- so REPORT -> WARN ->
+            # REPORT ran for as long as the wording kept changing, and at full
+            # price: report() clears the KV cache, and think() resets
+            # _total_generated whenever the cache is None, so
+            # MAX_TOTAL_THINK_TOKENS restarted on every pass instead of
+            # bounding the loop. Charging the cycle puts the loop under the
+            # per-agent cap that already exists rather than adding another.
+            live_agent = self.live_agents.get(agent_id)
+            if live_agent is not None:
+                was_capped = live_agent.cycles_capped
+                live_agent.non_terminal_cycles += 1
+                # The same tally _run_live_agents keeps when run() crosses the
+                # cap, repeated here because a WARN crosses it OUTSIDE run():
+                # the branch below respawns the agent in this same call, so
+                # _run_live_agents never sees a capped agent and the ledger
+                # reported zero agents reaching a cap that had just cut four
+                # warn loops. Guarded the same way it is there, so an agent
+                # that already capped on a THINK is not counted twice.
+                if live_agent.cycles_capped and not was_capped:
+                    self.colony.record_verdict("cycle_cap_reached")
 
             # A WARN sends the agent back to try again. If it comes back with
             # a byte-identical REPORT, it is not converging -- it has already
@@ -1653,6 +1699,50 @@ class Orchestrator:
                 parent_id = getattr(agent_node, "parent_id", None) if agent_node else None
                 self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict)
                 return
+
+            # Out of cycles and still not accepted. Sending it back again is
+            # what made this a loop rather than a retry: the cap narrows
+            # decide() to REPORT/DIE, but REPORT is exactly what a WARN
+            # answers, so a capped agent kept re-REPORTing with its counter
+            # climbing past the cap and nothing reading it. A WARN at the cap
+            # is an EXECUTE in everything but name -- routed the same way,
+            # which is also the only path that consults MAX_TASK_ATTEMPTS and
+            # the per-task energy ceiling.
+            if live_agent is not None and live_agent.cycles_capped:
+                self.colony.record_verdict("warn_cycle_cap_respawn")
+                print(f"  [warn-cycle-cap] {agent_id} spent its "
+                      f"{live_agent.non_terminal_cycles} cycles without an "
+                      f"accepted REPORT -- respawning instead of warning again.")
+                if agent_node is not None:
+                    agent_node.fail_reason = (
+                        "Previous attempt was REJECTED: review sent your REPORT "
+                        "back to be revised and you ran out of attempts without "
+                        "an acceptable answer. Do not restate the task or pad "
+                        "the result -- give the answer itself."
+                    )
+                self.last_warned_report.pop(agent_id, None)
+                role = getattr(agent_node, "role", "worker") if agent_node else "worker"
+                parent_id = getattr(agent_node, "parent_id", None) if agent_node else None
+                self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict)
+                return
+
+            # Now that these passes are counted, they have to be worth
+            # spending: the agent was previously re-ticked with no idea a WARN
+            # had happened at all -- same prompt, same fail_reason, one more
+            # sentence of its own thoughts -- so it re-derived the same answer
+            # and burned the cycle for nothing. One clause, prefixed as a
+            # verdict, is the same shape the EXECUTE branch below uses, and
+            # for the same reason: judge prose at full length reads as more of
+            # the agent's own reasoning rather than as a ruling on it.
+            if agent_node is not None:
+                warn_text = first_clause(
+                    _dedupe_repeated_sentences(str(verdict.get("reason", ""))),
+                    max_chars=120,
+                )
+                agent_node.fail_reason = (
+                    f"SENT BACK BY REVIEW -- {warn_text}" if warn_text else
+                    "SENT BACK BY REVIEW -- your last REPORT was not accepted."
+                )
 
             self.last_warned_report[agent_id] = str(result)
             return
@@ -1892,11 +1982,34 @@ class Orchestrator:
                 reason_label="no energy to respawn",
             )
 
+    def _agent_energy_allowance(self, role: str) -> int:
+        """What one agent of this role may spend before its own caps stop it.
+
+        Computable rather than sampled: think() always runs its whole role cap
+        (it has no EOS check) and decide()'s payload is stopped at a fixed
+        budget, so agent_cycle_tokens(role) is a real per-cycle maximum, and
+        Agent.MAX_NON_TERMINAL_CYCLES bounds how many cycles there can be.
+        Billed through the same chars-per-100 proxy debit_energy uses.
+        """
+        spawn = self.energy_when_new_by_role.get(role, self.energy_when_new)
+        per_cycle = max(1, (agent_cycle_tokens(role)
+                            * self.ENERGY_CHARS_PER_TOKEN) // 100)
+        return spawn + Agent.MAX_NON_TERMINAL_CYCLES * per_cycle
+
     def task_energy_ceiling(self) -> int:
         """Most energy one task's agents may spend before it gets no more
-        respawns. See TASK_ENERGY_FRACTION in __init__."""
-        start = getattr(self.colony, "starting_budget", 0) or 0
-        return max(self.TASK_ENERGY_FLOOR, int(self.TASK_ENERGY_FRACTION * start))
+        respawns. See TASK_AGENT_ALLOWANCE in __init__.
+
+        Priced at the most expensive role rather than the task's own: one
+        figure keeps the ledger readable, and pricing a decomposer task at its
+        own cheaper rate would tighten exactly the tasks that also absorb every
+        child's injection cost -- the root most of all, whose abandonment ends
+        the run.
+        """
+        roles = set(self.energy_when_new_by_role) | {"executor"}
+        dearest = max(self._agent_energy_allowance(r) for r in roles)
+        return max(self.TASK_ENERGY_FLOOR,
+                   int(self.TASK_AGENT_ALLOWANCE * dearest))
 
     def _abandon_task(self, task_id: str, parent_id: Optional[str],
                        agent_id: Optional[str], attempts: int,
@@ -2299,6 +2412,15 @@ class Orchestrator:
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
             print(f"    agents that reached it   : {verdicts.get('cycle_cap_reached', 0)}")
             print(f"    actions forced by the cap: {verdicts.get('cycle_cap_coerced', 0)}")
+            # A WARN is a non-terminal cycle too (see handle_completion). These
+            # two lines are what says whether REPORT -> WARN -> REPORT is still
+            # running long: warns far above respawns means agents are revising
+            # and converging, warns clustered just under the cap per agent
+            # means they are looping and being cut off.
+            warns = verdicts.get('judge_warn', 0)
+            print(f"    judge WARNs issued      : {warns}")
+            print(f"    warn loops cut at the cap: "
+                  f"{verdicts.get('warn_cycle_cap_respawn', 0)}")
 
             print(chr(10) + "  SOFTWARE FRAMING (code-shaped work on a non-software request)")
             if not self._software_framing_guard_active:
@@ -2332,7 +2454,9 @@ class Orchestrator:
 
             ceiling = self.task_energy_ceiling()
             print(f"\n  TASK ENERGY (top 10 by energy; per-task ceiling {ceiling} = "
-                  f"max({self.TASK_ENERGY_FLOOR}, {self.TASK_ENERGY_FRACTION:.0%} of start))")
+                  f"{self.TASK_AGENT_ALLOWANCE} agents' worth of "
+                  f"{Agent.MAX_NON_TERMINAL_CYCLES} full-cap cycles; OVER next "
+                  f"to a reason = stopped as intended)")
             task_energy = dict(getattr(self.colony, "task_energy_spent", {}) or {})
             if not task_energy:
                 print("    (no energy attributed to a task this run)")
@@ -2342,7 +2466,16 @@ class Orchestrator:
                     task = self.task_graph.tasks.get(task_id)
                     status = task.status if task is not None else "?"
                     agents = 1 + respawns.get(task_id, 0)
-                    flag = "  OVER" if spent >= ceiling else ""
+                    # OVER is expected on a task the ceiling stopped: the
+                    # check runs at respawn time and the live agent is never
+                    # killed mid-cycle, so a task always crosses the line
+                    # before it can be caught, by up to one agent's spend.
+                    # OVER with nothing that stopped it is the real signature
+                    # -- a task past its ceiling that is still being funded.
+                    flag = ""
+                    if spent >= ceiling:
+                        flag = ("  OVER" if task_id in reasons
+                                else "  OVER -- NOT STOPPED")
                     label = f"  [{reasons[task_id]}]" if task_id in reasons else ""
                     print(f"    {spent:>6}  agents={agents}  status={status}  "
                           f"{task_id}{flag}{label}")

@@ -102,6 +102,27 @@ def role_may_use_tools(role):
     return role != "decomposer"
 
 
+# Per-role ceiling on think()'s generation, module level for the same reason
+# role_may_use_tools is: Agent._get_role_cap spends it and the orchestrator's
+# per-task energy ceiling budgets for it, and the two must not drift apart.
+THINK_TOKEN_CAPS = {"decomposer": 64, "executor": 128, "verifier": 64}
+DEFAULT_THINK_TOKEN_CAP = 128
+
+
+def think_token_cap(role):
+    return THINK_TOKEN_CAPS.get(role, DEFAULT_THINK_TOKEN_CAP)
+
+
+def agent_cycle_tokens(role):
+    """Most tokens one full think() + decide() cycle can generate for this
+    role. Not an estimate: think() is a hand-rolled forward-pass loop with no
+    EOS check, so it always runs its whole cap (see Agent._get_role_cap), and
+    decide()'s payload is stopped at REPORT_MAX_NEW_TOKENS. That makes what an
+    agent may spend computable rather than sampled, which is what lets
+    Orchestrator.task_energy_ceiling be derived instead of guessed."""
+    return think_token_cap(role) + _ActionPayloadStop.REPORT_MAX_NEW_TOKENS
+
+
 def _payload_match_for(text, action_match):
     """PAYLOAD: belonging to action_match -- the first one AFTER it. A
     PAYLOAD: earlier in the text belongs to an earlier (discarded) block.
@@ -501,13 +522,7 @@ class Agent:
         truncation is strictly cheaper. The degeneracy check in think()
         now usually stops the loop before even this lower cap is reached.
         """
-        if self.role == "decomposer":
-            return 64
-        if self.role == "executor":
-            return 128
-        if self.role == "verifier":
-            return 64
-        return 128  # safety default for any role not yet in this map
+        return think_token_cap(self.role)
 
     def _default_available_tools(self):
         try:
