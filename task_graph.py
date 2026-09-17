@@ -64,8 +64,18 @@ class TaskGraph:
 # just adds a new task, update dependencies of dependents...by just appending this there
     def add_task(self, task: TaskNode):
         self.tasks[task.task_id] = task
-        task.in_degree = len(task.dependencies)
-        
+        # A dependency that is already closed (completed, or failed and
+        # released the way orchestrator._abandon_task/_close_unstartable_child
+        # release theirs) will never decrement in_degree again, so counting
+        # it left the new task pending forever. Happens within a single SPAWN
+        # batch: siblings are added one at a time, and an earlier one can be
+        # closed (no energy to start it) before a later one that depends on
+        # it is added.
+        task.in_degree = sum(
+            1 for dep_id in task.dependencies
+            if self.tasks.get(dep_id) is None or self.tasks[dep_id].status not in (2, 3)
+        )
+
         for parent_id in task.dependencies:
             parent_task = self.tasks.get(parent_id)
             if parent_task:

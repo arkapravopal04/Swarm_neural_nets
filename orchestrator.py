@@ -86,6 +86,14 @@ class Orchestrator:
 
         # Tasks abandoned by the attempt cap, so terminate() can say so.
         self.abandoned_tasks: set = set()
+        # task_id -> why it was abandoned, for terminate() and the partial
+        # result's cause line: the attempt cap, the energy ceiling, or no
+        # energy to respawn.
+        self.abandon_reasons: Dict[str, str] = {}
+
+        # Child tasks that never got an agent because spawn_agent had no
+        # energy for them -- see _close_unstartable_child.
+        self.unstarted_tasks: set = set()
 
         # agent_id -> the exact REPORT text that last earned it a judge WARN.
         # Used to short-circuit an agent that answers a WARN by resubmitting
@@ -153,6 +161,30 @@ class Orchestrator:
         # and its dependents are released so the rest of the graph can
         # finish.
         self.MAX_TASK_ATTEMPTS = 3
+
+        # Per-task energy ceiling: a second, independent bound on the same
+        # respawn decision. MAX_TASK_ATTEMPTS counts agents; this counts what
+        # they cost. The per-agent cycle cap (Agent.MAX_NON_TERMINAL_CYCLES)
+        # bounds one agent, but every respawn starts a fresh agent with a
+        # fresh cycle budget, so a task could still spend up to
+        # (1 + MAX_TASK_ATTEMPTS) agents' worth of full cycles plus spawn
+        # costs. Totals come from ColonyState.task_energy_spent, which keeps
+        # accumulating across those agents.
+        #
+        # Scaled to the run's starting budget because that ranges 100-3000
+        # (phaser tiers S-XL, plus overrides): a fixed number would either
+        # never fire on a large run or strangle a small one. The floor keeps
+        # a tiny budget from abandoning a task after one ordinary attempt.
+        # Both values are first guesses, not tuned from a run -- the energy
+        # report's TASK ENERGY table is there to tune them.
+        #
+        # Checked only when deciding whether to respawn, like the attempt
+        # cap: a task already at or over the ceiling gets no further agent.
+        # The live agent is never killed for crossing it mid-run, so a task
+        # can overshoot by at most what that one agent spends, which its own
+        # cycle cap bounds.
+        self.TASK_ENERGY_FRACTION = 0.10
+        self.TASK_ENERGY_FLOOR = 50
 
         self.SHORT_ANSWER_WORD_THRESHOLD = 12
 
@@ -261,10 +293,27 @@ class Orchestrator:
             if live_agent.awaiting is not None:
                 continue
 
+            # Belt and braces for handle_parent_notification's gate: whatever
+            # cleared `awaiting`, a decomposer is not ticked while any child
+            # is unfinished -- it cannot REPORT a complete result, and each
+            # tick spends one of its capped cycles. Re-set rather than just
+            # skipped, so the deadlock watchdog keeps treating it as waiting
+            # instead of as silent.
+            if getattr(live_agent, "role", None) == "decomposer" and self._open_child_task_ids(agent_id):
+                live_agent.awaiting = "children"
+                continue
+
             agent_node = self.colony.get_agent(agent_id)
             prev_len = len(live_agent.thought_process)
+            was_capped = getattr(live_agent, "cycles_capped", False)
             try:
                 live_agent.run(available_roles, available_tools, requirements=None)
+                # Tallied so the final report shows whether the cycle cap
+                # is firing, and how often the model ignored its menu.
+                if getattr(live_agent, "cycles_capped", False) and not was_capped:
+                    self.colony.record_verdict("cycle_cap_reached")
+                if getattr(live_agent, "cap_coerced_last_run", False):
+                    self.colony.record_verdict("cycle_cap_coerced")
             except Exception as e:
                 print(f"Agent {agent_id} crashed during run(): {e}")
                 print(traceback.format_exc())
@@ -431,6 +480,10 @@ class Orchestrator:
         
         self.colony.register_agent(new_agent)
         self.task_graph.assign_agent(task_id, agent_id)
+        if parent_node is not None:
+            # Read by Agent.final_actions: a decomposer with no child yet
+            # finishes by SPAWNing, one whose children exist by REPORTing.
+            parent_node.has_spawned = True
         
         # Debit the initialization energy cost from the colony budget
         self.colony.debit_energy(agent_id, spawn_cost, category="spawn")
@@ -654,7 +707,61 @@ class Orchestrator:
         dep_context = self._build_dependency_context(dependencies)
         combined_context = (goal_line + dep_context) or None
 
-        self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id, ghost_context=combined_context)
+        if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
+                            ghost_context=combined_context) is None:
+            self._close_unstartable_child(task_id, parent_id)
+
+    def _close_unstartable_child(self, task_id: str, parent_id: Optional[str]):
+        """
+        spawn_agent refused this child for lack of energy after its TaskNode
+        was already in the graph. Left alone, that task sat at pending with
+        no agent, so _process_unblocked_tasks (or the watchdog) started it
+        later with no parent_id: its result went nowhere, the parent never
+        heard back, and anything depending on it stayed blocked. Retrying
+        with the right parent would not help either -- energy only goes
+        down (the one credit path, consolidation, never fires), so a spawn
+        refused now is refused on every later tick.
+
+        So the task is closed on the spot, the same way _abandon_task closes
+        one: marked failed with a result saying it never started, its
+        dependents released, and the parent notified.
+        """
+        self.unstarted_tasks.add(task_id)
+        task_node = self.task_graph.tasks.get(task_id)
+        description = task_node.description if task_node is not None else "<unknown task>"
+        result = (
+            "[NOT STARTED -- the colony did not have enough energy left to "
+            "start an agent for this subtask, so no work was done on it.]"
+        )
+        print(f"  [spawn] {task_id} (\"{description[:60]}\") could not be started "
+              f"for lack of energy -- closing it instead of leaving it pending "
+              f"with no parent.")
+        if task_node is not None:
+            task_node.status = 3
+            task_node.result = result
+        self.colony.store_result(task_id, result)
+        self._release_dependents(task_node)
+        self._drain_pending_overflow(parent_id)
+        if parent_id:
+            self.messenger.push_event(
+                "parent_notification",
+                "orchestrator",
+                {"parent_id": parent_id, "child_id": task_id, "result": result}
+            )
+
+    def _release_dependents(self, task_node: Optional[TaskNode]):
+        """Unblocks the dependents of a task closed as failed. complete_task()
+        does this as a side effect of marking status=2, which would be a lie
+        here, so the in_degree bookkeeping is repeated explicitly."""
+        if task_node is None:
+            return
+        for dependent_id in task_node.dependents:
+            dep_task = self.task_graph.tasks.get(dependent_id)
+            if dep_task is None:
+                continue
+            dep_task.in_degree -= 1
+            if dep_task.in_degree == 0 and dep_task.agent_id is not None:
+                dep_task.status = 1
 
     def _drain_pending_overflow(self, parent_id: Optional[str]):
         """
@@ -881,6 +988,96 @@ class Orchestrator:
 
     def handle_spawn(self, event: Event):
         """Triggered when an existing agent requests sub-agents (children)."""
+        unstarted_before = len(self.unstarted_tasks)
+        if self._handle_spawn_request(event):
+            self._release_spawner_if_nothing_started(
+                event.payload.get("parent_id"),
+                out_of_energy=len(self.unstarted_tasks) > unstarted_before,
+            )
+
+    def _release_spawner_if_nothing_started(self, parent_id: Optional[str],
+                                            out_of_energy: bool = False):
+        """
+        Agent.request_spawn sets awaiting="children" as soon as a SPAWN has a
+        plausible shape, before the orchestrator has created anything. If
+        nothing was actually started -- every batch entry malformed and
+        skipped, a single SPAWN with no task text, or no energy to start any
+        child -- no child exists to ever send a parent_notification, and
+        the deadlock watchdog skips awaiting agents, so the decomposer hung
+        until the budget ran out. Hand it back with the reason instead, and
+        charge the cycle: request_spawn's `awaiting` meant run() did not,
+        so a decomposer repeating an unusable batch would otherwise loop
+        outside the cycle cap.
+        """
+        live_parent = self.live_agents.get(parent_id) if parent_id else None
+        if live_parent is None or live_parent.awaiting != "children":
+            return
+        if self._open_child_task_ids(parent_id):
+            return
+
+        parent_node = self.colony.get_agent(parent_id)
+        has_children = bool(parent_node is not None and parent_node.has_spawned)
+        was_capped = getattr(live_parent, "cycles_capped", False)
+
+        # Two cases where releasing it to try again cannot help, so it goes
+        # down the normal DIE path (failure -> respawn or abandon) instead:
+        #  * it was already at the cycle cap. Its SPAWN was its last allowed
+        #    action; releasing it again let a batch that looks valid but
+        #    starts nothing (e.g. {"subtasks": ["junk"]}) repeat forever
+        #    past the cap.
+        #  * no energy, and it never had a child. Another SPAWN is refused
+        #    the same way, and there is nothing to REPORT.
+        # `awaiting` stays set so it is not ticked before the failure event
+        # is routed on the next tick.
+        if was_capped or (out_of_energy and not has_children):
+            why = (
+                "no energy left to start its subtasks" if out_of_energy
+                else "its final allowed SPAWN started no subtasks"
+            )
+            print(f"  [handle_spawn] {parent_id}'s SPAWN started no subtasks "
+                  f"and it cannot usefully retry ({why}) -- routing to failure.")
+            if parent_node is not None:
+                parent_node.fail_reason = f"SPAWN Action Failed: {why}."
+            self.messenger.push_event(
+                "failure_request",
+                parent_id,
+                {
+                    "task_id": live_parent.task_id,
+                    "role": live_parent.role,
+                    "parent_id": live_parent.parent_id,
+                    "result": f"Cycle cap / spawn failure: {why}.",
+                },
+            )
+            return
+
+        print(f"  [handle_spawn] {parent_id}'s SPAWN started no subtasks -- "
+              f"releasing it from awaiting instead of leaving it to hang.")
+        if out_of_energy:
+            # Asking for a corrected batch would only be refused again. Only
+            # reached with finished children, so REPORT is on its menu.
+            live_parent.fail_reason = (
+                "SPAWN Action Failed: none of your requested subtasks were "
+                "started because the colony is out of energy to start new "
+                "agents. Do not SPAWN again. REPORT what your finished "
+                "children produced, or DIE if there is nothing."
+            )
+        else:
+            live_parent.fail_reason = (
+                "SPAWN Action Failed: none of your requested subtasks were "
+                "started, so nothing is working on your behalf. Every subtask "
+                "needs a non-empty \"task\" string; SPAWN a corrected batch, or "
+                "DIE if the task cannot be decomposed."
+            )
+        live_parent.awaiting = None
+        if hasattr(live_parent, "non_terminal_cycles"):
+            live_parent.non_terminal_cycles += 1
+            if live_parent.cycles_capped:
+                self.colony.record_verdict("cycle_cap_reached")
+
+    def _handle_spawn_request(self, event: Event) -> bool:
+        """Body of handle_spawn. Returns False only when the request was
+        rejected and the spawner already routed to a respawn, True in every
+        other case (including when nothing ended up being spawned)."""
         payload = event.payload
         parent_id = payload.get("parent_id")
 
@@ -894,7 +1091,7 @@ class Orchestrator:
         # path the prompt already describes, which handle_failure respawns
         # as a decomposer on the same task.
         if not self._reject_spawn_from_non_decomposer(event):
-            return
+            return False
 
         subtasks = payload.get("subtasks")
 
@@ -938,7 +1135,7 @@ class Orchestrator:
             if not self._reject_derived_subtask_batch(
                 event, [description for _, description, _ in prepared]
             ):
-                return
+                return False
 
             # Fan-out cap: resolved against the FULL original batch's labels
             # above (so an item past the cap can still be a valid dependency
@@ -1017,7 +1214,7 @@ class Orchestrator:
                     self.pending_overflow.setdefault(parent_id, []).append(spawn_kwargs)
                 else:
                     self._spawn_child_task(**spawn_kwargs)
-            return
+            return True
 
         # Single-subtask case.
         description = payload.get("task_id") or payload.get("description")
@@ -1026,10 +1223,10 @@ class Orchestrator:
 
         if not description:
             print("Warning: Spawn request ignored due to missing task description in payload.")
-            return
+            return True
 
         if not self._reject_derived_subtask_batch(event, [description]):
-            return
+            return False
 
         self._spawn_child_task(
             description=description,
@@ -1037,6 +1234,7 @@ class Orchestrator:
             parent_id=parent_id,
             dependencies=payload.get("dependencies", []),
         )
+        return True
 
     def handle_parent_notification(self, event: Event):
         """
@@ -1070,7 +1268,35 @@ class Orchestrator:
         injection_cost = max(1, len(injected_text) // 100)
         self.colony.debit_energy(parent_id, injection_cost, category="injection")
 
+        # Resume the parent only once EVERY child is done. Clearing the gate
+        # on the first result ticked a decomposer every heartbeat while its
+        # siblings were still running -- a THINK per tick that used to only
+        # waste energy, and with the per-agent cycle cap
+        # (Agent.MAX_NON_TERMINAL_CYCLES) forces it onto REPORT with half its
+        # children's results, which for the root ends the run early.
+        still_open = self._open_child_task_ids(parent_id)
+        if still_open:
+            print(f"  [parent_notification] {parent_id} received {child_id}'s "
+                  f"result; still waiting on {len(still_open)} child task(s).")
+            return
         live_parent.awaiting = None
+
+    def _open_child_task_ids(self, parent_id: str) -> list:
+        """Task ids of this agent's children that are pending or running,
+        plus overflow subtasks queued for it but not spawned yet."""
+        open_ids = []
+        parent = self.colony.get_agent(parent_id)
+        if parent is not None:
+            for child_id in parent.children:
+                child = self.colony.get_agent(child_id)
+                if child is None:
+                    continue
+                task = self.task_graph.tasks.get(child.task_id)
+                if task is not None and task.status in (0, 1):
+                    open_ids.append(child.task_id)
+        for queued in self.pending_overflow.get(parent_id) or []:
+            open_ids.append(queued.get("task_id"))
+        return open_ids
 
     def handle_completion(self, event: Event):
         """PROMOTE: Routes completed results to parents, unblocks tasks, or triggers synthesizer."""
@@ -1434,6 +1660,11 @@ class Orchestrator:
                 # since awaiting agents are exempt from the deadlock
                 # watchdog, nothing else caught it either. Mirrors the
                 # normal-path notification exactly.
+                # A completion frees a fan-out slot on this path too. Without
+                # the drain, a queued overflow subtask was never started --
+                # and since queued subtasks count as unfinished children in
+                # _open_child_task_ids, the parent then waited forever.
+                self._drain_pending_overflow(parent_id)
                 if parent_id:
                     self.messenger.push_event(
                         "parent_notification",
@@ -1450,13 +1681,43 @@ class Orchestrator:
             self._abandon_task(task_id, parent_id, agent_id, attempts)
             return
 
+        # Per-task energy ceiling -- independent of the attempt count above.
+        spent = self.colony.task_energy_spent.get(task_id, 0)
+        ceiling = self.task_energy_ceiling()
+        if spent >= ceiling:
+            self._abandon_task(
+                task_id, parent_id, agent_id, attempts,
+                reason=(f"its agents used {spent} energy, at or over the per-task "
+                        f"ceiling of {ceiling}"),
+                reason_label="energy ceiling",
+            )
+            return
+
         print(f"Agent {agent_id} failed. Respawning {role} with ghost context "
               f"(attempt {attempts + 2} of {self.MAX_TASK_ATTEMPTS + 1} for this task).")
         self.respawn_counts[task_id] = attempts + 1
-        self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id, ghost_context=ghost_context)
+        if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
+                            ghost_context=ghost_context) is None:
+            # No energy for the replacement. The old agent is already gone,
+            # so the task sat at "running" with no agent: never ticked, never
+            # finished, and its parent was never told. Energy does not come
+            # back, so close it now with whatever the earlier attempts left.
+            self._abandon_task(
+                task_id, parent_id, agent_id, attempts,
+                reason="the colony had no energy left to respawn an agent for it",
+                reason_label="no energy to respawn",
+            )
+
+    def task_energy_ceiling(self) -> int:
+        """Most energy one task's agents may spend before it gets no more
+        respawns. See TASK_ENERGY_FRACTION in __init__."""
+        start = getattr(self.colony, "starting_budget", 0) or 0
+        return max(self.TASK_ENERGY_FLOOR, int(self.TASK_ENERGY_FRACTION * start))
 
     def _abandon_task(self, task_id: str, parent_id: Optional[str],
-                       agent_id: Optional[str], attempts: int):
+                       agent_id: Optional[str], attempts: int,
+                       reason: Optional[str] = None,
+                       reason_label: str = "attempt cap"):
         """
         Terminal disposition for a task that has burned through
         MAX_TASK_ATTEMPTS respawns without ever satisfying the judge.
@@ -1470,6 +1731,7 @@ class Orchestrator:
         completion would.
         """
         self.abandoned_tasks.add(task_id)
+        self.abandon_reasons[task_id] = reason_label
         task_node = self.task_graph.tasks.get(task_id)
         description = task_node.description if task_node is not None else "<unknown task>"
 
@@ -1481,6 +1743,8 @@ class Orchestrator:
         partial_text = str(partial).strip() if partial else ""
 
         marker = (
+            f"[ABANDONED after {attempts + 1} attempt(s) -- {reason}.]"
+            if reason else
             f"[ABANDONED after {attempts + 1} attempt(s) -- no agent assigned to "
             f"this subtask produced an acceptable result, so it was stopped "
             f"rather than recycled further.]"
@@ -1496,8 +1760,12 @@ class Orchestrator:
 
         print("=" * 62)
         print(f"TASK ABANDONED: {task_id} -- \"{description}\"")
-        print(f"  {attempts + 1} attempt(s) exhausted (cap MAX_TASK_ATTEMPTS="
-              f"{self.MAX_TASK_ATTEMPTS}). Marking failed and releasing dependents.")
+        if reason:
+            print(f"  After {attempts + 1} attempt(s): {reason}. Marking failed "
+                  f"and releasing dependents.")
+        else:
+            print(f"  {attempts + 1} attempt(s) exhausted (cap MAX_TASK_ATTEMPTS="
+                  f"{self.MAX_TASK_ATTEMPTS}). Marking failed and releasing dependents.")
         print(f"  Salvaged partial: {'yes' if partial_text else 'none'}")
         print("=" * 62)
 
@@ -1506,17 +1774,7 @@ class Orchestrator:
             task_node.result = abandoned_result
         self.colony.store_result(task_id, abandoned_result)
 
-        # Release dependents. complete_task() does this as a side effect of
-        # marking status=2, which would be a lie here, so the in_degree
-        # bookkeeping is repeated explicitly rather than reused.
-        if task_node is not None:
-            for dependent_id in task_node.dependents:
-                dep_task = self.task_graph.tasks.get(dependent_id)
-                if dep_task is None:
-                    continue
-                dep_task.in_degree -= 1
-                if dep_task.in_degree == 0 and dep_task.agent_id is not None:
-                    dep_task.status = 1
+        self._release_dependents(task_node)
 
         # A freed fan-out slot is a freed slot whether the child succeeded or
         # was abandoned -- otherwise a decomposer's queued overflow never
@@ -1854,6 +2112,10 @@ class Orchestrator:
                 print(f"    reject : {rejects}")
                 print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
 
+            print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
+            print(f"    agents that reached it   : {verdicts.get('cycle_cap_reached', 0)}")
+            print(f"    actions forced by the cap: {verdicts.get('cycle_cap_coerced', 0)}")
+
             print("\n  RESPAWNS (top 10 by count)")
             respawns = getattr(self, "respawn_counts", {}) or {}
             if not respawns:
@@ -1866,6 +2128,23 @@ class Orchestrator:
                     if len(description) > 60:
                         description = description[:57] + "..."
                     print(f"    {count:>3}x  status={status}  {task_id}  {description}")
+
+            ceiling = self.task_energy_ceiling()
+            print(f"\n  TASK ENERGY (top 10 by energy; per-task ceiling {ceiling} = "
+                  f"max({self.TASK_ENERGY_FLOOR}, {self.TASK_ENERGY_FRACTION:.0%} of start))")
+            task_energy = dict(getattr(self.colony, "task_energy_spent", {}) or {})
+            if not task_energy:
+                print("    (no energy attributed to a task this run)")
+            else:
+                reasons = getattr(self, "abandon_reasons", {}) or {}
+                for task_id, spent in sorted(task_energy.items(), key=lambda kv: -kv[1])[:10]:
+                    task = self.task_graph.tasks.get(task_id)
+                    status = task.status if task is not None else "?"
+                    agents = 1 + respawns.get(task_id, 0)
+                    flag = "  OVER" if spent >= ceiling else ""
+                    label = f"  [{reasons[task_id]}]" if task_id in reasons else ""
+                    print(f"    {spent:>6}  agents={agents}  status={status}  "
+                          f"{task_id}{flag}{label}")
 
             live_count = getattr(self, "_live_agents_at_terminate", len(self.live_agents))
             print(f"\n  live_agents at terminate : {live_count}")
@@ -1912,21 +2191,34 @@ class Orchestrator:
                   f"binding constraint -- remaining budget: {self._check_energy()}.")
         elif self.root_task_id in self.abandoned_tasks:
             print("System Status: TERMINATED [ABANDONED]")
-            print(f"The root task exhausted its {self.MAX_TASK_ATTEMPTS} respawn "
-                  f"attempts without an acceptable result. Synthesizing whatever "
-                  f"subtasks did complete.")
+            root_reason = self.abandon_reasons.get(self.root_task_id, "attempt cap")
+            if root_reason == "attempt cap":
+                print(f"The root task exhausted its {self.MAX_TASK_ATTEMPTS} respawn "
+                      f"attempts without an acceptable result. Synthesizing whatever "
+                      f"subtasks did complete.")
+            else:
+                print(f"The root task was abandoned ({root_reason}) without an "
+                      f"acceptable result. Synthesizing whatever subtasks did complete.")
         else:
             rem_energy = self._check_energy()
             print("System Status: TERMINATED [ENERGY DEATH]")
             print(f"The colony depleted its energy allocation. Remaining budget: {rem_energy}")
 
         if self.abandoned_tasks:
-            print(f"\n  ABANDONED TASKS ({len(self.abandoned_tasks)}) -- hit the "
-                  f"{self.MAX_TASK_ATTEMPTS}-attempt cap:")
+            print(f"\n  ABANDONED TASKS ({len(self.abandoned_tasks)}):")
             for abandoned_id in self.abandoned_tasks:
                 abandoned = self.task_graph.tasks.get(abandoned_id)
                 description = abandoned.description if abandoned is not None else "<unknown>"
-                print(f"    {abandoned_id}  {description[:70]}")
+                label = self.abandon_reasons.get(abandoned_id, "attempt cap")
+                print(f"    {abandoned_id}  [{label}]  {description[:60]}")
+
+        if self.unstarted_tasks:
+            print(f"\n  NOT STARTED ({len(self.unstarted_tasks)}) -- no energy left "
+                  f"to spawn an agent:")
+            for unstarted_id in self.unstarted_tasks:
+                unstarted = self.task_graph.tasks.get(unstarted_id)
+                description = unstarted.description if unstarted is not None else "<unknown>"
+                print(f"    {unstarted_id}  {description[:70]}")
 
         # Printed on BOTH exit paths on purpose: a successful run's ledger is
         # the baseline the failing runs get compared against.
@@ -1949,8 +2241,9 @@ class Orchestrator:
                 try:
                     partial_answer = self.synthesizer.format_output(partial_results, goal_text)
                     cause = (
-                        "one or more subtasks were abandoned after exhausting "
-                        f"their {self.MAX_TASK_ATTEMPTS} respawn attempts"
+                        "one or more subtasks were abandoned ("
+                        + ", ".join(sorted(set(self.abandon_reasons.values())))
+                        + ")"
                         if self.abandoned_tasks
                         else "the colony ran out of its energy budget"
                     )
