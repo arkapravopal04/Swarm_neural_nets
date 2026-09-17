@@ -35,15 +35,41 @@ from text_utils import (
     trim_to_sentences,
     first_clause,
     drop_incomplete_tail,
+    asks_for_software,
+    plain_register,
+    software_artifact_reason,
 )
 import ghost_extractor
+
+# Software-framing interventions, all on by default (see Orchestrator.__init__).
+FRAMING_LEVERS = ("reword", "block")
+
+
+def _without_quoted_example(reason: str) -> str:
+    """software_artifact_reason minus its quoted evidence: "names a
+    source-code file ('scorer.py')" -> "names a source-code file". Anything
+    written to an agent's fail_reason becomes its respawn's ghost context,
+    and quoting the file or function name back would hand the replacement
+    the exact framing the rejection exists to stop."""
+    return re.sub(r"\s*\([^()]*\)\s*$", "", reason)
 
 class Orchestrator:
     def __init__(self, colony_state: ColonyState, task_graph: TaskGraph, messenger: Messenger,
                  phaser=None, judge=None, memory_store=None, synthesizer=None,
                  model=None, tokeniser=None, embed_model=None,
-                 budget_override: Optional[int] = None):
+                 budget_override: Optional[int] = None,
+                 framing_levers=FRAMING_LEVERS):
         self.colony = colony_state
+        # Which software-framing interventions act this run: "reword"
+        # (plain wording for code-coded subtask vocabulary) and/or "block"
+        # (reject code-shaped SPAWN/REPORT, scrub code-shaped DIE text).
+        # Detection and its counters run regardless, so a run with
+        # framing_levers=() is the measured baseline the others compare to.
+        unknown = set(framing_levers) - set(FRAMING_LEVERS)
+        if unknown:
+            raise ValueError(f"unknown framing_levers {sorted(unknown)}; "
+                             f"valid: {sorted(FRAMING_LEVERS)}")
+        self.framing_levers = frozenset(framing_levers)
         self.task_graph = task_graph
         self.messenger = messenger
         self.agent_counter = 0 
@@ -314,6 +340,12 @@ class Orchestrator:
                     self.colony.record_verdict("cycle_cap_reached")
                 if getattr(live_agent, "cap_coerced_last_run", False):
                     self.colony.record_verdict("cycle_cap_coerced")
+                # Observation only: pseudocode in an agent's own reasoning
+                # is the reflex showing up before any action, and nothing
+                # else would count it.
+                new_thoughts = str(getattr(live_agent, "thought_process", "") or "")[prev_len:]
+                if self._software_framing_reason(new_thoughts) is not None:
+                    self.colony.record_verdict("software_framing_think_detected")
             except Exception as e:
                 print(f"Agent {agent_id} crashed during run(): {e}")
                 print(traceback.format_exc())
@@ -414,6 +446,8 @@ class Orchestrator:
 
         goal_text = spec.get("goal", problem_spec)
         print(f"[initialize_colony] goal ({len(goal_text)} chars): {goal_text}")
+        print(f"[initialize_colony] software framing guard: "
+              f"{'ON' if self._software_framing_guard_active else 'OFF'}")
 
         root_node = TaskNode(
             task_id=self.root_task_id,
@@ -879,6 +913,54 @@ class Orchestrator:
             return False
         return True
 
+    @property
+    def _software_framing_guard_active(self) -> bool:
+        """
+        True when the user's own request never asked for software, so a
+        subtask or answer shaped like code is the model's reflex rather than
+        the job. Read from raw_text only, never the phaser's goal: the goal
+        is model output and can itself be where "Generate a script to..."
+        came from. No spec (or no raw text) leaves the guard off.
+        """
+        raw_text = (self.spec or {}).get("raw_text")
+        return bool(raw_text) and not asks_for_software(raw_text)
+
+    def _software_framing_reason(self, text) -> Optional[str]:
+        """Why this text is a software deliverable in disguise, or None
+        (always None when the project really is about software)."""
+        if not self._software_framing_guard_active:
+            return None
+        return software_artifact_reason(text)
+
+    def _plain_subtask_description(self, description: str) -> str:
+        """
+        A SPAWNed subtask description with code-coded words reworded
+        ("Implement the voting logic" -> "Work out the voting rules").
+
+        Reworded rather than rejected: the words are ordinary English and
+        the plan behind them is usually fine, but the child reads its task
+        text (and its own children inherit it) as a request for code -- the
+        suspected path by which one early "implement" spreads through a
+        colony. Rejecting would cost a respawn per word.
+
+        Counted whether or not the "reword" lever is on, so a baseline run
+        still shows how often subtasks arrive in code-coded wording.
+        """
+        if not self._software_framing_guard_active or not isinstance(description, str):
+            return description
+        plain, replaced = plain_register(description)
+        if not replaced:
+            return description
+        self.colony.record_verdict("software_framing_subtask_codeword")
+        if "reword" not in self.framing_levers:
+            print(f"  [software-framing] subtask uses code-coded wording {replaced} "
+                  f"(reword lever off): {description[:80]!r}")
+            return description
+        print(f"  [software-framing] reworded subtask {replaced}: "
+              f"{description[:80]!r} -> {plain[:80]!r}")
+        self.colony.record_verdict("software_framing_subtask_reworded")
+        return plain
+
     def _reject_derived_subtask_batch(self, event: Event, descriptions: list) -> bool:
         """
         Returns True if this SPAWN batch may proceed, False if it was
@@ -903,7 +985,52 @@ class Orchestrator:
             return True
 
         offending = None
+        advice = (
+            "The examples in your instructions show "
+            "the FORMAT only -- their task text belongs to a different, "
+            "made-up project and must never appear in your payload. Every "
+            "subtask you spawn must be a piece of THIS project's task, "
+            "worded in this project's own vocabulary."
+        )
+        agent_offending = None
+        rejection = ("REJECTED: decomposition copied its subtasks from "
+                     "the prompt's worked examples instead of "
+                     "decomposing the assigned task.")
+        # Software framing. Every code-shaped subtask in the batch is counted
+        # BEFORE deciding anything, so the count means the same thing with
+        # the "block" lever on (batch rejected at the first one) or off.
+        software_hits = []
         for description in descriptions:
+            software_reason = self._software_framing_reason(description)
+            if software_reason is not None:
+                self.colony.record_verdict("software_framing_spawn_detected")
+                software_hits.append((description, software_reason))
+        if software_hits and "block" not in self.framing_levers:
+            for description, software_reason in software_hits:
+                print(f"  [software-framing] subtask {software_reason} "
+                      f"(block lever off): {description[:80]!r}")
+        elif software_hits:
+            description, software_reason = software_hits[0]
+            offending = (
+                f"subtask '{description[:80]}' {software_reason}, but "
+                f"this project never asked for software"
+            )
+            # The spawner's respawn reads fail_reason as ghost context, so
+            # it must not quote the file/function names back to it.
+            agent_offending = (
+                f"a subtask {_without_quoted_example(software_reason)}, but "
+                f"this project never asked for software"
+            )
+            advice = (
+                "Word every subtask as the decision, list, plan or "
+                "piece of writing it really is, in plain sentences -- "
+                "no file names, function names or code."
+            )
+            rejection = ("REJECTED: decomposition turned a non-software "
+                         "task into software subtasks.")
+            self.colony.record_verdict("software_framing_spawn_rejected")
+
+        for description in ([] if offending is not None else descriptions):
             exemplar = self._matching_exemplar(description)
             if exemplar is not None:
                 offending = (
@@ -929,11 +1056,7 @@ class Orchestrator:
 
         spawner.fail_reason = (
             "Previous attempt was REJECTED and none of its subtasks were "
-            f"created: {offending}. The examples in your instructions show "
-            "the FORMAT only -- their task text belongs to a different, "
-            "made-up project and must never appear in your payload. Every "
-            "subtask you spawn must be a piece of THIS project's task, "
-            "worded in this project's own vocabulary."
+            f"created: {agent_offending or offending}. {advice}"
         )
         self.messenger.push_event(
             "failure_request",
@@ -942,9 +1065,7 @@ class Orchestrator:
                 "task_id": spawner.task_id,
                 "role": spawner.role,
                 "parent_id": spawner.parent_id,
-                "result": ("REJECTED: decomposition copied its subtasks from "
-                           "the prompt's worked examples instead of "
-                           "decomposing the assigned task."),
+                "result": rejection,
             },
         )
         return False
@@ -1121,6 +1242,7 @@ class Orchestrator:
                 if not description:
                     print("Warning: subtask entry missing 'task'/'description', skipping.")
                     continue
+                description = self._plain_subtask_description(description)
                 sub["role"] = self._enforce_child_role(sub.get("role", "worker"), parent_id)
                 task_id = self._generate_task_id()
                 label = sub.get("label")
@@ -1225,6 +1347,7 @@ class Orchestrator:
             print("Warning: Spawn request ignored due to missing task description in payload.")
             return True
 
+        description = self._plain_subtask_description(description)
         if not self._reject_derived_subtask_batch(event, [description]):
             return False
 
@@ -1349,6 +1472,40 @@ class Orchestrator:
                 print(f"  [report-trim] {agent_id} REPORT trimmed "
                       f"{len(str(result))} -> {len(trimmed)} chars before judging.")
                 result = trimmed
+
+        # Software framing: a REPORT that is a file list, a function or a
+        # made-up checksum on a project that never asked for software is not
+        # an answer to it, however well the judge's similarity score rates
+        # its vocabulary. Rejected before the judge and never promoted to a
+        # parent -- and checked BEFORE last_partial_result below, or a task
+        # later abandoned by the attempt cap would hand this exact text to
+        # its parent as the salvaged answer anyway. Reads the untrimmed
+        # payload: the 3-sentence report-trim above can cut the file list or
+        # checksum line off and let the rest through.
+        software_reason = self._software_framing_reason(payload.get("result"))
+        if software_reason is not None:
+            self.colony.record_verdict("software_framing_report_detected")
+        framing_agent = self.colony.get_agent(agent_id)
+        if (software_reason is not None and framing_agent is not None
+                and "block" not in self.framing_levers):
+            print(f"  [software-framing] REPORT from {agent_id} {software_reason} "
+                  f"(block lever off).")
+        elif software_reason is not None and framing_agent is not None:
+            self.colony.record_verdict("software_framing_report_rejected")
+            print(f"REJECT (software framing) on {agent_id}/{task_id}: REPORT "
+                  f"{software_reason}, but this project never asked for software.")
+            framing_agent.fail_reason = (
+                f"Previous attempt was REJECTED: your answer "
+                f"{_without_quoted_example(software_reason)}, "
+                f"but nobody asked for a program. Give the answer itself in "
+                f"plain sentences -- the decision, list, plan or text the task "
+                f"asks for. No code, pseudocode, file names or function names."
+            )
+            self._kill_and_respawn(
+                agent_id, task_id, framing_agent.role, framing_agent.parent_id,
+                verdict={"verdict": "execute", "reason": framing_agent.fail_reason},
+            )
+            return
 
         # Remembered whatever the judge decides next: if this task is later
         # abandoned by the attempt cap, this is the salvage value handed to
@@ -1598,6 +1755,33 @@ class Orchestrator:
         verdict = payload.get("judge_verdict")
 
         die_text = payload.get("result", "") or ""
+        # A DIE's text becomes the dead agent's fail_reason (Agent.die), and
+        # extract_agent_ghost hands that to the respawn as ghost context. So
+        # a "TASK TOO LARGE: split into scheduler.py, scorer.py, ..." would
+        # seed the replacement decomposer with the very software breakdown
+        # it should not make. With the "block" lever on, the reason is
+        # replaced by a plain note before the respawn reads it; the DIE
+        # itself (and the TASK TOO LARGE re-plan below) still proceeds.
+        software_reason = self._software_framing_reason(die_text)
+        if software_reason is not None:
+            self.colony.record_verdict("software_framing_die_detected")
+            dead_node = self.colony.get_agent(agent_id)
+            if "block" in self.framing_levers and dead_node is not None:
+                self.colony.record_verdict("software_framing_die_scrubbed")
+                too_large = die_text.startswith("TASK TOO LARGE:")
+                dead_node.fail_reason = (
+                    f"Previous attempt DIED{' (task too large)' if too_large else ''}. "
+                    f"Its stated reason {_without_quoted_example(software_reason)} "
+                    f"and was withheld, "
+                    f"because this project never asked for software. Treat "
+                    f"the task as decisions, lists, plans or writing, in "
+                    f"plain sentences."
+                )
+                print(f"  [software-framing] DIE from {agent_id} {software_reason} "
+                      f"-- withheld from the respawn's ghost context.")
+            else:
+                print(f"  [software-framing] DIE from {agent_id} {software_reason} "
+                      f"(block lever off).")
         if verdict is None and role == "executor" and die_text.startswith("TASK TOO LARGE:"):
             print(f"Agent {agent_id} reported its task as too large -- "
                   f"respawning as a decomposer for the same task instead of an executor.")
@@ -2115,6 +2299,23 @@ class Orchestrator:
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
             print(f"    agents that reached it   : {verdicts.get('cycle_cap_reached', 0)}")
             print(f"    actions forced by the cap: {verdicts.get('cycle_cap_coerced', 0)}")
+
+            print(chr(10) + "  SOFTWARE FRAMING (code-shaped work on a non-software request)")
+            if not self._software_framing_guard_active:
+                print("    (guard off -- the request asked for software, or there was none)")
+            else:
+                print(f"    levers on: {sorted(self.framing_levers) or 'none (baseline)'}")
+                print("    detected (counted whatever the levers):")
+                print(f"      subtasks in code-coded wording : {verdicts.get('software_framing_subtask_codeword', 0)}")
+                print(f"      code-shaped subtasks           : {verdicts.get('software_framing_spawn_detected', 0)}")
+                print(f"      code-shaped THINK cycles       : {verdicts.get('software_framing_think_detected', 0)}")
+                print(f"      code-shaped REPORTs            : {verdicts.get('software_framing_report_detected', 0)}")
+                print(f"      code-shaped DIEs               : {verdicts.get('software_framing_die_detected', 0)}")
+                print("    acted on:")
+                print(f"      subtasks reworded      : {verdicts.get('software_framing_subtask_reworded', 0)}")
+                print(f"      SPAWN batches rejected : {verdicts.get('software_framing_spawn_rejected', 0)}")
+                print(f"      REPORTs rejected       : {verdicts.get('software_framing_report_rejected', 0)}")
+                print(f"      DIE reasons withheld   : {verdicts.get('software_framing_die_scrubbed', 0)}")
 
             print("\n  RESPAWNS (top 10 by count)")
             respawns = getattr(self, "respawn_counts", {}) or {}

@@ -3,11 +3,13 @@ import torch
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from text_utils import (
+    asks_for_software,
     cut_at_code_block,
     dedupe_global_and_cap,
     dedupe_list_exact,
     final_derived_constraint,
     looks_like_source_code,
+    plain_register,
     reasoning_reason,
     strip_code_fences,
 )
@@ -64,9 +66,14 @@ class Problem_Phaser:
     # stronger penalty can break by discouraging its repeat.
     REPETITION_PENALTY = 1.3
 
-    def __init__(self, model, tokeniser, embed_model=None):
+    def __init__(self, model, tokeniser, embed_model=None, reword_software_vocabulary=True):
         self.llm = model
         self.tokeniser = tokeniser
+        # Phaser half of the orchestrator's "reword" framing lever: plain
+        # wording for code-coded words in the goal and requirements of a
+        # request that never asked for software. Separate switch because the
+        # phaser is constructed separately; set both off for a baseline run.
+        self.reword_software_vocabulary = reword_software_vocabulary
 
         # FIX: previously always constructed its own SentenceTransformer here,
         # and memory_state.py's MemoryStore did the same independently -- two
@@ -239,17 +246,38 @@ class Problem_Phaser:
         )
         return fallback
 
+    def _plain_wording(self, text, raw_text, what):
+        """text with code-coded words reworded, when the user's own request
+        (raw_text) never asked for software and the lever is on. On a
+        software request "implement" and "algorithm" mean what they say."""
+        if not self.reword_software_vocabulary or not text or asks_for_software(raw_text):
+            return text
+        plain, replaced = plain_register(text)
+        if replaced:
+            print(f"[Problem_Phaser] {what} reworded out of software "
+                  f"vocabulary {replaced}: {plain!r}")
+        return plain
+
     def _get_goal_prompt(self, raw_text):
         """Extracts the singular core action statement from the user's prompt."""
-        goal_prompt = f"""You are an expert systems architect specializing in intent distillation.
+        # Two examples, one software and one not. The only example used to
+        # turn a request into "Generate a script to...", and this goal is
+        # the [Project goal] line in every agent's ghost context -- one
+        # code-flavoured sentence here sets the register for the whole
+        # colony. "systems architect" went for the same reason.
+        goal_prompt = f"""You are an expert at intent distillation.
 TASK: Extract the single core objective from the user's request.
 RULES: 
 1. Output EXACTLY ONE imperative sentence.
 2. No preambles, conversational filler, or explanations.
+3. Keep the kind of result the user asked for, in the user's own plain words. Only mention a script or a program if the user asked for one.
 
-EXAMPLE:
+EXAMPLES:
 Input: "I have a CSV of sales data, can you write me a script to plot monthly revenue trends?"
 Output: Generate a script to visualize monthly revenue trends from sales data.
+
+Input: "Our hiking group argues every month about which trail to do. How should we decide?"
+Output: Decide on a fair way for the hiking group to choose each month's trail.
 
 GIVEN TEXT: 
 <user_input>
@@ -295,6 +323,12 @@ Output:"""
                     f"of the text ({len(goal_sentence)} -> {len(cleaned_goal)} chars)."
                 )
             goal_sentence = cleaned_goal
+
+            # Reworded BEFORE encoding, so goal_vector and the root task
+            # description still agree (see the dedupe note above). Only when
+            # the user's own text never asked for software: there,
+            # "implement" and "algorithm" mean exactly what they say.
+            goal_sentence = self._plain_wording(goal_sentence, raw_text, "goal")
             goal_vector = self.embed_model.encode(goal_sentence, convert_to_numpy=True)
 
         return goal_sentence, goal_vector
@@ -311,8 +345,8 @@ EXAMPLES:
 Input: "Using my existing AWS RDS Postgres database, create a query to find duplicates."
 Output: The user is operating with an existing AWS RDS PostgreSQL database.
 
-Input: "I have a CSV file with columns 'Date' and 'Amount'. Write a script."
-Output: The user currently has a dataset in CSV format with 'Date' and 'Amount' columns.
+Input: "Our team of six shares one car for site visits. Plan next week's visits."
+Output: The user's team has six people sharing a single car for site visits.
 
 Input: "Can you write a short sci-fi story?"
 Output: NONE
@@ -350,7 +384,7 @@ Output:"""
     def _get_requirement(self, raw_text):
         """Extracts technical boundaries, constraints, and requirements as distinct vectors."""
         requirement_prompt = f"""You are a strict constraints-extraction engine.
-TASK: Extract all explicit technical boundaries, rules, performance targets, and formatting demands.
+TASK: Extract all explicit boundaries, rules, limits, targets, and formatting demands.
 
 RULES:
 1. Output ONLY a Markdown bulleted list using the '-' character.
@@ -367,6 +401,13 @@ Output:
 - Must use BeautifulSoup framework.
 - Execution time must be under 5 seconds.
 - Selenium is strictly prohibited.
+
+Input: "Plan a dinner for 8 guests. Keep it under $200, two guests are vegetarian, and no nuts."
+Output:
+- Must serve 8 guests.
+- Total cost must be under $200.
+- Must include vegetarian options for 2 guests.
+- Nuts are prohibited.
 
 Input: "Explain the theory of relativity."
 Output:
@@ -393,7 +434,14 @@ Output:
             req_output = self._sanitize_generation(req_output)
 
         requirements_list = self._clean_requirements(req_output)
-        
+        # Requirements reach every agent's "Constraints you must satisfy"
+        # block, so an extractor that writes "Must implement a fair
+        # resolution algorithm" would re-prime every child regardless of how
+        # its own task is worded. Reworded before encoding, same as the goal.
+        requirements_list = [
+            self._plain_wording(req, raw_text, "constraint") for req in requirements_list
+        ]
+
         vectored_reqs = []
         if requirements_list:
             vectored_reqs = self.embed_model.encode(requirements_list, convert_to_numpy=True)
