@@ -305,6 +305,24 @@ class Agent:
     MAX_TOTAL_THINK_TOKENS = 4096
     THINK_CYCLES_BEFORE_DECIDE = 1
 
+    # Hard ceiling on run() cycles that end without finishing or handing off.
+    # Every run() past the first spends a full think() generation AND a
+    # decide() generation, so an agent whose decide() keeps answering THINK
+    # never ends -- one executor looped THINK seven-plus times without a
+    # REPORT or DIE and was most of that run's think_tick spend on its own.
+    # MAX_TOTAL_THINK_TOKENS does not catch it: it only stops think() from
+    # generating, and decide() still offers THINK every cycle.
+    #
+    # Counts any cycle whose action is not REPORT/DIE and that left
+    # `awaiting` unset -- not only THINK. A SPAWN or TOOL the agent itself
+    # rejects (malformed JSON, missing keys) returns without setting
+    # `awaiting`, so the next tick is another think()+decide() on the same
+    # task: the same loop, and counting THINK alone never saw it. Includes
+    # think()'s automatic first cycle, so 4 means three more chosen by
+    # decide(). Once reached, run() skips think() and decide() is offered
+    # only final_actions.
+    MAX_NON_TERMINAL_CYCLES = 4
+
     def __init__(self, tokeniser, model, message: Messenger, node: AgentNode,
                  KV_Cache=None, last_hidden_state=None):
         self.node = node
@@ -348,6 +366,12 @@ class Agent:
         # across think() cycles -- a loop that straddles a cycle boundary
         # has to stay penalized.
         self._think_recent_ids = deque(maxlen=self.THINK_REPETITION_WINDOW)
+        # Cycles so far that neither finished nor handed off, against
+        # MAX_NON_TERMINAL_CYCLES.
+        self.non_terminal_cycles = 0
+        # Set by decide() when the cap forced a different action than the
+        # model chose; the orchestrator reads it after run() to tally it.
+        self.cap_coerced_last_run = False
         # actions
         self.action_tokens = ["THINK", "SPAWN", "TOOL", "REPORT", "DIE"]
         # Set by run() to whatever available_tools it was actually called
@@ -369,6 +393,26 @@ class Agent:
     @property
     def role(self):
         return self.node.role
+
+    @property
+    def cycles_capped(self):
+        return self.non_terminal_cycles >= self.MAX_NON_TERMINAL_CYCLES
+
+    @property
+    def _decomposer_awaiting_first_spawn(self):
+        return self.role == "decomposer" and not getattr(self.node, "has_spawned", False)
+
+    @property
+    def final_actions(self):
+        """The whole menu once cycles_capped. A decomposer that has not
+        spawned yet finishes by SPAWNing -- a REPORT from it is either
+        structurally rejected (root) or its own planning notes judged as a
+        subtask's answer (non-root). Once its children exist the
+        orchestrator only runs it after all of them finish, so REPORT is
+        then the real roll-up."""
+        if self._decomposer_awaiting_first_spawn:
+            return ("SPAWN", "DIE")
+        return ("REPORT", "DIE")
 
     @property
     def _role_may_tool(self):
@@ -471,7 +515,7 @@ class Agent:
         except Exception:
             return []
 
-    def _get_format_example(self, available_tools=None):
+    def _get_format_example(self, available_tools=None, final_only=False):
         examples = {
             "decomposer": (
                 'ACTION: SPAWN\n'
@@ -498,6 +542,16 @@ class Agent:
             # of a valid response, which is why so many of them opened
             # with one.
             positive = examples["verifier"]
+
+        if final_only:
+            # Cycle cap reached with a REPORT/DIE menu, so the only worked
+            # example is a REPORT -- no SPAWN batches, no tool reference.
+            return (
+                f"Example of a VALID response:\n{examples['verifier']}\n\n"
+                f"Example of an INVALID response (do NOT do this -- free-form "
+                f"reasoning with no ACTION: line is never an acceptable output):\n"
+                f"<free-form reasoning with no ACTION: line -- placeholder, not a task>\n\n"
+            )
 
         decomposer_batch_example = (
             'Every subtask you SPAWN in a batch MUST include an explicit '
@@ -895,23 +949,59 @@ class Agent:
                 "Give the answer itself first. Do not introduce it.\n"
             )
 
+        think_action_line = (
+            "- THINK  — continue reasoning before acting (Use this to plan your next move).\n"
+        )
+        think_format_line = "- If THINK: Provide your reasoning in plain text.\n"
+        think_cap_str = ""
+        if self.cycles_capped:
+            # Cycle budget spent: final_actions is the whole menu, and every
+            # other line of the prompt has to agree with it -- the role rule
+            # and the example included, not just the action list.
+            think_action_line = think_format_line = ""
+            tool_action_line = tool_format_line = ""
+            if self._decomposer_awaiting_first_spawn:
+                report_action_line = report_format_line = ""
+                think_cap_str = (
+                    f"[THINKING BUDGET EXHAUSTED -- you have already used "
+                    f"{self.non_terminal_cycles} cycles on this task without "
+                    f"spawning. You must act now: SPAWN your subtasks, or DIE "
+                    f"if this task cannot be decomposed.]\n"
+                )
+                # The normal decomposer example is already SPAWN-only.
+            else:
+                spawn_action_line = spawn_format_line = ""
+                if self.role == "decomposer":
+                    role_constraint_str = (
+                        "CRITICAL RULE: your subtasks are finished and their "
+                        "results are in your previous thoughts. Your ONLY job "
+                        "now is to combine those results for your parent. Do "
+                        "not create new subtasks and do not solve anything "
+                        "your children did not.\n"
+                    )
+                think_cap_str = (
+                    f"[THINKING BUDGET EXHAUSTED -- you have already used "
+                    f"{self.non_terminal_cycles} cycles on this task. You must "
+                    f"finish now: REPORT your best result (state plainly anything "
+                    f"you could not work out), or DIE if you have nothing usable.]\n"
+                )
+                format_example_str = self._get_format_example(available_tools, final_only=True)
+
         prompt = f"""You are an AI agent in a colony of agents working together to solve problems.
 Your Agent ID: {self.agent_id}
 Your Role: {self.role}
 {role_constraint_str}Your Task: {self.task}
 
-{requirements_str}{ghost_str}{fail_str}{tool_result_str}{thoughts_str}
+{requirements_str}{ghost_str}{fail_str}{tool_result_str}{thoughts_str}{think_cap_str}
 Available actions:
-- THINK  — continue reasoning before acting (Use this to plan your next move).
-{spawn_action_line}{tool_action_line}{report_action_line}- DIE    — you cannot complete this task, signal failure to your parent.
+{think_action_line}{spawn_action_line}{tool_action_line}{report_action_line}- DIE    — you cannot complete this task, signal failure to your parent.
 
 OUTPUT FORMAT INSTRUCTIONS:
 You must respond with EXACTLY ONE action block in the following format:
 
 ACTION: <One of the available actions>
 PAYLOAD: <Depends on the action>
-- If THINK: Provide your reasoning in plain text.
-{spawn_format_line}{tool_format_line}{report_format_line}- If DIE: Provide the reason you cannot proceed.
+{think_format_line}{spawn_format_line}{tool_format_line}{report_format_line}- If DIE: Provide the reason you cannot proceed.
 
 {format_example_str}
 Your next action:"""
@@ -1457,7 +1547,80 @@ Your next action:"""
             else:
                 payload = "[No content generated -- decide() produced an empty response.]"
 
+        self.cap_coerced_last_run = False
+        if self.cycles_capped:
+            final = self.final_actions
+            if action not in final or (action == "SPAWN" and not self._is_spawn_payload(payload)):
+                action, payload = self._coerce_final_action(action, payload)
+                self.cap_coerced_last_run = True
+
         return action, payload
+
+    @staticmethod
+    def _is_spawn_payload(payload):
+        """True only if the orchestrator would start at least one subtask
+        from this payload. Shape alone is not enough at the cap: a subtasks
+        list of strings or task-less dicts passes a shape check, starts
+        nothing, and would be this agent's last action. Key spelling is not
+        checked: the orchestrator fuzzy-repairs keys like "taask", and if
+        nothing starts anyway it routes a capped spawner to failure
+        (_release_spawner_if_nothing_started)."""
+        def has_task(item):
+            return isinstance(item, dict) and any(
+                isinstance(value, str) and value.strip()
+                for key, value in item.items() if key not in ("role", "label")
+            )
+
+        if not isinstance(payload, dict):
+            return False
+        subtasks = payload.get("subtasks")
+        if isinstance(subtasks, list):
+            return any(has_task(sub) for sub in subtasks)
+        return "role" in payload and has_task(payload)
+
+    def _coerce_final_action(self, action, payload):
+        """
+        Cycle cap reached but decide() still produced an action outside
+        final_actions (or a parse failure, which lands on THINK above).
+        Leaving the menu out of the prompt does not stop the model writing
+        the word, and every fallback in decide() degrades to THINK -- so
+        without this the cap is advisory and the loop continues.
+
+        REPORT/DIE menu: converted to a REPORT of whatever prose there is,
+        so the tier checks judge it; DIE only when there is no text at all.
+        SPAWN/DIE menu (decomposer, no children yet): anything but a usable
+        SPAWN is a DIE. Its prose is planning notes, never an answer.
+        """
+        # Whatever decide() said about the action it just discarded ("SPAWN
+        # Action Failed ... on your next attempt") no longer applies, and a
+        # WARN that keeps this agent running would otherwise show it a
+        # verdict telling it to retry an action it does not have.
+        self.fail_reason = None
+
+        if "REPORT" in self.final_actions:
+            text = payload if isinstance(payload, str) else ""
+            text = strip_scaffolding_lines(strip_special_tokens(text)).strip()
+            if not text:
+                text = strip_scaffolding_lines(
+                    strip_special_tokens(self.thought_process[-2000:])
+                ).strip()
+        else:
+            text = ""
+        forced = "REPORT" if text else "DIE"
+        print(
+            f"  [decide() CYCLE CAP] agent={self.agent_id} role={self.role} "
+            f"cycles={self.non_terminal_cycles} menu={self.final_actions} -- "
+            f"decide() chose {action}, which is closed or unusable; forcing {forced}."
+        )
+        if text:
+            return "REPORT", _dedupe_repeated_sentences(trim_closer_tail(text), max_chars=2000)
+        if self._decomposer_awaiting_first_spawn:
+            reason = "without producing a usable SPAWN"
+        else:
+            reason = "with no usable result to report"
+        return "DIE", (
+            f"Cycle cap reached ({self.non_terminal_cycles} cycles) {reason}."
+        )
         
     def execute(self, action, payload):
         '''just makes it to teh handler methods'''
@@ -1881,13 +2044,31 @@ Your next action:"""
         # that case, so leave enforcement off to match.
         self._run_available_tools = available_tools
 
-        action = self.think(available_roles, available_tools, requirements)
-        
-        if action == "FORCE_DECIDE" or (action in self.action_tokens and action != "THINK"):
+        self.cap_coerced_last_run = False
+        if self.cycles_capped:
+            # No think() once the cap is hit: its generation is the bulk of
+            # a tick's think_tick cost, and it can only feed a THINK that
+            # decide() is no longer allowed to return.
             action, payload = self.decide(available_roles, available_tools, requirements)
         else:
-            payload = self.thought_process
+            action = self.think(available_roles, available_tools, requirements)
+
+            if action == "FORCE_DECIDE" or (action in self.action_tokens and action != "THINK"):
+                action, payload = self.decide(available_roles, available_tools, requirements)
+            else:
+                payload = self.thought_process
 
         self.execute(action, payload)
+
+        # After execute(), not before: whether a SPAWN/TOOL actually handed
+        # off is only known once its handler has accepted or rejected it. A
+        # dispatched TOOL sets no `awaiting` (its result arrives before the
+        # next tick) but clears fail_reason, while every refusal sets one; it
+        # is not charged here because MAX_TOOL_ATTEMPTS_PER_AGENT and the
+        # duplicate-call window already bound it, and charging it would
+        # leave an executor three real tool calls.
+        handed_off = self.awaiting is not None or (action == "TOOL" and self.fail_reason is None)
+        if action not in ("REPORT", "DIE") and not handed_off:
+            self.non_terminal_cycles += 1
         
         return action

@@ -25,6 +25,7 @@ class AgentNode:
     tool_call_count: int = 0
     generation: int = 0
     crash_count: int = 0
+    has_spawned: bool = False
 
 
 class ColonyState:
@@ -46,6 +47,13 @@ class ColonyState:
         self.starting_budget = initial_budget
         self.energy_ledger = {}
         self.energy_credits = {}
+
+        # task_id -> total debited to agents while they worked that task.
+        # Keyed by task, not agent, so it keeps accumulating across every
+        # agent a task burns through: a respawn starts a fresh Agent (and a
+        # fresh AgentNode.energy_spent) but not a fresh entry here. Read by
+        # Orchestrator's per-task energy ceiling.
+        self.task_energy_spent = {}
 
         # Tier-3 verdict tally (Step 1). Deliberately NOT folded into
         # energy_ledger: that dict is summed against starting_budget in
@@ -94,6 +102,10 @@ class ColonyState:
             agent.energy_spent += amount
             self.budget_remaining -= amount
             self.energy_ledger[category] = self.energy_ledger.get(category, 0) + amount
+            if agent.task_id:
+                self.task_energy_spent[agent.task_id] = (
+                    self.task_energy_spent.get(agent.task_id, 0) + amount
+                )
         else:
             print(f"Warning: {agent_id} invalid for energy debit "
                   f"(category={category}) -- charging budget as 'orphaned'.")
