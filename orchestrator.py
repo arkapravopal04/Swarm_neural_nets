@@ -123,6 +123,11 @@ class Orchestrator:
         # result's cause line: the attempt cap, the energy ceiling, or no
         # energy to respawn.
         self.abandon_reasons: Dict[str, str] = {}
+        # task_id -> (spent, ceiling) for a task whose REPORT was promoted
+        # after its agents had already crossed the energy ceiling. The
+        # result is kept -- it was produced and judged good -- but the
+        # overrun is recorded so the ledger stays honest about it.
+        self.completed_over_ceiling: Dict[str, tuple] = {}
 
         # Child tasks that never got an agent because spawn_agent had no
         # energy for them -- see _close_unstartable_child.
@@ -1478,6 +1483,17 @@ class Orchestrator:
         injection_cost = max(1, len(injected_text) // 100)
         self.colony.debit_energy(parent_id, injection_cost, category="injection")
 
+        # The ceiling, checked at bill time. An injection is billed to a
+        # parent that is `awaiting` its children, and _run_live_agents skips
+        # an awaiting agent -- so a decomposer's task could be pushed over
+        # its ceiling by its children's results with nothing consulting the
+        # line until the parent's own next cycle. Checked here, the task
+        # stops on the debit that crossed it.
+        parent_node = self.colony.get_agent(parent_id)
+        parent_task_id = getattr(parent_node, "task_id", None) if parent_node else None
+        if self._enforce_task_energy_ceiling(parent_id, parent_task_id):
+            return
+
         # Resume the parent only once EVERY child is done. Clearing the gate
         # on the first result ticked a decomposer every heartbeat while its
         # siblings were still running -- a THINK per tick that used to only
@@ -1861,6 +1877,22 @@ class Orchestrator:
             f"\"{self.task_graph.tasks.get(task_id).description if self.task_graph.tasks.get(task_id) else '?'}\" "
             f"-- verdict={verdict['verdict']} ({verdict.get('reason', 'no judge configured')})"
         )
+
+        # The ceiling, checked after judging. A REPORT cycle is exempt from
+        # the per-cycle check so a possibly-good result reaches the judge
+        # instead of being thrown away unread -- which leaves this, the
+        # promotion, as the one exit from that exemption with no check at
+        # all (the tier-3 critique above is billed on this same path). The
+        # result has been produced and accepted, so abandoning it now would
+        # waste finished work; it is kept, and the overrun recorded instead.
+        overrun = self._task_energy_overrun(task_id)
+        if overrun is not None:
+            spent, ceiling = overrun
+            self.completed_over_ceiling[task_id] = (spent, ceiling)
+            print(f"  [energy-ceiling] {agent_id} completed task {task_id} at "
+                  f"{spent} energy against a ceiling of {ceiling} -- result "
+                  f"kept, flagged as completed over ceiling.")
+
         self.task_graph.complete_task(task_id)
         self.colony.store_result(task_id, result)
 
@@ -2130,7 +2162,10 @@ class Orchestrator:
             at all -- a THINK, a refused TOOL/SPAWN, or a crash under
             MAX_CONSECUTIVE_CRASHES;
           * handle_completion's WARN branch, for a REPORT the judge sent
-            back, which is the loop that actually produced the overshoot.
+            back, which is the loop that actually produced the overshoot;
+          * handle_parent_notification, right after a child's result is
+            billed to its waiting parent -- the one debit that lands on an
+            agent _run_live_agents is not ticking.
         Between them the overshoot is bounded by one cycle rather than by
         one whole agent's remaining budget.
 
@@ -2662,10 +2697,17 @@ class Orchestrator:
                     # rather than by a whole agent's.
                     # OVER with nothing that stopped it is the real signature
                     # -- a task past its ceiling that is still being funded.
+                    # A promoted REPORT that landed over the line is kept,
+                    # not stopped -- labelled as such so it neither hides
+                    # under a plain status=2 nor reads as a leak.
                     flag = ""
                     if spent >= ceiling:
-                        flag = ("  OVER" if task_id in reasons
-                                else "  OVER -- NOT STOPPED")
+                        if task_id in reasons:
+                            flag = "  OVER"
+                        elif task_id in self.completed_over_ceiling:
+                            flag = "  OVER -- COMPLETED OVER CEILING"
+                        else:
+                            flag = "  OVER -- NOT STOPPED"
                     label = f"  [{reasons[task_id]}]" if task_id in reasons else ""
                     print(f"    {spent:>6}  agents={agents}  status={status}  "
                           f"{task_id}{flag}{label}")
