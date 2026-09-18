@@ -381,6 +381,15 @@ class Orchestrator:
                 # is firing, and how often the model ignored its menu.
                 if getattr(live_agent, "cycles_capped", False) and not was_capped:
                     self.colony.record_verdict("cycle_cap_reached")
+                # A run() that STARTED capped is a decision made with the
+                # reduced menu -- run() skips think() and goes straight to a
+                # decide() whose prompt no longer offers THINK/SPAWN. This is
+                # the counter that shows enforcement working: cycle_cap_coerced
+                # below counts only the decisions where the model ignored the
+                # reduced menu anyway, so it reads 0 exactly when the strip
+                # does its job.
+                if was_capped:
+                    self.colony.record_verdict("cycle_cap_decisions")
                 if getattr(live_agent, "cap_coerced_last_run", False):
                     self.colony.record_verdict("cycle_cap_coerced")
                 # Observation only: pseudocode in an agent's own reasoning
@@ -2579,8 +2588,19 @@ class Orchestrator:
                 print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
 
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
+            # Read these three together. "decisions at the cap" is the number
+            # that proves enforcement ran: each one is a decide() whose menu
+            # had THINK/SPAWN stripped. "forced" is the subset where the model
+            # ignored that menu and the backstop overrode it -- so 0 forced
+            # with decisions > 0 is the strip WORKING, not failing. Reached
+            # with 0 decisions means every capped agent was respawned before
+            # it made one (the WARN-at-cap path), so the menu never came up.
+            decisions = verdicts.get('cycle_cap_decisions', 0)
+            coerced = verdicts.get('cycle_cap_coerced', 0)
             print(f"    agents that reached it   : {verdicts.get('cycle_cap_reached', 0)}")
-            print(f"    actions forced by the cap: {verdicts.get('cycle_cap_coerced', 0)}")
+            print(f"    decisions at the cap     : {decisions}")
+            print(f"      model kept to the menu : {max(0, decisions - coerced)}")
+            print(f"      actions forced by the cap: {coerced}")
             # A WARN is a non-terminal cycle too (see handle_completion). These
             # two lines are what says whether REPORT -> WARN -> REPORT is still
             # running long: warns far above respawns means agents are revising
