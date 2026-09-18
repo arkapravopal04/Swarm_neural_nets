@@ -33,13 +33,19 @@ from agent_node import (
 from tools import ToolRegistry
 from text_utils import (
     normalize_identifier,
+    normalize_words,
     trim_to_sentences,
     first_clause,
+    degeneracy_cut,
     drop_incomplete_tail,
     asks_for_software,
     plain_register,
     software_artifact_reason,
 )
+# For DEGENERATE_ANSWER_MESSAGE only -- the synthesizer instance is injected,
+# not constructed here. Imported so a run that produced nothing usable says so
+# in the same words whichever guard caught it.
+from synthesizer import Synthesizer
 import ghost_extractor
 
 # Software-framing interventions, all on by default (see Orchestrator.__init__).
@@ -219,11 +225,14 @@ class Orchestrator:
         # for reference: a healthy subtask costs 13 and a healthy root
         # decomposer 22 including its children's injections, against 81.
         #
-        # Checked only when deciding whether to respawn, like the attempt
-        # cap: a task already at or over the ceiling gets no further agent.
-        # The live agent is never killed for crossing it mid-run, so a task
-        # can overshoot by at most what that one agent spends, which its own
-        # cycle cap bounds.
+        # Checked on every cycle (_run_live_agents) as well as on the respawn
+        # decision, because a task can cross the line mid-agent with no
+        # respawn boundary in between -- an agent that keeps THINKing reaches
+        # no terminal action, so nothing consulted the ceiling until its own
+        # cycle cap ran out. Overshoot is therefore bounded by one cycle,
+        # except on the cycle that produced a REPORT/DIE or handed off a
+        # SPAWN/TOOL: that result is adjudicated first rather than discarded,
+        # so the agent gets one more cycle before it can be stopped.
         self.TASK_AGENT_ALLOWANCE = 1.5
         # Only to turn generated tokens into the chars-per-100 proxy the rest
         # of the energy model bills in; ~4 chars per token for English BPE.
@@ -285,6 +294,20 @@ class Orchestrator:
                 agent = self.colony.get_agent(e.from_agent)
                 if agent:
                     agent.last_active = now
+
+            # An agent's REPORT/DIE is queued on the tick it is produced and
+            # adjudicated on the next one, so its task can be abandoned in
+            # between -- the per-cycle energy ceiling closes tasks without
+            # waiting for an event to route. Letting the stale event through
+            # would re-open a settled task: handle_completion would find no
+            # agent_node, skip the judge, and promote the result over the
+            # abandonment marker its parent was already handed.
+            if e.type in ("completion_request", "failure_request"):
+                stale_task = (e.payload or {}).get("task_id")
+                if stale_task and stale_task in self.abandoned_tasks:
+                    print(f"  [stale-event] dropping {e.type} from {e.from_agent} "
+                          f"for abandoned task {stale_task}.")
+                    continue
 
             if e.type == "spawn_request":
                 self.handle_spawn(e)
@@ -353,7 +376,7 @@ class Orchestrator:
             prev_len = len(live_agent.thought_process)
             was_capped = getattr(live_agent, "cycles_capped", False)
             try:
-                live_agent.run(available_roles, available_tools, requirements=None)
+                action = live_agent.run(available_roles, available_tools, requirements=None)
                 # Tallied so the final report shows whether the cycle cap
                 # is firing, and how often the model ignored its menu.
                 if getattr(live_agent, "cycles_capped", False) and not was_capped:
@@ -407,6 +430,11 @@ class Orchestrator:
                             "result": fail_reason,
                         }
                     )
+                # A crash is billed like a spawn, and a crash-loop under
+                # MAX_CONSECUTIVE_CRASHES reaches no respawn decision at
+                # all -- so it needs the same per-cycle boundary the
+                # normal path gets below.
+                self._enforce_task_energy_ceiling(agent_id, task_id)
                 continue
 
             if agent_node:
@@ -416,6 +444,36 @@ class Orchestrator:
             new_chars = len(live_agent.thought_process) - prev_len
             cost = max(1, new_chars // 100)
             self.colony.debit_energy(agent_id, cost, category="think_tick")
+
+            # The ceiling, checked every cycle rather than only where
+            # MAX_TASK_ATTEMPTS is. This covers the cycles that reach no
+            # terminal action -- a THINK, a refused TOOL/SPAWN -- and so
+            # produce no respawn decision for the old check to fire on.
+            #
+            # Skipped for the cycle that just produced a REPORT or DIE, or
+            # that handed off a SPAWN/TOOL: that work is queued for the next
+            # tick's _route_events and has not been judged yet, so killing
+            # the agent here would spend the energy and then throw the result
+            # away -- the opposite of what the ceiling is for. It is not a
+            # hole, because every way that adjudication can end also checks:
+            # promote completes the task, execute/DIE and the two warn
+            # short-circuits route through _kill_and_respawn, and a plain
+            # WARN -- the loop that actually overspends, since every pass
+            # through it is a REPORT cycle -- checks in handle_completion
+            # before sending the agent back. That is where the REPORT is
+            # salvaged rather than discarded: by then it has been rejected
+            # and recorded in last_partial_result.
+            # The same predicate Agent.run uses to decide whether the cycle
+            # counted as non-terminal, so the rule here is exactly "a cycle
+            # that was charged is a cycle that is checked". A dispatched TOOL
+            # sets no `awaiting` but is still work in flight -- its result
+            # arrives before the next tick -- so retiring the agent on it
+            # would strand the call.
+            handed_off = (getattr(live_agent, "awaiting", None) is not None
+                          or (action == "TOOL"
+                              and getattr(live_agent, "fail_reason", None) is None))
+            if action not in ("REPORT", "DIE") and not handed_off:
+                self._enforce_task_energy_ceiling(agent_id, task_id)
 
     def initialize_colony(self, problem_spec: str):
         """System entry point. Bootstraps the first task and the root agent."""
@@ -866,7 +924,7 @@ class Orchestrator:
         description -- so "Pick a color palette for the newsletter template."
         and "pick a colour  palette for the newsletter template" compare as
         the same string modulo the ratio below."""
-        return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+        return normalize_words(text)
 
     @classmethod
     def _matching_exemplar(cls, description: str) -> Optional[str]:
@@ -1706,8 +1764,7 @@ class Orchestrator:
             # answers, so a capped agent kept re-REPORTing with its counter
             # climbing past the cap and nothing reading it. A WARN at the cap
             # is an EXECUTE in everything but name -- routed the same way,
-            # which is also the only path that consults MAX_TASK_ATTEMPTS and
-            # the per-task energy ceiling.
+            # which is also the only path that consults MAX_TASK_ATTEMPTS.
             if live_agent is not None and live_agent.cycles_capped:
                 self.colony.record_verdict("warn_cycle_cap_respawn")
                 print(f"  [warn-cycle-cap] {agent_id} spent its "
@@ -1724,6 +1781,25 @@ class Orchestrator:
                 role = getattr(agent_node, "role", "worker") if agent_node else "worker"
                 parent_id = getattr(agent_node, "parent_id", None) if agent_node else None
                 self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict)
+                return
+
+            # The task's cumulative energy, checked before the agent is let
+            # back around. A WARN is the one decision point that continues an
+            # agent without routing through _kill_and_respawn, so this loop --
+            # REPORT -> WARN -> REPORT, each pass paying for a full cycle plus
+            # the judge's own tier-3 critique -- is how a task crossed its
+            # ceiling mid-agent with no respawn boundary to be caught at,
+            # as task_ac3e5d85 did. Reproduced in
+            # test_the_warn_loop_is_stopped_mid_agent_not_at_the_respawn_boundary:
+            # without this check the loop ran to 106 against a ceiling of 81
+            # and was closed by the respawn-time check, as before.
+            # Placed after the short-circuit and cycle-cap branches above so
+            # their _kill_and_respawn keeps its own precedence (success cache,
+            # then attempt cap, then ceiling), and after the judge has ruled,
+            # so the REPORT being abandoned is one already rejected -- and one
+            # already recorded in last_partial_result, so it is salvaged for
+            # the parent rather than discarded.
+            if self._enforce_task_energy_ceiling(agent_id, task_id):
                 return
 
             # Now that these passes are counted, they have to be worth
@@ -1879,11 +1955,14 @@ class Orchestrator:
 
         self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict)
 
-    def _kill_and_respawn(self, agent_id: str, task_id: Optional[str], role: str,
-                           parent_id: Optional[str], verdict: Optional[Dict[str, Any]] = None):
-        """
-        Shared kill/ghost/respawn path used by both a self-reported DIE
-        (handle_failure) and a judge-triggered EXECUTE (handle_completion).
+    def _retire_agent(self, agent_id: str, task_id: Optional[str],
+                      verdict: Optional[Dict[str, Any]] = None) -> dict:
+        """Take an agent off the colony: ghost record, VRAM, registry.
+
+        Extracted from _kill_and_respawn so the two ways an agent can be
+        stopped -- respawned onto the same task, or stopped outright
+        because its task is finished with -- tear it down identically.
+        Returns the ghost context, which only the respawn path uses.
         """
         live_agent = self.live_agents.pop(agent_id, None)
 
@@ -1911,6 +1990,15 @@ class Orchestrator:
 
         ghost_context = self.colony.extract_agent_ghost(agent_id)
         self.colony.unregister_agent(agent_id)
+        return ghost_context
+
+    def _kill_and_respawn(self, agent_id: str, task_id: Optional[str], role: str,
+                           parent_id: Optional[str], verdict: Optional[Dict[str, Any]] = None):
+        """
+        Shared kill/ghost/respawn path used by both a self-reported DIE
+        (handle_failure) and a judge-triggered EXECUTE (handle_completion).
+        """
+        ghost_context = self._retire_agent(agent_id, task_id, verdict)
 
         if not task_id:
             print(f"Agent {agent_id} failed with no task_id -- cannot respawn.")
@@ -1956,13 +2044,20 @@ class Orchestrator:
             return
 
         # Per-task energy ceiling -- independent of the attempt count above.
-        spent = self.colony.task_energy_spent.get(task_id, 0)
-        ceiling = self.task_energy_ceiling()
-        if spent >= ceiling:
+        # The same check also runs every cycle in _run_live_agents; this one
+        # stays because a respawn is the other way a task can acquire more
+        # spend, and it must not be authorised past the line either.
+        overrun = self._task_energy_overrun(task_id)
+        if overrun is not None:
+            # Counted separately from the mid-agent stop so the ledger can
+            # say WHICH check is doing the work. Both label the task
+            # "energy ceiling" in the abandoned list, which is the right
+            # thing for a reader of that list and useless for deciding
+            # whether the per-cycle check earns its place.
+            self.colony.record_verdict("energy_ceiling_at_respawn")
             self._abandon_task(
                 task_id, parent_id, agent_id, attempts,
-                reason=(f"its agents used {spent} energy, at or over the per-task "
-                        f"ceiling of {ceiling}"),
+                reason=self._energy_ceiling_reason(*overrun),
                 reason_label="energy ceiling",
             )
             return
@@ -1995,6 +2090,80 @@ class Orchestrator:
         per_cycle = max(1, (agent_cycle_tokens(role)
                             * self.ENERGY_CHARS_PER_TOKEN) // 100)
         return spawn + Agent.MAX_NON_TERMINAL_CYCLES * per_cycle
+
+    def _energy_ceiling_reason(self, spent: int, ceiling: int) -> str:
+        """The abandonment reason line, shared by both ceiling checks so a
+        task stopped mid-agent and one stopped at a respawn decision read
+        identically in the log and in the partial handed to the parent."""
+        return (f"its agents used {spent} energy, at or over the per-task "
+                f"ceiling of {ceiling}")
+
+    def _task_energy_overrun(self, task_id: Optional[str]):
+        """(spent, ceiling) if this task is at or over its energy ceiling,
+        else None."""
+        if not task_id:
+            return None
+        spent = self.colony.task_energy_spent.get(task_id, 0)
+        ceiling = self.task_energy_ceiling()
+        return (spent, ceiling) if spent >= ceiling else None
+
+    def _enforce_task_energy_ceiling(self, agent_id: str,
+                                     task_id: Optional[str]) -> bool:
+        """Stop a task that crossed its energy ceiling mid-agent.
+
+        The ceiling used to be consulted only where MAX_TASK_ATTEMPTS is,
+        on the respawn decision -- so a task whose agent kept going without
+        reaching one had no boundary to be caught at, and sailed past the
+        line uncaught (task_ac3e5d85).
+
+        Called from both places an agent is let continue after a cycle:
+          * _run_live_agents, for a cycle that reached no terminal action
+            at all -- a THINK, a refused TOOL/SPAWN, or a crash under
+            MAX_CONSECUTIVE_CRASHES;
+          * handle_completion's WARN branch, for a REPORT the judge sent
+            back, which is the loop that actually produced the overshoot.
+        Between them the overshoot is bounded by one cycle rather than by
+        one whole agent's remaining budget.
+
+        Ends in the same abandon-and-release-dependents path the attempt
+        cap uses: the task is marked failed, its best partial goes to the
+        parent with a marker, and its dependents are released.
+
+        Returns True if the task was abandoned (the caller must stop
+        touching this agent).
+        """
+        if not task_id or task_id in self.abandoned_tasks:
+            return False
+        task_node = self.task_graph.tasks.get(task_id)
+        if task_node is None or task_node.status != 1:
+            # Already completed, failed or not running: nothing to stop,
+            # and abandoning it would overwrite a real disposition.
+            return False
+        overrun = self._task_energy_overrun(task_id)
+        if overrun is None:
+            return False
+        spent, ceiling = overrun
+
+        # Read off the colony node before _retire_agent unregisters it.
+        agent_node = self.colony.get_agent(agent_id)
+        parent_id = getattr(agent_node, "parent_id", None) if agent_node else None
+        attempts = self.respawn_counts.get(task_id, 0)
+
+        print(f"  [energy-ceiling] {agent_id} took task {task_id} to {spent} "
+              f"energy against a ceiling of {ceiling} without reaching a "
+              f"respawn decision -- stopping it here.")
+        self.colony.record_verdict("energy_ceiling_midagent")
+        self._retire_agent(
+            agent_id, task_id,
+            verdict={"verdict": "execute",
+                     "reason": self._energy_ceiling_reason(spent, ceiling)},
+        )
+        self._abandon_task(
+            task_id, parent_id, agent_id, attempts,
+            reason=self._energy_ceiling_reason(spent, ceiling),
+            reason_label="energy ceiling",
+        )
+        return True
 
     def task_energy_ceiling(self) -> int:
         """Most energy one task's agents may spend before it gets no more
@@ -2467,9 +2636,10 @@ class Orchestrator:
                     status = task.status if task is not None else "?"
                     agents = 1 + respawns.get(task_id, 0)
                     # OVER is expected on a task the ceiling stopped: the
-                    # check runs at respawn time and the live agent is never
-                    # killed mid-cycle, so a task always crosses the line
-                    # before it can be caught, by up to one agent's spend.
+                    # check runs after a cycle's energy is debited, so a task
+                    # always crosses the line before it can be caught -- by
+                    # one cycle's spend now that the check is per-cycle,
+                    # rather than by a whole agent's.
                     # OVER with nothing that stopped it is the real signature
                     # -- a task past its ceiling that is still being funded.
                     flag = ""
@@ -2480,12 +2650,93 @@ class Orchestrator:
                     print(f"    {spent:>6}  agents={agents}  status={status}  "
                           f"{task_id}{flag}{label}")
 
+            # Which of the two ceiling checks actually stopped things. The
+            # abandoned list labels both "energy ceiling", so without this
+            # split there is no way to tell from a run whether the per-cycle
+            # check is carrying the load, duplicating the respawn-time one,
+            # or never firing at all -- the exact ambiguity that left the
+            # cycle cap suspected of not being implemented.
+            midagent = verdicts.get("energy_ceiling_midagent", 0)
+            at_respawn = verdicts.get("energy_ceiling_at_respawn", 0)
+            print(f"    stopped mid-agent (per cycle)  : {midagent}")
+            print(f"    stopped at a respawn decision  : {at_respawn}")
+
             live_count = getattr(self, "_live_agents_at_terminate", len(self.live_agents))
             print(f"\n  live_agents at terminate : {live_count}")
             print(f"  peak live_agents        : {getattr(self, 'peak_live_agents', 'n/a')}")
             print("=" * 62 + "\n")
         except Exception:
             print(f"Warning: failed printing energy report:\n{traceback.format_exc()}")
+
+    def _guard_final_answer(self, best_result):
+        """The last check between a collapsed decode and the user.
+
+        Synthesizer.format_output cuts its own output, but it is not the
+        only way a final answer leaves this class. A synthesizer that
+        raised, a colony built without one, and the root-task fallback all
+        return an agent's REPORT verbatim -- and a REPORT is deduped and
+        trimmed to three sentences on its way through handle_completion and
+        nothing more, so an "ACTION REQUESTED:" line or an echoed prompt
+        exemplar inside one reaches the user untouched. That is the same
+        failure the synthesizer guard was added for, through a door it does
+        not cover.
+
+        Placed on the one return instead of on those three assignments, so
+        it is true of every exit including ones added later. Running it over
+        an already-cut synthesis is a no-op by construction -- the cut is
+        idempotent -- which is what makes covering the exit cheaper than
+        covering each source.
+
+        A non-string result (the success branch can return colony.results,
+        a dict) has no tail to cut and is returned untouched.
+        """
+        if not isinstance(best_result, str) or not best_result.strip():
+            return best_result
+
+        kept, reason = degeneracy_cut(
+            best_result, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS
+        )
+        if reason is None:
+            return best_result
+
+        self.colony.record_verdict("final_answer_cut")
+        print(f"  [final-answer] cut at {reason} "
+              f"({len(best_result)} -> {len(kept)} chars) on the way out.")
+        if kept.strip():
+            return kept
+
+        # Nothing before the collapse. Returned as an explicit failure
+        # rather than as "" or as the degenerate text itself: a caller that
+        # cannot tell a failed run from a real answer is the hole this
+        # exists to close.
+        self.colony.record_verdict("final_answer_empty_after_cut")
+        print("  [final-answer] nothing survived the cut -- the run's last "
+              "text was degenerate from its first sentence.")
+        return Synthesizer.DEGENERATE_ANSWER_MESSAGE
+
+    def _print_final_answer_report(self):
+        """What the guards did to the text the user actually reads.
+
+        Printed here and not in _print_energy_report because most of it
+        happens after that runs: the partial-result synthesis and the exit
+        guard both come later in terminate(), so the counters would read
+        zero there no matter what happened.
+        """
+        verdicts = getattr(self.colony, "verdict_counts", {}) or {}
+        trims = dict(getattr(self.synthesizer, "trim_counts", {}) or {})
+        rows = (
+            ("synthesis cut at a degenerate tail", trims.get("cut", 0)),
+            ("synthesis empty after its cut     ", trims.get("empty", 0)),
+            ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
+            ("returned answer cut on the way out", verdicts.get("final_answer_cut", 0)),
+            ("returned answer empty after cut   ",
+             verdicts.get("final_answer_empty_after_cut", 0)),
+        )
+        if not any(count for _, count in rows):
+            return
+        print("\n  FINAL ANSWER GUARDS (degeneracy reaching the user)")
+        for label, count in rows:
+            print(f"    {label} : {count}")
 
     def terminate(self) -> Any:
         """
@@ -2607,6 +2858,8 @@ class Orchestrator:
             else:
                 best_result = self.colony.results
 
+        best_result = self._guard_final_answer(best_result)
+        self._print_final_answer_report()
         return best_result
 
     def run(self, problem_spec: str) -> Any:

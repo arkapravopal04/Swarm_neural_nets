@@ -19,7 +19,7 @@ from colony_state import AgentNode
 from tools import ToolRegistry
 from text_utils import (
     dedupe_and_cap as _dedupe_repeated_sentences,
-    has_closer_run,
+    looks_degenerate,
     normalize_identifier,
     strip_special_tokens,
     strip_scaffolding_lines,
@@ -1259,43 +1259,18 @@ Your next action:"""
 
     @staticmethod
     def _looks_degenerate(text: str) -> bool:
-        """Cheap heuristic check for a collapsed generation: either a
-        repeated sentence, or a long tail of pure bracket/backtick noise.
+        """Cheap heuristic check for a collapsed generation -- a repeated
+        sentence, a tail of pure bracket/backtick noise, or closer-cycling.
 
-        FIX: confirmed via a real run -- the old flat threshold of 3
-        occurrences let a long block (e.g. a whole multi-sentence
-        "Verified..." paragraph) repeat twice, burn roughly half of a
-        400-token budget on the duplicate, and trail off mid-sentence
-        WITHOUT ever being flagged, since it never reached a third
-        repetition. A long sentence (>60 chars) repeating even once more
-        is already a much stronger degeneracy signal than a short filler
-        phrase repeating -- e.g. "Understood." repeating 3 times is
-        probably fine; a 20-word clause repeating twice almost never is.
-        Scaling the threshold by sentence length catches this earlier
-        without over-triggering on short, legitimately-repeated phrases.
+        The rules moved to text_utils.looks_degenerate so that the
+        synthesizer's final answer can be held to the same standard as an
+        agent's REPORT. They are the same check, not two checks that happen
+        to agree today: this gates generation (think()'s early stop, and
+        decide()'s retry loop), and degeneracy_cut answers "where did it
+        collapse" for text that has already been generated. Kept as a method
+        because the call sites read as the agent asking about its own output.
         """
-        tail = text[-120:]
-        noise_chars = sum(1 for c in tail if c in "{}[]<>`")
-        if noise_chars > 40:
-            return True
-
-        # Third shape: closer-cycling. Neither check below sees it -- every
-        # sentence is unique, so the repeated-sentence counter never climbs
-        # past 1, and it is plain prose, so the bracket-noise count stays at
-        # 0. A REPORT that trailed off into "Ready. Finalized. Deploying.
-        # Deployment. Done. Submitted. Confirmed. Completed." was therefore
-        # scored as a perfectly healthy generation by this function, which
-        # is why decide() never retried it and think() never cut it short.
-        if has_closer_run(text):
-            return True
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 15]
-        counts = {}
-        for s in sentences:
-            counts[s] = counts.get(s, 0) + 1
-            threshold = 2 if len(s) > 60 else 3
-            if counts[s] >= threshold:
-                return True
-        return False
+        return looks_degenerate(text)
 
     def decide(self, available_roles=None, available_tools=None, requirements=None):
         if available_roles is None:

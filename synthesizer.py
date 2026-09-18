@@ -22,9 +22,16 @@ already wraps the shared model.
 
 from text_utils import (
     dedupe_global_and_cap as _dedupe_and_cap,
+    degeneracy_cut as _degeneracy_cut,
     drop_incomplete_tail as _drop_incomplete_tail,
+    looks_degenerate as _looks_degenerate,
     trim_closer_tail as _trim_closer_tail,
 )
+# The prompt's own SPAWN examples, read from the one place they are defined
+# rather than restated here -- same reason Orchestrator._matching_exemplar
+# imports them. A copy would keep matching text the prompt no longer uses
+# the moment someone rewords an example, which is worse than no check.
+from agent_node import EXEMPLAR_SUBTASK_DESCRIPTIONS
 
 
 class Synthesizer:
@@ -35,8 +42,33 @@ class Synthesizer:
     # the same discipline problem_phaser.py already applies on the way in.
     MAX_RESULTS_BLOCK_CHARS = 6000
 
+    # What the user is told when the final decode collapsed from its very
+    # first sentence, so there is nothing left after the cut in
+    # format_output. Said plainly rather than returned as an empty string or
+    # as the degenerate text itself: the run failed at the last step, and a
+    # caller (or a reader) that cannot tell that apart from a real answer is
+    # exactly the hole this guard exists to close.
+    DEGENERATE_ANSWER_MESSAGE = (
+        "The final answer collapsed into repeated or scaffolding text from "
+        "its first sentence -- no usable answer was produced."
+    )
+
     def __init__(self, llm_call_fn=None):
         self.llm_call_fn = llm_call_fn
+        # What format_output had to do to its own output, by kind: "cut",
+        # "empty", "shipped_degenerate". A print line is enough to debug one
+        # run but invisible in the end-of-run ledger, which is where anyone
+        # comparing runs actually looks -- and a guard nobody can see firing
+        # is how the cycle cap ended up suspected of not existing.
+        #
+        # Kept here rather than pushed to ColonyState.record_verdict so this
+        # class stays free of the colony: it is handed results and a
+        # callable, nothing else. The orchestrator reads this dict when it
+        # prints the ledger.
+        self.trim_counts = {}
+
+    def _record_trim(self, kind: str):
+        self.trim_counts[kind] = self.trim_counts.get(kind, 0) + 1
 
     # ------------------------------------------------------------------
     # Collection
@@ -199,9 +231,57 @@ class Synthesizer:
         # Order is load-bearing: clean on sentence boundaries first, cap
         # last, because the cap appends an ellipsis that later passes would
         # misread as a sentence terminator.
+        #
+        # FIX (a degenerate tail reached the user): the passes above CLEAN,
+        # and cleaning is the wrong verb for this failure. One real run
+        # signed its user-facing answer off with "ACTION REQUESTED: RUN OR
+        # ABORT?" and a repeated exemplar sentence -- neither is a duplicate
+        # to collapse or a closer to trim, so every pass above left them
+        # exactly where they were. handle_completion runs a degeneracy check
+        # over each individual REPORT before the judge reads it; nothing ran
+        # one over the answer those REPORTs are stitched into, which is the
+        # only text in the run the user actually reads.
+        #
+        # Cut rather than filtered, because past the point where a decode
+        # starts reciting its own output or the harness's scaffolding, the
+        # rest is the collapse. Keeping the good prefix and dropping the
+        # rest is honest; deduping the tail and pasting the survivors back
+        # together builds something that reads finished out of the failure.
         raw = self.llm_call_fn(prompt)
         cleaned = _trim_closer_tail(_drop_incomplete_tail(raw))
-        return _dedupe_and_cap(cleaned, max_chars=self.MAX_RESULTS_BLOCK_CHARS)
+
+        kept, reason = _degeneracy_cut(cleaned, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS)
+        if reason is not None:
+            self._record_trim("cut")
+            print(f"  [synthesis-trim] final answer cut at {reason} "
+                  f"({len(cleaned)} -> {len(kept)} chars).")
+        if not kept.strip():
+            self._record_trim("empty")
+            print("  [synthesis-trim] nothing survived the cut -- the final "
+                  "decode was degenerate from its first sentence.")
+            return self.DEGENERATE_ANSWER_MESSAGE
+
+        # keep_line_breaks, unlike every other caller of this helper: those
+        # are cleaning a string that goes back into a prompt as one line,
+        # this is the document the user reads. Without it a final answer
+        # written as a numbered plan or a bulleted list arrived as one
+        # flattened paragraph -- the cleaning passes above all preserve the
+        # layout, and then the last one threw it away.
+        answer = _dedupe_and_cap(kept, max_chars=self.MAX_RESULTS_BLOCK_CHARS,
+                                 keep_line_breaks=True)
+
+        # Reported, not cut. What can still reach here is closer-cycling
+        # buried mid-answer, which degeneracy_cut leaves alone on purpose
+        # (trim_closer_tail already handles the tail, where cutting is the
+        # only place it is safe). A line in the run log beats silently
+        # shipping it as if nothing happened, and beats destroying the real
+        # content that follows it.
+        if _looks_degenerate(answer):
+            self._record_trim("shipped_degenerate")
+            print("  [synthesis-trim] WARNING: the final answer still reads "
+                  "as degenerate after trimming -- shipping it, but the last "
+                  "decode of this run did not go cleanly.")
+        return answer
 
     # ------------------------------------------------------------------
     # Entry point
