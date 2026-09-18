@@ -85,11 +85,19 @@ def normalize_identifier(raw, candidates, cutoff: float = 0.75, strip_chars: str
     return None
 
 
-def _join_within_budget(sentences, max_chars):
+def _join_within_budget(sentences, max_chars, separators=None):
     """
-    Joins sentences with a single space, keeping only as many WHOLE
-    sentences as fit within max_chars -- never slices into the middle of
-    the last one.
+    Joins sentences, keeping only as many WHOLE sentences as fit within
+    max_chars -- never slices into the middle of the last one.
+
+    `separators[i]` is the whitespace that followed sentences[i] in the
+    original text. Passed, it is put back verbatim, so a bulleted or
+    multi-line answer keeps its line breaks and indentation; omitted,
+    sentences are joined with a single space, which flattens the text to
+    one paragraph. Flattening is the right default for everything that
+    goes back into a prompt as one line -- a goal, a fail_reason, a DIE
+    line -- and wrong only for text a person reads as a document. See
+    dedupe_global_and_cap's keep_line_breaks.
 
     The previous approach (in both callers below) joined everything
     first, then hard-sliced the joined string at max_chars and backed up
@@ -110,12 +118,18 @@ def _join_within_budget(sentences, max_chars):
         return ""
     kept = [sentences[0]]
     total = len(sentences[0])
-    for s in sentences[1:]:
-        if total + 1 + len(s) > max_chars:
+    joins = []
+    for i, s in enumerate(sentences[1:], start=1):
+        # What separated this sentence from the one before it. Budgeted at
+        # its real length rather than at 1, so a cap means the same number
+        # of characters whether or not the layout was kept.
+        sep = separators[i - 1] if separators else " "
+        if total + len(sep) + len(s) > max_chars:
             break
+        joins.append(sep)
         kept.append(s)
-        total += 1 + len(s)
-    result = " ".join(kept)
+        total += len(sep) + len(s)
+    result = kept[0] + "".join(sep + s for sep, s in zip(joins, kept[1:]))
     if len(kept) < len(sentences):
         result += "..."
     return result
@@ -141,7 +155,20 @@ def dedupe_and_cap(text, max_chars: int = 500):
     return _join_within_budget(deduped, max_chars)
 
 
-def dedupe_global_and_cap(text, max_chars: int = 400):
+def _split_keeping_separators(text):
+    """[(sentence, the whitespace that followed it), ...].
+
+    The same boundary every other split in this module uses, with the
+    whitespace kept instead of discarded -- which is the whole of what
+    separates a bulleted answer from the same answer flattened into one
+    paragraph. The last sentence's separator is "".
+    """
+    parts = re.split(r'(?<=[.!?])(\s+)', text.strip())
+    return [(parts[i], parts[i + 1] if i + 1 < len(parts) else "")
+            for i in range(0, len(parts), 2)]
+
+
+def dedupe_global_and_cap(text, max_chars: int = 400, keep_line_breaks: bool = False):
     """
     Collapses ANY repeated sentence (first occurrence wins), not just
     consecutive ones, then caps overall length.
@@ -153,19 +180,35 @@ def dedupe_global_and_cap(text, max_chars: int = 400):
     clause with other generated content, which an adjacent-only pass
     would miss entirely. Case-insensitive comparison so trivial
     capitalization drift doesn't defeat the dedupe.
+
+    keep_line_breaks puts each sentence back behind the whitespace that
+    originally followed the one before it, instead of behind a single
+    space. Off by default and deliberately not the only behaviour: most
+    callers here are cleaning a string that goes back into a prompt as
+    one line, where a preserved newline is noise. It exists for the one
+    caller whose output is a document somebody reads -- the synthesizer's
+    final answer, which was arriving as a flattened paragraph however
+    carefully the decode had laid it out in bullets. Nothing upstream put
+    those breaks back, because nothing upstream had them any more.
     """
     if not text:
         return text
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    pieces = _split_keeping_separators(text)
     seen = set()
     deduped = []
-    for s in sentences:
-        key = s.strip().lower()
+    for sentence, separator in pieces:
+        key = sentence.strip().lower()
         if not key or key not in seen:
             if key:
                 seen.add(key)
-            deduped.append(s)
-    return _join_within_budget(deduped, max_chars)
+            deduped.append((sentence, separator))
+    return _join_within_budget(
+        [s for s, _ in deduped], max_chars,
+        # The separator that followed each KEPT sentence, so a dropped
+        # duplicate takes its own trailing whitespace with it rather than
+        # leaving a gap where it used to be.
+        separators=[sep for _, sep in deduped] if keep_line_breaks else None,
+    )
 
 
 # A Markdown fence marker, and the small set of info strings worth
@@ -454,12 +497,35 @@ def looks_like_source_code(text):
 
 
 _SPECIAL_TOKEN_RE = re.compile(r"<\|[^\s>]{0,40}\|>")
-_SCAFFOLD_LINE_RE = re.compile(
-    r"^[ \t]*(?:ACTION|PAYLOAD)\s*:.*$"
-    r"|^[ \t]*Your next action\s*:?.*$"
+# Split into its two halves so degeneracy_cut can take one without the
+# other, and so neither is written down twice.
+#
+# The LABEL half is the ambiguous one. Under IGNORECASE, "Action: Book the
+# venue by Friday." -- an ordinary labelled line in a finished plan -- is
+# indistinguishable from the harness's own "ACTION:" protocol line. That is
+# harmless where this pattern started: strip_scaffolding_lines REMOVES the
+# matching line and keeps everything around it, so a false positive costs
+# one line. It is not harmless in degeneracy_cut, which TRUNCATES from the
+# match onward -- there a false positive costs the whole rest of the
+# answer, and a plan written with "Action:"/"Payload:" labels lost
+# everything after its first bullet. degeneracy_cut uses
+# _PROTOCOL_SHOUT_RE instead, which is case-SENSITIVE for exactly this
+# reason.
+_SCAFFOLD_LABEL_PATTERN = r"^[ \t]*(?:ACTION|PAYLOAD)\s*:.*$"
+# The PHRASE half is unambiguous either way: these are sentences lifted
+# from the agent prompt itself, and no finished answer says them. Safe to
+# truncate on.
+_SCAFFOLD_PHRASE_PATTERN = (
+    r"^[ \t]*Your next action\s*:?.*$"
     r"|^[ \t]*Available actions\s*:?.*$"
-    r"|^[ \t]*Your output must be.*$",
+    r"|^[ \t]*Your output must be.*$"
+)
+_SCAFFOLD_LINE_RE = re.compile(
+    _SCAFFOLD_LABEL_PATTERN + "|" + _SCAFFOLD_PHRASE_PATTERN,
     re.IGNORECASE | re.MULTILINE,
+)
+_SCAFFOLD_PHRASE_RE = re.compile(
+    _SCAFFOLD_PHRASE_PATTERN, re.IGNORECASE | re.MULTILINE
 )
 
 
@@ -766,20 +832,253 @@ def trim_closer_tail(text, min_run=CLOSER_MIN_RUN, max_words=CLOSER_MAX_WORDS):
     an answer that is ENTIRELY closers is a failure the judge's own
     emptiness checks should see, not something to silently blank out here
     (same reasoning as drop_incomplete_tail).
+
+    Returns a PREFIX of the input rather than a rejoin of the sentences it
+    kept, the same way degeneracy_cut does. Rejoining flattened a bulleted
+    answer into one paragraph as the price of removing its trailing
+    "Done. Submitted. Confirmed." -- a cut that changes the layout of the
+    part it kept is doing more than it says.
     """
     if not text:
         return text
-    sentences = _sentence_list(text)
-    if not sentences:
+    text = str(text)
+    spans = _sentence_spans(text)
+    if not spans:
         return text
 
-    cut = len(sentences)
-    while cut > 0 and _is_closer_sentence(sentences[cut - 1], max_words):
+    cut = len(spans)
+    while cut > 0 and _is_closer_sentence(text[spans[cut - 1][0]:spans[cut - 1][1]].strip(),
+                                          max_words):
         cut -= 1
 
-    if len(sentences) - cut < min_run or cut == 0:
+    if len(spans) - cut < min_run or cut == 0:
         return text
-    return " ".join(sentences[:cut])
+    return text[:spans[cut - 1][1]].rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Degeneracy: one detector, and where to cut.
+#
+# looks_degenerate is Agent._looks_degenerate, moved here body-and-all.
+# agent_node still gates generation with it (think()'s early stop and
+# decide()'s retry loop both ask it whether the model has collapsed), and
+# now the final synthesis can ask the same question of the same text shape
+# without a second copy of the rules -- a copy would be free to drift away
+# from the one whose behaviour the run logs describe.
+#
+# degeneracy_cut answers the other half: not "is this collapsed" but "where
+# did it collapse", so a caller holding the last text in the run can keep
+# the part written before the wheels came off instead of taking or dropping
+# the whole thing.
+
+_DEGENERATE_NOISE_CHARS = "{}[]<>`"
+# Whole-text check: brackets/backticks in the last 120 chars, budget 40.
+_NOISE_TAIL_WINDOW = 120
+_NOISE_TAIL_BUDGET = 40
+# Per-sentence check: the same one-third ratio rather than a second
+# invented threshold, plus a floor so a short sentence carrying one
+# bracketed aside is not read as symbol-soup.
+_NOISE_SENTENCE_RATIO = _NOISE_TAIL_BUDGET / _NOISE_TAIL_WINDOW
+_NOISE_SENTENCE_FLOOR = 8
+
+# A sentence long enough that one repeat is already a collapse, and the
+# shortest sentence worth counting at all.
+_REPEAT_LONG_SENTENCE_CHARS = 60
+_REPEAT_MIN_SENTENCE_CHARS = 15
+
+
+def _repeat_threshold(sentence):
+    """How many occurrences of `sentence` mean the generation has collapsed.
+
+    A flat threshold of 3 let a long block (e.g. a whole multi-sentence
+    "Verified..." paragraph) repeat twice, burn roughly half of a 400-token
+    budget on the duplicate, and trail off mid-sentence WITHOUT being
+    flagged. A long sentence (>60 chars) repeating even once more is a much
+    stronger signal than a short filler phrase repeating -- "Understood."
+    three times is probably fine; a 20-word clause twice almost never is.
+    """
+    return 2 if len(sentence) > _REPEAT_LONG_SENTENCE_CHARS else 3
+
+
+def looks_degenerate(text) -> bool:
+    """Cheap heuristic check for a collapsed generation: a repeated
+    sentence, a long tail of pure bracket/backtick noise, or closer-cycling.
+
+    Closer-cycling is the shape neither of the other two sees -- every
+    sentence is unique, so the repeat counter never climbs past 1, and it is
+    plain prose, so the noise count stays at 0. A REPORT that trailed off
+    into "Ready. Finalized. Deploying. Deployment. Done. Submitted."
+    was therefore scored as a perfectly healthy generation.
+    """
+    if not text:
+        return False
+    tail = text[-_NOISE_TAIL_WINDOW:]
+    noise_chars = sum(1 for c in tail if c in _DEGENERATE_NOISE_CHARS)
+    if noise_chars > _NOISE_TAIL_BUDGET:
+        return True
+
+    if has_closer_run(text):
+        return True
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text)
+                 if len(s.strip()) > _REPEAT_MIN_SENTENCE_CHARS]
+    counts = {}
+    for s in sentences:
+        counts[s] = counts.get(s, 0) + 1
+        if counts[s] >= _repeat_threshold(s):
+            return True
+    return False
+
+
+# A prompt placeholder echoed back into prose: "<independent part A of YOUR
+# task>". agent_node's SPAWN exemplars are all this shape by construction
+# (deliberately domain-free placeholders, so that a copy is unmistakable).
+# Matched on shape as well as on the exemplar strings themselves, since a
+# placeholder the model half-rewrote ("<part B of the task>") is the same
+# failure and matches no exemplar exactly.
+#
+# Words only, and at least two of them. "<[^<>\n]+>" -- anything between
+# angle brackets -- reads ordinary prose as a placeholder and throws the
+# answer away over it: "keep the tank between <5 and >10 degrees" and "send
+# it to Smith <smith@example.com>" both matched it. A leading letter rules
+# out the inequality, the restricted character class rules out the address,
+# and requiring a space rules out "<br>".
+_PLACEHOLDER_ECHO_RE = re.compile(r"<[A-Za-z][A-Za-z\- ]*\s[A-Za-z][A-Za-z\- ]*>")
+
+
+# The ACTION:/PAYLOAD: labels as the harness itself writes them -- bare, or
+# shouted with a word of padding. This is the ONLY scaffolding-label pattern
+# degeneracy_cut consults; _SCAFFOLD_LABEL_PATTERN above is deliberately not,
+# because it is IGNORECASE and a truncating caller cannot afford that (see
+# the note there).
+#
+# Case-SENSITIVE and all-caps on purpose. "Action required: book the venue."
+# and "Payload: 200 attendees" are ordinary English in a finished answer;
+# "ACTION REQUESTED: RUN OR ABORT?" -- how one real run signed off its
+# user-facing answer -- is the protocol talking. The optional [A-Z]+ group
+# is what separates them, and it is also why the bare "ACTION: REPORT" is
+# still caught: the padding word is optional, the capitals are not.
+_PROTOCOL_SHOUT_RE = re.compile(
+    r"^[ \t>*_#-]*(?:ACTION|PAYLOAD)(?:\s+[A-Z]+)?\s*:", re.MULTILINE
+)
+
+
+def _sentence_spans(text):
+    """(start, end) offsets of each sentence, blanks dropped.
+
+    The same split as _sentence_list, keeping offsets: degeneracy_cut
+    returns a SLICE of the original text rather than a rejoin of the
+    sentences it kept, so a bulleted or multi-line answer keeps its line
+    breaks instead of being flattened into one paragraph on the way out.
+    """
+    spans = []
+    start = 0
+    for boundary in re.finditer(r"(?<=[.!?])\s+", text):
+        if text[start:boundary.start()].strip():
+            spans.append((start, boundary.start()))
+        start = boundary.end()
+    if text[start:].strip():
+        spans.append((start, len(text)))
+    return spans
+
+
+def normalize_words(text):
+    """Casefolded, punctuation-free, whitespace-collapsed view of a string --
+    so "Pick a color palette for the newsletter." and "pick a colour  palette
+    for the newsletter" compare as near-identical rather than as unrelated."""
+    return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
+def degeneracy_cut(text, exemplars=()):
+    """
+    `text` cut at the first point where the generation stopped answering,
+    as (kept_text, reason). (text, None) when it never did.
+
+    "The first sign of it" is the whole point: once a decode locks onto its
+    own output, or starts reciting the harness's scaffolding back, the text
+    AFTER that point is the failure, not content to be salvaged and stitched
+    into something that reads finished. Deduping such a tail rather than
+    cutting it produces exactly that -- a plausible-looking answer assembled
+    out of the model's collapse.
+
+    Four shapes, all of them "everything after this is noise":
+
+      * a sentence repeated up to _repeat_threshold (the loop itself),
+      * a sentence that is mostly bracket/backtick noise,
+      * an ACTION:/PAYLOAD:-style scaffolding line echoed back -- one real
+        run ended its user-facing answer on "ACTION REQUESTED: RUN OR
+        ABORT?", which is the harness's protocol talking, not an answer,
+      * a prompt exemplar or placeholder echoed back.
+
+    WHERE it cuts is as load-bearing as whether it cuts. The scaffolding
+    patterns are line-anchored, so the cut goes at the start of the
+    offending LINE, not at the start of the sentence containing it: a final
+    answer that is a bulleted plan carries no sentence terminator before its
+    trailing "ACTION REQUESTED:" line, which makes the whole answer one
+    "sentence" -- cutting at its start threw the entire answer away to
+    remove one line of scaffolding, which is a worse failure than the one
+    this guard exists to fix. The other three shapes have no sub-sentence
+    position to speak of and cut at the sentence boundary.
+
+    Closer-cycling is deliberately NOT cut here: it is a degeneracy signal
+    (looks_degenerate reports it anywhere) but trim_closer_tail already
+    handles it where cutting is safe, i.e. at the tail, because a closer run
+    buried mid-text has real content after it that cutting would destroy.
+
+    Cutting at offset 0 returns "" -- the caller decides what an
+    entirely-degenerate text means, since blanking it silently would hide
+    the failure rather than report it.
+    """
+    if not text:
+        return text, None
+    spans = _sentence_spans(text)
+    if not spans:
+        return text, None
+
+    exemplar_norms = [n for n in (normalize_words(e) for e in exemplars or ()) if n]
+
+    counts = {}
+    for sentence_start, sentence_end in spans:
+        sentence = text[sentence_start:sentence_end]
+        stripped = sentence.strip()
+        cut = None
+        reason = None
+
+        if len(stripped) > _REPEAT_MIN_SENTENCE_CHARS:
+            counts[stripped] = counts.get(stripped, 0) + 1
+            if counts[stripped] >= _repeat_threshold(stripped):
+                cut, reason = sentence_start, "a sentence repeated"
+
+        if reason is None:
+            noise = sum(1 for c in stripped if c in _DEGENERATE_NOISE_CHARS)
+            if (noise >= _NOISE_SENTENCE_FLOOR
+                    and noise > len(stripped) * _NOISE_SENTENCE_RATIO):
+                cut, reason = sentence_start, "bracket/backtick noise"
+
+        if reason is None:
+            # _SCAFFOLD_PHRASE_RE, not _SCAFFOLD_LINE_RE: the label half of
+            # that pattern is IGNORECASE, and cutting on it cost a plan
+            # written with "Action:"/"Payload:" labels everything after its
+            # first one. _PROTOCOL_SHOUT_RE covers the labels this actually
+            # needs to catch, without reading ordinary English as protocol.
+            echoed = (_SCAFFOLD_PHRASE_RE.search(sentence)
+                      or _PROTOCOL_SHOUT_RE.search(sentence))
+            if echoed is not None:
+                cut = sentence_start + echoed.start()
+                reason = "harness scaffolding echoed back"
+
+        if reason is None and _PLACEHOLDER_ECHO_RE.search(sentence):
+            cut, reason = sentence_start, "a prompt placeholder echoed back"
+
+        if reason is None and exemplar_norms:
+            normalized = normalize_words(stripped)
+            if normalized and any(e in normalized for e in exemplar_norms):
+                cut, reason = sentence_start, "a prompt exemplar echoed back"
+
+        if reason is not None:
+            return text[:cut].rstrip(), reason
+
+    return text, None
 
 
 # ---------------------------------------------------------------------------
