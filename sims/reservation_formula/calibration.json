@@ -1,0 +1,314 @@
+{
+ "full": {
+  "exec healthy t=0": {
+   "mean": 18.4,
+   "p50": 18,
+   "p90": 20,
+   "max": 21
+  },
+  "exec healthy t=1": {
+   "mean": 24.9,
+   "p50": 25,
+   "p90": 27,
+   "max": 27
+  },
+  "exec healthy t=2": {
+   "mean": 31.1,
+   "p50": 31,
+   "p90": 33,
+   "max": 34
+  },
+  "exec 1 warn": {
+   "mean": 28.9,
+   "p50": 29,
+   "p90": 31,
+   "max": 32
+  },
+  "exec 2 warn": {
+   "mean": 39.4,
+   "p50": 39,
+   "p90": 42,
+   "max": 44
+  },
+  "exec execute+respawn (task total)": {
+   "mean": 36.6,
+   "p50": 36,
+   "p90": 39,
+   "max": 39
+  },
+  "dec k=0": {
+   "mean": 16,
+   "p50": 16,
+   "p90": 17,
+   "max": 18
+  },
+  "dec k=1": {
+   "mean": 23.8,
+   "p50": 24,
+   "p90": 25,
+   "max": 26
+  },
+  "dec k=2": {
+   "mean": 28.7,
+   "p50": 28,
+   "p90": 31,
+   "max": 32
+  },
+  "dec k=3": {
+   "mean": 33.9,
+   "p50": 34,
+   "p90": 35,
+   "max": 36
+  },
+  "dec k=4": {
+   "mean": 38.5,
+   "p50": 38,
+   "p90": 40,
+   "max": 41
+  },
+  "dec k=2 1 warn": {
+   "mean": 37.3,
+   "p50": 37,
+   "p90": 39,
+   "max": 40
+  },
+  "root k=1": {
+   "mean": 23.6,
+   "p50": 24,
+   "p90": 26,
+   "max": 27
+  },
+  "root k=2": {
+   "mean": 29.0,
+   "p50": 29,
+   "p90": 31,
+   "max": 32
+  },
+  "root k=3": {
+   "mean": 33.6,
+   "p50": 33,
+   "p90": 36,
+   "max": 37
+  },
+  "root k=4": {
+   "mean": 38.4,
+   "p50": 39,
+   "p90": 40,
+   "max": 40
+  },
+  "root k=5": {
+   "mean": 42.9,
+   "p50": 43,
+   "p90": 44,
+   "max": 44
+  },
+  "root k=3 1 warn": {
+   "mean": 41.9,
+   "p50": 42,
+   "p90": 44,
+   "max": 45
+  },
+  "root k=3 2 warn": {
+   "mean": 50.1,
+   "p50": 50,
+   "p90": 53,
+   "max": 54
+  },
+  "converted exec(t=0)->dec k=2 (task total)": {
+   "mean": 40.7,
+   "p50": 41,
+   "p90": 43,
+   "max": 44
+  },
+  "  sunk at conversion (t=0)": {
+   "mean": 11.9,
+   "p50": 12,
+   "p90": 13,
+   "max": 14
+  },
+  "converted exec(t=2)->dec k=2 (task total)": {
+   "mean": 53.0,
+   "p50": 53,
+   "p90": 55,
+   "max": 57
+  },
+  "  sunk at conversion (t=2)": {
+   "mean": 24.6,
+   "p50": 25,
+   "p90": 26,
+   "max": 27
+  },
+  "fit_mean": {
+   "alpha": 18.900000000000002,
+   "beta": 4.93,
+   "alpha_root": 19.1,
+   "beta_root": 4.799999999999999,
+   "sigma": 0.1999999999999993,
+   "e": 18.4
+  },
+  "fit_p90": {
+   "alpha": 20.5,
+   "beta": 4.9,
+   "alpha_root": 21.9,
+   "beta_root": 4.5,
+   "sigma": 1.3999999999999986,
+   "e": 20
+  }
+ },
+ "lean": {
+  "exec healthy t=0": {
+   "mean": 12.0,
+   "p50": 12,
+   "p90": 13,
+   "max": 14
+  },
+  "exec healthy t=1": {
+   "mean": 15.8,
+   "p50": 16,
+   "p90": 17,
+   "max": 18
+  },
+  "exec healthy t=2": {
+   "mean": 19.4,
+   "p50": 19,
+   "p90": 21,
+   "max": 22
+  },
+  "exec 1 warn": {
+   "mean": 18.7,
+   "p50": 19,
+   "p90": 20,
+   "max": 21
+  },
+  "exec 2 warn": {
+   "mean": 25.3,
+   "p50": 25,
+   "p90": 27,
+   "max": 29
+  },
+  "exec execute+respawn (task total)": {
+   "mean": 24.0,
+   "p50": 24,
+   "p90": 26,
+   "max": 26
+  },
+  "dec k=0": {
+   "mean": 11.3,
+   "p50": 11,
+   "p90": 12,
+   "max": 13
+  },
+  "dec k=1": {
+   "mean": 17.6,
+   "p50": 18,
+   "p90": 18,
+   "max": 19
+  },
+  "dec k=2": {
+   "mean": 21.6,
+   "p50": 22,
+   "p90": 23,
+   "max": 23
+  },
+  "dec k=3": {
+   "mean": 25.7,
+   "p50": 26,
+   "p90": 27,
+   "max": 27
+  },
+  "dec k=4": {
+   "mean": 30.2,
+   "p50": 30,
+   "p90": 31,
+   "max": 32
+  },
+  "dec k=2 1 warn": {
+   "mean": 27.1,
+   "p50": 27,
+   "p90": 28,
+   "max": 29
+  },
+  "root k=1": {
+   "mean": 17.6,
+   "p50": 17,
+   "p90": 19,
+   "max": 19
+  },
+  "root k=2": {
+   "mean": 21.8,
+   "p50": 22,
+   "p90": 23,
+   "max": 23
+  },
+  "root k=3": {
+   "mean": 25.8,
+   "p50": 26,
+   "p90": 27,
+   "max": 27
+  },
+  "root k=4": {
+   "mean": 30.2,
+   "p50": 30,
+   "p90": 32,
+   "max": 32
+  },
+  "root k=5": {
+   "mean": 34.3,
+   "p50": 35,
+   "p90": 35,
+   "max": 35
+  },
+  "root k=3 1 warn": {
+   "mean": 30.9,
+   "p50": 31,
+   "p90": 32,
+   "max": 32
+  },
+  "root k=3 2 warn": {
+   "mean": 36.3,
+   "p50": 36,
+   "p90": 38,
+   "max": 39
+  },
+  "converted exec(t=0)->dec k=2 (task total)": {
+   "mean": 30.5,
+   "p50": 31,
+   "p90": 32,
+   "max": 33
+  },
+  "  sunk at conversion (t=0)": {
+   "mean": 8.6,
+   "p50": 9,
+   "p90": 9,
+   "max": 10
+  },
+  "converted exec(t=2)->dec k=2 (task total)": {
+   "mean": 37.5,
+   "p50": 38,
+   "p90": 39,
+   "max": 40
+  },
+  "  sunk at conversion (t=2)": {
+   "mean": 15.9,
+   "p50": 16,
+   "p90": 17,
+   "max": 18
+  },
+  "fit_mean": {
+   "alpha": 13.3,
+   "beta": 4.1899999999999995,
+   "alpha_root": 13.400000000000006,
+   "beta_root": 4.179999999999999,
+   "sigma": 0.10000000000000497,
+   "e": 12.0
+  },
+  "fit_p90": {
+   "alpha": 14.0,
+   "beta": 4.3,
+   "alpha_root": 14.9,
+   "beta_root": 4.1,
+   "sigma": 0.9000000000000004,
+   "e": 13
+  }
+ }
+}

@@ -23,3 +23,5 @@ __pycache__/
 
 
 tests/
+# per-run energy traces (main.py / notebook)
+hive_energy_trace.jsonl

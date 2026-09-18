@@ -857,6 +857,98 @@ def trim_closer_tail(text, min_run=CLOSER_MIN_RUN, max_words=CLOSER_MAX_WORDS):
 
 
 # ---------------------------------------------------------------------------
+# Echo tails: closer-cycling's cousin.
+#
+# Observed at the end of a promoted REPORT:
+#
+#   "...Nothing else seems necessary at this stage. Exactly five. Done. Five."
+#
+# Only one of those fragments is a closer, so trim_closer_tail's run never
+# starts, and none of them repeats a sentence, so the dedupe helpers pass
+# it through. What the others have in common is that they say nothing new:
+# "Five." re-uses a word the answer already used. The model has finished
+# and is muttering its answer back to itself.
+#
+# Same precision-first stance as the closer trimmer. A fragment only counts
+# when it is at most two words and either opens on a confirmation word
+# ("Exactly five.") or has every content word be a closer, a confirmation
+# word, or a word used elsewhere in the text. The
+# run must include at least one real closer, which is what separates
+# "Five. Done." from the tail of a short list. The run is left alone when
+# the sentence before it is a question, since a one-word tail there may be
+# the answer to it: "Is it feasible? Yes. Done."
+#
+# min_run is 2, not trim_closer_tail's 4, because this runs after the
+# report-trim has cut a REPORT down to three sentences. The observed
+# four-fragment tail arrives here as "Exactly five. Done.".
+# ---------------------------------------------------------------------------
+
+ECHO_MIN_RUN = 2
+ECHO_MAX_WORDS = 2
+
+_ECHO_CONFIRM_STEMS = ("exact", "correct", "indeed")
+
+_QUESTION_END_RE = re.compile(r"\?[\"'\)\]]*$")
+
+
+def _letter_words(sentence):
+    """Lowercased letters-only words, the same cleaning _is_closer_sentence uses."""
+    return [w for w in (_WORD_CLEAN_RE.sub("", w.lower()) for w in sentence.split()) if w]
+
+
+def trim_echo_tail(text, min_run=ECHO_MIN_RUN, max_words=ECHO_MAX_WORDS):
+    """Drop a trailing run of fragments that only restate the answer or sign off.
+
+    Returns a prefix of the input, like trim_closer_tail, so the layout of
+    the kept part is unchanged. Returns the text unchanged when the run is
+    shorter than min_run, has no closer in it, follows a question, or is
+    the whole text.
+    """
+    if not text:
+        return text
+    text = str(text)
+    spans = _sentence_spans(text)
+    if not spans:
+        return text
+
+    sentences = [text[start:end].strip() for start, end in spans]
+    per_sentence = [_letter_words(s) for s in sentences]
+    totals = {}
+    for words in per_sentence:
+        for w in words:
+            totals[w] = totals.get(w, 0) + 1
+
+    cut = len(spans)
+    saw_closer = False
+    while cut > 0:
+        words = per_sentence[cut - 1]
+        content = [w for w in words if w not in _CLOSER_STOPWORDS]
+        if not content or len(words) > max_words:
+            break
+        own = {}
+        for w in words:
+            own[w] = own.get(w, 0) + 1
+        # A word counts as an echo when it also appears in another sentence.
+        # A fragment that opens on a confirmation word ("Exactly five.") is
+        # a restatement whatever follows, which matters once the report-trim
+        # has removed the later "Five." that the word would have echoed.
+        confirms = content[0].startswith(_ECHO_CONFIRM_STEMS)
+        if not confirms and not all(w.startswith(_CLOSER_STEMS + _ECHO_CONFIRM_STEMS)
+                                    or totals[w] > own[w]
+                                    for w in content):
+            break
+        if _is_closer_sentence(sentences[cut - 1], max_words):
+            saw_closer = True
+        cut -= 1
+
+    if len(spans) - cut < min_run or cut == 0 or not saw_closer:
+        return text
+    if _QUESTION_END_RE.search(sentences[cut - 1]):
+        return text
+    return text[:spans[cut - 1][1]].rstrip()
+
+
+# ---------------------------------------------------------------------------
 # Degeneracy: one detector, and where to cut.
 #
 # looks_degenerate is Agent._looks_degenerate, moved here body-and-all.
@@ -989,10 +1081,17 @@ def normalize_words(text):
     return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
 
 
-def degeneracy_cut(text, exemplars=()):
+def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
     """
     `text` cut at the first point where the generation stopped answering,
     as (kept_text, reason). (text, None) when it never did.
+
+    repeat_threshold overrides _repeat_threshold's per-sentence count when
+    given. The default is tuned for text still being generated, where a
+    short sentence recurring twice across several paragraphs can be
+    legitimate. A result that has already been trimmed to a few sentences
+    (scrub_result's input) has no room for that: one repeat there is the
+    loop, so scrub_result passes 2.
 
     "The first sign of it" is the whole point: once a decode locks onto its
     own output, or starts reciting the harness's scaffolding back, the text
@@ -1046,7 +1145,9 @@ def degeneracy_cut(text, exemplars=()):
 
         if len(stripped) > _REPEAT_MIN_SENTENCE_CHARS:
             counts[stripped] = counts.get(stripped, 0) + 1
-            if counts[stripped] >= _repeat_threshold(stripped):
+            threshold = (repeat_threshold if repeat_threshold is not None
+                         else _repeat_threshold(stripped))
+            if counts[stripped] >= threshold:
                 cut, reason = sentence_start, "a sentence repeated"
 
         if reason is None:
@@ -1079,6 +1180,62 @@ def degeneracy_cut(text, exemplars=()):
             return text[:cut].rstrip(), reason
 
     return text, None
+
+
+def scrub_result(text, exemplars=()):
+    """
+    One subtask result with its degenerate parts removed, as
+    (kept_text, reasons). reasons is empty when nothing was removed.
+
+    A REPORT that passed the judge is stored, sent to its parent, cached,
+    and handed to any sibling that depends on it. None of those consumers
+    cleaned it, so a tail like "Exactly five. Done." or a sentence the
+    model looped on travelled with it into other agents' prompts, where a
+    small model tends to continue it. This is run once, where the result
+    is stored, and again at the points it is injected into a prompt.
+
+    Three steps, in order:
+      1. degeneracy_cut with repeat_threshold=2. The result has already been
+         trimmed to about three sentences, so a sentence appearing twice is
+         the loop starting. Everything from its second copy is cut.
+      2. trim_closer_tail, for closer runs from REPORT paths that did not
+         trim them at the source.
+      3. trim_echo_tail, for the restating tail step 2 does not catch.
+
+    Every step cuts a prefix and never rewrites what it keeps, so the
+    function is idempotent. That is what makes the second run at injection
+    free on text that was already scrubbed.
+
+    Can return "" when the text is degenerate from its first sentence (an
+    echoed exemplar, say). What an empty result means is the caller's
+    decision, the same contract as degeneracy_cut.
+
+    Prose only. Callers exempt source code, since sentence boundaries mean
+    nothing there.
+    """
+    if not text or not str(text).strip():
+        return text, []
+    text = str(text)
+    reasons = []
+
+    kept, reason = degeneracy_cut(text, exemplars=exemplars, repeat_threshold=2)
+    if reason is not None:
+        reasons.append(reason)
+        text = kept
+        if not text.strip():
+            return "", reasons
+
+    kept = trim_closer_tail(text)
+    if kept != text:
+        reasons.append("closer-cycling tail")
+        text = kept
+
+    kept = trim_echo_tail(text)
+    if kept != text:
+        reasons.append("restating tail")
+        text = kept
+
+    return text, reasons
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,3 @@
+# raw per-run dumps from montecarlo.py / scenarios.py (large; regenerate)
+mc*_n*.json
+scenarios_*.json
