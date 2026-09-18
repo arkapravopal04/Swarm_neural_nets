@@ -16,6 +16,7 @@ import uuid
 import time
 import re
 import traceback
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
 
@@ -25,7 +26,6 @@ from task_graph import TaskGraph, TaskNode
 from event_queue import Messenger, Event
 from agent_node import (
     Agent,
-    agent_cycle_tokens,
     _dedupe_repeated_sentences,
     EXEMPLAR_SUBTASK_DESCRIPTIONS,
     role_may_use_tools,
@@ -38,6 +38,7 @@ from text_utils import (
     first_clause,
     degeneracy_cut,
     drop_incomplete_tail,
+    scrub_result,
     asks_for_software,
     plain_register,
     software_artifact_reason,
@@ -60,12 +61,26 @@ def _without_quoted_example(reason: str) -> str:
     the exact framing the rejection exists to stop."""
     return re.sub(r"\s*\([^()]*\)\s*$", "", reason)
 
+
+@dataclass
+class TaskReservation:
+    """What the admission rule and the per-task ceiling know about one task.
+    See the RESERVE_* constants in Orchestrator.__init__."""
+    kind: str                # "executor" | "decomposer" | "root"
+    k: int = 0               # children in its admitted SPAWN batch (queued overflow included)
+    spawned: bool = False    # False until a SPAWN batch is admitted; k is provisional until then
+    sunk: int = 0            # task spend before its current attempt began
+    conv_sunk: int = 0       # spend carried in by a TASK TOO LARGE conversion
+    attempts: int = 0        # agents spawned for this task so far
+
+
 class Orchestrator:
     def __init__(self, colony_state: ColonyState, task_graph: TaskGraph, messenger: Messenger,
                  phaser=None, judge=None, memory_store=None, synthesizer=None,
                  model=None, tokeniser=None, embed_model=None,
                  budget_override: Optional[int] = None,
-                 framing_levers=FRAMING_LEVERS):
+                 framing_levers=FRAMING_LEVERS,
+                 energy_trace_path: Optional[str] = None):
         self.colony = colony_state
         # Which software-framing interventions act this run: "reword"
         # (plain wording for code-coded subtask vocabulary) and/or "block"
@@ -163,6 +178,10 @@ class Orchestrator:
         # without the phaser's estimate in the way.
         self.budget_override = budget_override
 
+        # Where terminate() appends this run's per-task energy records (one
+        # JSON line per run), the data RESERVE_* is re-fitted from. None = off.
+        self.energy_trace_path = energy_trace_path
+
         # Live Agent objects (the think/decide/execute reasoning wrapper),
         # keyed by agent_id. Distinct from ColonyState.agents, which only
         # holds the AgentNode data records. Previously nothing populated
@@ -200,51 +219,68 @@ class Orchestrator:
         # finish.
         self.MAX_TASK_ATTEMPTS = 3
 
-        # Per-task energy ceiling: a second, independent bound on the same
-        # respawn decision. MAX_TASK_ATTEMPTS counts agents; this counts what
-        # they cost. The per-agent cycle cap (Agent.MAX_NON_TERMINAL_CYCLES)
-        # bounds one agent, but every respawn starts a fresh agent with a
-        # fresh cycle budget, so a task could still spend up to
-        # (1 + MAX_TASK_ATTEMPTS) agents' worth of full cycles plus spawn
-        # costs. Totals come from ColonyState.task_energy_spent, which keeps
-        # accumulating across those agents.
+        # Energy reservation, admission and the per-task ceiling. Evaluated
+        # and calibrated against the real tick loop in
+        # sims/reservation_formula (REPORT.md there has the numbers).
         #
-        # Measured in AGENTS, not in a slice of the colony budget. A budget
-        # fraction was the original guess and it was unfirable: at the
-        # configured budget_override=2500 it computed to 250, while the worst
-        # case the caps can structurally produce -- 1+MAX_TASK_ATTEMPTS agents
-        # each running MAX_NON_TERMINAL_CYCLES full-cap cycles -- measures 214,
-        # and the real runaway that motivated the check peaked at 111. It could
-        # never fire on any task. It also floated against budget_override, so
-        # the same colony was bounded differently run to run for a reason with
-        # nothing to do with what a task costs.
-        #
-        # Derived instead from what one agent may spend before its OWN caps
-        # stop it (see _agent_energy_allowance), so it tracks the role token
-        # caps and the cycle cap rather than needing a re-tune whenever either
-        # is touched -- both were touched recently. That allowance is a
-        # structural maximum and real cycles come in well under it (stripping,
-        # plus think()'s degeneracy check usually stopping short), so 1.5
-        # full-cap agents is roughly three real ones: it fires before the
-        # fourth attempt without ever threatening an ordinary task. Measured
-        # for reference: a healthy subtask costs 13 and a healthy root
-        # decomposer 22 including its children's injections, against 81.
+        # What one ATTEMPT of a task costs its own task (spawn + think ticks
+        # + child-result injections + tier-3 critiques; never its children's
+        # spend), at p75 of a successful attempt:
+        #   executor        e             = RESERVE_EXECUTOR
+        #   decomposer(k)   alpha + beta*k   (linear in its batch size k:
+        #                   each child adds its SPAWN-payload tokens and one
+        #                   result injection)
+        #   root(k)         decomposer(k) + sigma. The root is billed exactly
+        #                   like any decomposer; sigma is a reserve for its
+        #                   roll-up being sent back by review, whose failure
+        #                   ends the run.
+        # These are measured quantities -- re-fit them from a real run's
+        # task_energy_spent ledger (sims/reservation_formula/fit_quantiles.py)
+        # when the token caps or the cycle cap change.
+        self.RESERVE_EXECUTOR = 27.0
+        self.RESERVE_DECOMPOSER_BASE = 20.5
+        self.RESERVE_PER_CHILD = 6.0
+        self.RESERVE_ROOT_EXTRA = self.RESERVE_DECOMPOSER_BASE / 2
+
+        # Admission: new work (bootstrap, a SPAWN batch, a TASK TOO LARGE
+        # conversion, a respawn) is allowed only while
+        #     spent + sum of every unfinished task's remaining reservation
+        #           + the new work's reservation  <=  budget - ADMISSION_FLOOR
+        # A decomposer that has not SPAWNed yet reserves its cheapest
+        # decomposition (k=1, one child) -- reserving nothing for its children
+        # let the top of the tree admit work the bottom could never afford,
+        # and reserving its full fan-out made the root unstartable below ~230.
+        # A batch that does not fit is cut to the largest k that does; the
+        # rest is DROPPED and the decomposer told so. Bundling the overflow
+        # into one child does not save energy: that child DIEs TASK TOO LARGE
+        # and needs the budget admission just said was not there.
+        # The floor keeps the colony out of energy death (tick() stops at
+        # <= energy_threshold_death with work in flight).
+        self.ADMISSION_CONTROL = True
+        self.ADMISSION_FLOOR = self.energy_threshold_death + 1
+        self.task_reservations: Dict[str, TaskReservation] = {}
+        # Tasks whose next spawn is a TASK TOO LARGE conversion already
+        # admitted in handle_failure, so spawn_agent must not re-check it.
+        self._admitted_conversions: set = set()
+
+        # Per-task energy ceiling: the runaway guard across ALL of a task's
+        # agents. MAX_TASK_ATTEMPTS counts agents; this counts what they cost.
+        #     ceiling = conv_sunk + TASK_CEILING_ATTEMPTS * own_cost
+        # i.e. about three attempts of what THIS task should cost. For an
+        # executor that is 3 * 27 = 81, the old flat figure -- which was right
+        # for executors only: a decomposer's attempt grows with k, the root's
+        # carries sigma, and a converted task carries the executor spend it
+        # arrived with (conv_sunk) instead of having it eat its decomposer
+        # share. A per-ATTEMPT ceiling was tested and dropped: the cycle cap
+        # (Agent.MAX_NON_TERMINAL_CYCLES) already stops one agent first.
         #
         # Checked on every cycle (_run_live_agents) as well as on the respawn
         # decision, because a task can cross the line mid-agent with no
-        # respawn boundary in between -- an agent that keeps THINKing reaches
-        # no terminal action, so nothing consulted the ceiling until its own
-        # cycle cap ran out. Overshoot is therefore bounded by one cycle,
-        # except on the cycle that produced a REPORT/DIE or handed off a
-        # SPAWN/TOOL: that result is adjudicated first rather than discarded,
-        # so the agent gets one more cycle before it can be stopped.
-        self.TASK_AGENT_ALLOWANCE = 1.5
-        # Only to turn generated tokens into the chars-per-100 proxy the rest
-        # of the energy model bills in; ~4 chars per token for English BPE.
-        self.ENERGY_CHARS_PER_TOKEN = 4
-        # Safety rail, not a calibration knob: keeps a pathologically small
-        # set of role caps from producing a ceiling that abandons everything.
-        self.TASK_ENERGY_FLOOR = 50
+        # respawn boundary in between. Overshoot is therefore bounded by one
+        # cycle, except on the cycle that produced a REPORT/DIE or handed off
+        # a SPAWN/TOOL: that result is adjudicated first rather than
+        # discarded, so the agent gets one more cycle before it can be stopped.
+        self.TASK_CEILING_ATTEMPTS = 3
 
         self.SHORT_ANSWER_WORD_THRESHOLD = 12
 
@@ -556,7 +592,17 @@ class Orchestrator:
         assert self.task_graph.tasks[self.root_task_id].description == goal_text
 
         print(f"Colony initialized. Bootstrapping root task: {self.root_task_id}")
-        self.spawn_agent(role="decomposer", task_id=self.root_task_id)
+        if (self.spawn_agent(role="decomposer", task_id=self.root_task_id) is None
+                and "admission_root_refused" in self.colony.verdict_counts):
+            # Nothing smaller than root + one decomposer + one executor can
+            # answer anything. Closed now rather than left pending, which
+            # the deadlock watchdog would retry every tick to MAX_TICKS.
+            self._abandon_task(
+                self.root_task_id, None, None, 0,
+                reason=("the budget is below the cheapest possible "
+                        "decomposition of the task"),
+                reason_label="admission",
+            )
 
     def spawn_agent(self, role: str, task_id: str, parent_id: Optional[str] = None, ghost_context: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """SPAWN: Creates an agent, assigns it to a task, and deducts energy.
@@ -576,6 +622,35 @@ class Orchestrator:
                 f"(budget={self.colony.budget_remaining}, cost={spawn_cost})."
             )
             return None
+
+        # Admission. A task's first agent was reserved when its parent's SPAWN
+        # batch was admitted, so only the root's bootstrap is checked here. A
+        # TASK TOO LARGE conversion was admitted in handle_failure. Any other
+        # spawn onto a task that already had an agent is a respawn: new work,
+        # so it reserves a whole attempt again (sunk := spend so far) and must
+        # fit like anything else.
+        reservation = self._reservation(task_id)
+        if reservation.attempts == 0:
+            if task_id == self.root_task_id and not self._admits():
+                print(f"  [admission] root refused: its cheapest decomposition "
+                      f"({self._remaining_reservation(task_id):.0f}) does not fit "
+                      f"budget {self.colony.starting_budget} minus the "
+                      f"{self.ADMISSION_FLOOR} floor.")
+                self.colony.record_verdict("admission_root_refused")
+                return None
+        elif task_id in self._admitted_conversions:
+            self._admitted_conversions.discard(task_id)
+        else:
+            saved = (reservation.k, reservation.spawned, reservation.sunk)
+            if role == "decomposer":
+                reservation.k, reservation.spawned = 0, False  # it plans again
+            reservation.sunk = self.colony.task_energy_spent.get(task_id, 0)
+            if not self._admits():
+                reservation.k, reservation.spawned, reservation.sunk = saved
+                print(f"  [admission] respawn on {task_id} refused: another "
+                      f"attempt does not fit the uncommitted budget.")
+                self.colony.record_verdict("admission_respawn_refused")
+                return None
 
         agent_id = self._generate_id()
 
@@ -606,6 +681,7 @@ class Orchestrator:
         
         self.colony.register_agent(new_agent)
         self.task_graph.assign_agent(task_id, agent_id)
+        reservation.attempts += 1
         if parent_node is not None:
             # Read by Agent.final_actions: a decomposer with no child yet
             # finishes by SPAWNing, one whose children exist by REPORTing.
@@ -766,6 +842,47 @@ class Orchestrator:
             return requested_role
         return "decomposer" if parent_node.generation == 0 else "executor"
 
+    # Stands in for a result that scrub_result cut to nothing. Shaped like
+    # the [ABANDONED ...] and [NOT STARTED ...] markers so the parent can
+    # see there is a gap, and never "" or the degenerate text.
+    DEGENERATE_RESULT_MARKER = (
+        "[NO USABLE OUTPUT -- this subtask's result was degenerate from its "
+        "first sentence ({reason}), so nothing from it was kept.]"
+    )
+
+    def _scrub_result(self, result, where: str, task_id: Optional[str] = None):
+        """
+        Returns `result` with its degenerate parts removed (text_utils.scrub_result).
+
+        Called at promotion and again at each injection into another
+        agent's prompt, so all consumers get the same cleaned text. The
+        promotion call does the actual work. The injection calls are no-ops
+        on text that was already scrubbed (scrub_result is idempotent), so
+        they only fire for results that reached storage another way, such as
+        an abandoned task's salvaged partial. The counters record which of
+        the two did the cutting.
+
+        Source code is returned unchanged, the same exemption the report-trim
+        uses. So is anything that is not a non-empty string.
+        """
+        if not isinstance(result, str) or not result.strip() or self._looks_like_code(result):
+            return result
+        kept, reasons = scrub_result(result, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS)
+        if not reasons:
+            return result
+
+        label = task_id or "?"
+        self.colony.record_verdict(f"result_scrubbed_at_{where}")
+        print(f"  [result-scrub:{where}] {label}: removed {', '.join(reasons)} "
+              f"({len(result)} -> {len(kept)} chars).")
+        if kept.strip():
+            return kept
+
+        self.colony.record_verdict(f"result_empty_after_scrub_at_{where}")
+        print(f"  [result-scrub:{where}] {label}: nothing survived -- replaced "
+              f"with an explicit no-usable-output marker.")
+        return self.DEGENERATE_RESULT_MARKER.format(reason=reasons[0])
+
     def _build_dependency_context(self, dependencies: Optional[list]) -> str:
         if not dependencies:
             return ""
@@ -779,7 +896,11 @@ class Orchestrator:
                 dep_result = self.colony.results.get(dep_id)
             if dep_result is None:
                 continue
-            snippet = str(dep_result).strip()
+            # Scrubbed before the cap, so a degenerate tail cannot fill the
+            # 400 characters a sibling actually sees.
+            snippet = self._scrub_result(
+                str(dep_result).strip(), "dependency_injection", task_id=dep_id
+            )
             if len(snippet) > 400:
                 snippet = snippet[:400] + "..."
             lines.append(f'- From completed step "{dep_task.description}": {snippet}')
@@ -1351,6 +1472,23 @@ class Orchestrator:
             ):
                 return False
 
+            # Admission: the batch is cut to the largest k whose reservation
+            # fits (queued overflow included -- it is reserved now, spawned
+            # later). The rest is dropped, not bundled, and the decomposer is
+            # told. Not even one fitting sends it down the DIE path.
+            spawner = self.colony.get_agent(parent_id) if parent_id else None
+            if spawner is not None and prepared:
+                admitted = self._admit_spawn_batch(
+                    spawner.task_id, [sub.get("role") for sub, _, _ in prepared])
+                if admitted == 0:
+                    self._refuse_spawn_for_budget(parent_id, spawner)
+                    return False
+                if admitted < len(prepared):
+                    self._tell_parent_about_dropped_subtasks(
+                        parent_id, [d for _, d, _ in prepared[admitted:]])
+                    prepared = prepared[:admitted]
+            admitted_ids = {task_id for _, _, task_id in prepared}
+
             # Fan-out cap: resolved against the FULL original batch's labels
             # above (so an item past the cap can still be a valid dependency
             # target/source), but only the first `cap` are spawned now --
@@ -1399,7 +1537,15 @@ class Orchestrator:
                         )
                         if normalized_dep:
                             dep_id = label_to_id.get(normalized_dep)
-                    if dep_id:
+                    if dep_id and dep_id not in admitted_ids:
+                        # Its target was dropped by admission and will never
+                        # exist; waiting on it would leave this task pending.
+                        print(
+                            f"  [admission] subtask '{description[:60]}...' "
+                            f"depended on a subtask dropped for budget -- "
+                            f"dependency removed."
+                        )
+                    elif dep_id:
                         resolved_deps.append(dep_id)
                     else:
                         print(
@@ -1443,6 +1589,11 @@ class Orchestrator:
         if not self._reject_derived_subtask_batch(event, [description]):
             return False
 
+        spawner = self.colony.get_agent(parent_id) if parent_id else None
+        if spawner is not None and self._admit_spawn_batch(spawner.task_id, [role]) == 0:
+            self._refuse_spawn_for_budget(parent_id, spawner)
+            return False
+
         self._spawn_child_task(
             description=description,
             role=role,
@@ -1474,7 +1625,13 @@ class Orchestrator:
         # _build_dependency_context uses (consistency with the rest of the
         # "shared state" mechanism) and now explicitly debited using the
         # same chars-per-100 proxy used everywhere else in the energy model.
-        result_str = str(result).strip()
+        # Scrubbed at injection too, like _build_dependency_context. A
+        # promoted result is already clean. An abandoned task's salvaged
+        # partial never passed through promotion, and this is where it would
+        # otherwise enter the parent's prompt uncleaned.
+        result_str = self._scrub_result(
+            str(result).strip(), "parent_injection", task_id=child_id
+        )
         if len(result_str) > 400:
             result_str = result_str[:400] + "..."
         injected_text = f"\n[CHILD RESULT - {child_id}]: {result_str}\n"
@@ -1872,6 +2029,18 @@ class Orchestrator:
             self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict)
             return
 
+        # Accepted. This `result` becomes the canonical one: stored, set on
+        # the task node, sent to the parent, written to the success cache,
+        # and read by every dependent sibling. The dedupe and report-trim
+        # above only shaped what the judge read. A tail like "Exactly five.
+        # Done." or a sentence that started looping survived both, got
+        # accepted, and went everywhere from here. Scrubbing once, before
+        # any of those consumers, follows judge.py's rule that every
+        # consumer gets clean text from the origin. A success-cache hit in
+        # _kill_and_respawn re-promotes a value written below, so it is
+        # covered without a check of its own.
+        result = self._scrub_result(result, "promotion", task_id=task_id)
+
         print(
             f"SUBTASK COMPLETE: {agent_id}/{task_id} -- "
             f"\"{self.task_graph.tasks.get(task_id).description if self.task_graph.tasks.get(task_id) else '?'}\" "
@@ -1990,6 +2159,20 @@ class Orchestrator:
                 print(f"  [software-framing] DIE from {agent_id} {software_reason} "
                       f"(block lever off).")
         if verdict is None and role == "executor" and die_text.startswith("TASK TOO LARGE:"):
+            if task_id and not self._admit_conversion(task_id):
+                # No budget to decompose: the executor's DIE stands, and the
+                # parent gets whatever it left instead of a re-plan.
+                print(f"Agent {agent_id} reported its task as too large, but the "
+                      f"uncommitted budget cannot fund decomposing it -- closing "
+                      f"the task instead of converting.")
+                self._retire_agent(agent_id, task_id, verdict)
+                self._abandon_task(
+                    task_id, parent_id, agent_id, self.respawn_counts.get(task_id, 0),
+                    reason=("it was too large for one agent and there was not "
+                            "enough uncommitted energy to decompose it further"),
+                    reason_label="admission",
+                )
+                return
             print(f"Agent {agent_id} reported its task as too large -- "
                   f"respawning as a decomposer for the same task instead of an executor.")
             role = "decomposer"
@@ -2118,19 +2301,223 @@ class Orchestrator:
                 reason_label="no energy to respawn",
             )
 
-    def _agent_energy_allowance(self, role: str) -> int:
-        """What one agent of this role may spend before its own caps stop it.
+    # ------------------------------------------------------------------
+    # Energy reservation (see RESERVE_* / ADMISSION_* in __init__)
 
-        Computable rather than sampled: think() always runs its whole role cap
-        (it has no EOS check) and decide()'s payload is stopped at a fixed
-        budget, so agent_cycle_tokens(role) is a real per-cycle maximum, and
-        Agent.MAX_NON_TERMINAL_CYCLES bounds how many cycles there can be.
-        Billed through the same chars-per-100 proxy debit_energy uses.
-        """
-        spawn = self.energy_when_new_by_role.get(role, self.energy_when_new)
-        per_cycle = max(1, (agent_cycle_tokens(role)
-                            * self.ENERGY_CHARS_PER_TOKEN) // 100)
-        return spawn + Agent.MAX_NON_TERMINAL_CYCLES * per_cycle
+    def _reservation(self, task_id: str) -> TaskReservation:
+        """The task's reservation record, created on first use. A task that
+        reached the graph without going through spawn admission (the root
+        before bootstrap, recovery spawns, hand-built test graphs) is
+        classified from its agent's role, or its required_role."""
+        res = self.task_reservations.get(task_id)
+        if res is not None:
+            return res
+        task = self.task_graph.tasks.get(task_id)
+        agent = (self.colony.get_agent(task.agent_id)
+                 if task is not None and task.agent_id else None)
+        role = (getattr(agent, "role", None)
+                or getattr(task, "required_role", None) or "executor")
+        if task_id == self.root_task_id:
+            kind = "root"
+        elif role == "decomposer":
+            kind = "decomposer"
+        else:
+            kind = "executor"
+        res = TaskReservation(kind=kind)
+        if kind != "executor" and agent is not None and agent.children:
+            res.spawned, res.k = True, len(agent.children)
+        self.task_reservations[task_id] = res
+        return res
+
+    def _own_cost(self, res: TaskReservation) -> float:
+        """One attempt's cost to its own task. A decomposer that has not
+        SPAWNed yet is priced at k=1, its cheapest decomposition."""
+        if res.kind == "executor":
+            return self.RESERVE_EXECUTOR
+        k = res.k if res.spawned else 1
+        cost = self.RESERVE_DECOMPOSER_BASE + self.RESERVE_PER_CHILD * k
+        if res.kind == "root":
+            cost += self.RESERVE_ROOT_EXTRA
+        return cost
+
+    @staticmethod
+    def _child_kind(res: TaskReservation) -> str:
+        # Mirrors _enforce_child_role: the root's children are decomposers,
+        # every other decomposer's are executors.
+        return "decomposer" if res.kind == "root" else "executor"
+
+    def _unspawned_children_reservation(self, res: TaskReservation) -> float:
+        """A decomposer that has not SPAWNed yet also reserves the one child
+        its k=1 pricing assumes, so its parent cannot admit work the child
+        will then be unable to afford."""
+        if res.kind == "executor" or res.spawned:
+            return 0.0
+        return self._new_task_reservation(self._child_kind(res))
+
+    def _new_task_reservation(self, kind: str) -> float:
+        """Full reservation of a task about to be created (nothing spent)."""
+        res = TaskReservation(kind=kind)
+        return self._own_cost(res) + self._unspawned_children_reservation(res)
+
+    @staticmethod
+    def _reservation_kind(role: Optional[str]) -> str:
+        return "decomposer" if role == "decomposer" else "executor"
+
+    def _remaining_reservation(self, task_id: str) -> float:
+        res = self._reservation(task_id)
+        spent = self.colony.task_energy_spent.get(task_id, 0)
+        return (max(0.0, res.sunk + self._own_cost(res) - spent)
+                + self._unspawned_children_reservation(res))
+
+    def committed_energy(self) -> float:
+        """Spent so far plus everything still reserved: every unfinished
+        task's remaining reservation, and every queued overflow subtask
+        (reserved when its batch was admitted, not yet a task)."""
+        total = float(self.colony.starting_budget - self.colony.budget_remaining)
+        for task_id, task in self.task_graph.tasks.items():
+            if task.status in (0, 1):
+                total += self._remaining_reservation(task_id)
+        for queue in self.pending_overflow.values():
+            for spawn_kwargs in queue:
+                total += self._new_task_reservation(
+                    self._reservation_kind(spawn_kwargs.get("role")))
+        return total
+
+    def _admits(self, extra: float = 0.0) -> bool:
+        """The admission rule, evaluated with any hypothetical change already
+        applied to task_reservations and `extra` for work not yet created."""
+        if not self.ADMISSION_CONTROL:
+            return True
+        limit = self.colony.starting_budget - self.ADMISSION_FLOOR
+        return self.committed_energy() + extra <= limit
+
+    def _admit_spawn_batch(self, parent_task_id: str, child_roles: list) -> int:
+        """How many of this batch's children (in order) may be created: the
+        largest k whose reservation fits. 0 means not even one. On success
+        the parent's reservation is re-priced at that k."""
+        res = self._reservation(parent_task_id)
+        saved = (res.k, res.spawned)
+        extras = [self._new_task_reservation(self._reservation_kind(r)) for r in child_roles]
+        for k in range(len(child_roles), 0, -1):
+            res.k, res.spawned = k, True
+            if self._admits(sum(extras[:k])):
+                return k
+        res.k, res.spawned = saved
+        return 0
+
+    def _task_energy_records(self) -> list:
+        """One record per task: what the RESERVE_* figures are re-fitted
+        from (sims/reservation_formula/refit_from_runs.py). A task that
+        completed on its first attempt with no conversion is one clean sample
+        of what an attempt of its kind -- at its k -- costs."""
+        records = []
+        for task_id, task in self.task_graph.tasks.items():
+            res = self._reservation(task_id)
+            records.append({
+                "task_id": task_id,
+                "kind": res.kind,
+                "k": res.k if res.spawned else None,
+                "attempts": res.attempts,
+                "converted": res.conv_sunk > 0,
+                "conv_sunk": res.conv_sunk,
+                "spent": self.colony.task_energy_spent.get(task_id, 0),
+                "ceiling": self.task_energy_ceiling(task_id),
+                "status": task.status,
+                "abandon_reason": self.abandon_reasons.get(task_id),
+                "description": (task.description or "")[:80],
+            })
+        return records
+
+    def _write_energy_trace(self, outcome: str) -> None:
+        """Append this run's energy picture as one JSON line to
+        energy_trace_path. Off (None) unless set -- tests call terminate()."""
+        if not self.energy_trace_path:
+            return
+        import json
+        line = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "outcome": outcome,
+            "budget": self.colony.starting_budget,
+            "spent": self.colony.starting_budget - self.colony.budget_remaining,
+            "ticks": self.tick_count,
+            "budget_source": "override" if self.budget_override is not None else "phaser",
+            "params": {
+                "e": self.RESERVE_EXECUTOR, "alpha": self.RESERVE_DECOMPOSER_BASE,
+                "beta": self.RESERVE_PER_CHILD, "sigma": self.RESERVE_ROOT_EXTRA,
+                "A": self.TASK_CEILING_ATTEMPTS, "floor": self.ADMISSION_FLOOR,
+                "admission": self.ADMISSION_CONTROL,
+            },
+            "verdicts": dict(self.colony.verdict_counts),
+            "ledger": dict(self.colony.energy_ledger),
+            "tasks": self.run_trace.get("task_energy", []),
+        }
+        try:
+            with open(self.energy_trace_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+            print(f"[energy-trace] appended this run to {self.energy_trace_path}")
+        except Exception as e:
+            print(f"Warning: failed writing energy trace to {self.energy_trace_path}: {e}")
+
+    def _admit_conversion(self, task_id: str) -> bool:
+        """Re-price a TASK TOO LARGE task as a decomposer and admit it or not.
+        The executor's spend so far is carried as sunk (and conv_sunk, which
+        the ceiling adds on top) instead of eating the decomposer's share."""
+        res = self._reservation(task_id)
+        saved = (res.kind, res.k, res.spawned, res.sunk, res.conv_sunk)
+        spent = self.colony.task_energy_spent.get(task_id, 0)
+        res.kind, res.k, res.spawned = "decomposer", 0, False
+        res.sunk = res.conv_sunk = spent
+        if self._admits():
+            self._admitted_conversions.add(task_id)
+            return True
+        res.kind, res.k, res.spawned, res.sunk, res.conv_sunk = saved
+        self.colony.record_verdict("admission_conversion_refused")
+        return False
+
+    def _refuse_spawn_for_budget(self, parent_id: str, spawner) -> None:
+        """Not even one child fits. Handled exactly like a batch whose
+        children could not be started for lack of energy: a decomposer with
+        finished children is released to REPORT them, one without goes down
+        the DIE path (where respawn admission decides whether anything more
+        is spent on the task)."""
+        print(f"  [admission] {parent_id}'s SPAWN refused: not one subtask fits "
+              f"the uncommitted budget (committed "
+              f"{self.committed_energy():.0f} of {self.colony.starting_budget}).")
+        self.colony.record_verdict("admission_spawn_refused")
+        if self.live_agents.get(parent_id) is not None:
+            self._release_spawner_if_nothing_started(parent_id, out_of_energy=True)
+            return
+        spawner.fail_reason = ("SPAWN refused: the colony has no uncommitted "
+                               "energy left to start any subtask.")
+        self.messenger.push_event(
+            "failure_request",
+            parent_id,
+            {
+                "task_id": spawner.task_id,
+                "role": spawner.role,
+                "parent_id": spawner.parent_id,
+                "result": "No energy budget left to decompose this task.",
+            },
+        )
+
+    def _tell_parent_about_dropped_subtasks(self, parent_id: str, dropped: list) -> None:
+        """Truncation is only honest if the decomposer knows: its roll-up
+        must say what was not covered instead of presenting a partial plan as
+        the whole one. Delivered into its context like a child result, and
+        billed the same way."""
+        for _ in dropped:
+            self.colony.record_verdict("admission_subtasks_dropped")
+        names = "; ".join(f'"{d[:80]}"' for d in dropped)
+        print(f"  [admission] {parent_id}: dropped {len(dropped)} subtask(s) the "
+              f"budget cannot cover: {names}")
+        live_parent = self.live_agents.get(parent_id)
+        if live_parent is None:
+            return
+        note = (f"\n[BUDGET] These subtasks were NOT started because the colony "
+                f"cannot afford them: {names}. Your final REPORT must say they "
+                f"were not covered.\n")
+        live_parent.thought_process += note
+        self.colony.debit_energy(parent_id, max(1, len(note) // 100), category="injection")
 
     def _energy_ceiling_reason(self, spent: int, ceiling: int) -> str:
         """The abandonment reason line, shared by both ceiling checks so a
@@ -2145,7 +2532,7 @@ class Orchestrator:
         if not task_id:
             return None
         spent = self.colony.task_energy_spent.get(task_id, 0)
-        ceiling = self.task_energy_ceiling()
+        ceiling = self.task_energy_ceiling(task_id)
         return (spent, ceiling) if spent >= ceiling else None
 
     def _enforce_task_energy_ceiling(self, agent_id: str,
@@ -2209,20 +2596,18 @@ class Orchestrator:
         )
         return True
 
-    def task_energy_ceiling(self) -> int:
-        """Most energy one task's agents may spend before it gets no more
-        respawns. See TASK_AGENT_ALLOWANCE in __init__.
+    def task_energy_ceiling(self, task_id: Optional[str] = None) -> int:
+        """Most energy this task's agents may spend, all attempts together:
+        conv_sunk + TASK_CEILING_ATTEMPTS * own_cost. See __init__.
 
-        Priced at the most expensive role rather than the task's own: one
-        figure keeps the ledger readable, and pricing a decomposer task at its
-        own cheaper rate would tighten exactly the tasks that also absorb every
-        child's injection cost -- the root most of all, whose abandonment ends
-        the run.
+        Priced at the task's OWN cost -- role and batch size -- because a
+        decomposer's attempt grows with k and the root's carries sigma; one
+        flat figure fitted only executors. With no task_id, the executor
+        ceiling (the reference figure the ledger prints).
         """
-        roles = set(self.energy_when_new_by_role) | {"executor"}
-        dearest = max(self._agent_energy_allowance(r) for r in roles)
-        return max(self.TASK_ENERGY_FLOOR,
-                   int(self.TASK_AGENT_ALLOWANCE * dearest))
+        res = (self._reservation(task_id) if task_id
+               else TaskReservation(kind="executor"))
+        return int(res.conv_sunk + self.TASK_CEILING_ATTEMPTS * self._own_cost(res))
 
     def _abandon_task(self, task_id: str, parent_id: Optional[str],
                        agent_id: Optional[str], attempts: int,
@@ -2676,16 +3061,26 @@ class Orchestrator:
                         description = description[:57] + "..."
                     print(f"    {count:>3}x  status={status}  {task_id}  {description}")
 
-            ceiling = self.task_energy_ceiling()
-            print(f"\n  TASK ENERGY (top 10 by energy; per-task ceiling {ceiling} = "
-                  f"{self.TASK_AGENT_ALLOWANCE} agents' worth of "
-                  f"{Agent.MAX_NON_TERMINAL_CYCLES} full-cap cycles; OVER next "
-                  f"to a reason = stopped as intended)")
+            print(f"\n  TASK ENERGY (top 10 by energy; per-task ceiling = "
+                  f"conversion carry-over + {self.TASK_CEILING_ATTEMPTS} x the "
+                  f"task's own attempt cost, executor "
+                  f"{self.task_energy_ceiling()}; OVER next to a reason = "
+                  f"stopped as intended)")
             task_energy = dict(getattr(self.colony, "task_energy_spent", {}) or {})
             if not task_energy:
                 print("    (no energy attributed to a task this run)")
             else:
                 reasons = getattr(self, "abandon_reasons", {}) or {}
+                # A REPORT/DIE is judged a tick after the cycle that produced
+                # it, and that cycle is exempt from the per-cycle check -- so a
+                # mid-run ledger can catch a task over its line with its
+                # verdict still queued. That is the one-cycle window, not a
+                # leak: it is stopped (or kept, if promoted) when routed.
+                queued_verdicts = {
+                    (e.payload or {}).get("task_id")
+                    for e in self.messenger.pending()
+                    if e.type in ("completion_request", "failure_request")
+                }
                 for task_id, spent in sorted(task_energy.items(), key=lambda kv: -kv[1])[:10]:
                     task = self.task_graph.tasks.get(task_id)
                     status = task.status if task is not None else "?"
@@ -2701,15 +3096,18 @@ class Orchestrator:
                     # not stopped -- labelled as such so it neither hides
                     # under a plain status=2 nor reads as a leak.
                     flag = ""
+                    ceiling = self.task_energy_ceiling(task_id)
                     if spent >= ceiling:
                         if task_id in reasons:
                             flag = "  OVER"
                         elif task_id in self.completed_over_ceiling:
                             flag = "  OVER -- COMPLETED OVER CEILING"
+                        elif task_id in queued_verdicts:
+                            flag = "  OVER -- VERDICT PENDING"
                         else:
                             flag = "  OVER -- NOT STOPPED"
                     label = f"  [{reasons[task_id]}]" if task_id in reasons else ""
-                    print(f"    {spent:>6}  agents={agents}  status={status}  "
+                    print(f"    {spent:>6}/{ceiling:<4} agents={agents}  status={status}  "
                           f"{task_id}{flag}{label}")
 
             # Which of the two ceiling checks actually stopped things. The
@@ -2722,6 +3120,17 @@ class Orchestrator:
             at_respawn = verdicts.get("energy_ceiling_at_respawn", 0)
             print(f"    stopped mid-agent (per cycle)  : {midagent}")
             print(f"    stopped at a respawn decision  : {at_respawn}")
+
+            # What admission turned away. All zero on a run whose budget
+            # covered everything it planned.
+            print(f"\n  ADMISSION (committed at end: {self.committed_energy():.0f} "
+                  f"of {self.colony.starting_budget}, floor {self.ADMISSION_FLOOR})")
+            for label, key in (("subtasks dropped from a batch", "admission_subtasks_dropped"),
+                               ("SPAWN batches refused outright", "admission_spawn_refused"),
+                               ("TASK TOO LARGE conversions refused", "admission_conversion_refused"),
+                               ("respawns refused", "admission_respawn_refused"),
+                               ("root refused at bootstrap", "admission_root_refused")):
+                print(f"    {label:<35}: {verdicts.get(key, 0)}")
 
             live_count = getattr(self, "_live_agents_at_terminate", len(self.live_agents))
             print(f"\n  live_agents at terminate : {live_count}")
@@ -2777,7 +3186,8 @@ class Orchestrator:
         return Synthesizer.DEGENERATE_ANSWER_MESSAGE
 
     def _print_final_answer_report(self):
-        """What the guards did to the text the user actually reads.
+        """What the guards did to the text the user actually reads, and to
+        the child results that text is built from.
 
         Printed here and not in _print_energy_report because most of it
         happens after that runs: the partial-result synthesis and the exit
@@ -2785,6 +3195,25 @@ class Orchestrator:
         zero there no matter what happened.
         """
         verdicts = getattr(self.colony, "verdict_counts", {}) or {}
+
+        # Read together: "at promotion" is the choke point doing its job.
+        # Anything under injection is a result that reached storage without
+        # going through promotion (a salvaged partial, or a new path). A
+        # count there is worth tracking down.
+        scrub_rows = (
+            ("cut at promotion                  ", verdicts.get("result_scrubbed_at_promotion", 0)),
+            ("  empty after the cut             ",
+             verdicts.get("result_empty_after_scrub_at_promotion", 0)),
+            ("cut at parent injection           ",
+             verdicts.get("result_scrubbed_at_parent_injection", 0)),
+            ("cut at dependency injection       ",
+             verdicts.get("result_scrubbed_at_dependency_injection", 0)),
+        )
+        if any(count for _, count in scrub_rows):
+            print("\n  CHILD RESULT SCRUBS (degeneracy reaching other agents)")
+            for label, count in scrub_rows:
+                print(f"    {label} : {count}")
+
         trims = dict(getattr(self.synthesizer, "trim_counts", {}) or {})
         rows = (
             ("synthesis cut at a degenerate tail", trims.get("cut", 0)),
@@ -2870,6 +3299,16 @@ class Orchestrator:
         # Printed on BOTH exit paths on purpose: a successful run's ledger is
         # the baseline the failing runs get compared against.
         self._print_energy_report()
+        if is_successful:
+            outcome = "success"
+        elif self.hit_tick_ceiling:
+            outcome = "tick_ceiling"
+        elif self.root_task_id in self.abandoned_tasks:
+            outcome = "root_abandoned"
+        else:
+            outcome = "energy_death"
+        self.run_trace["task_energy"] = self._task_energy_records()
+        self._write_energy_trace(outcome)
 
         best_result = self.colony.results.get("final_spec")
 

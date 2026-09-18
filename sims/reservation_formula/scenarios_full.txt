@@ -1,0 +1,141 @@
+cell = success% | mean spent | leaf coverage | FK=false ceiling kills/run M=merges/run R=admission refusals/run
+
+## healthy 3x2
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   151 cov0.12          0%   206 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0    12%   148 cov0.33 R5.5     0%   199 cov0.67 FK0.5R3.5 100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   letter agent-scope     0%    98 cov0.00 R9.0    12%   148 cov0.33 R5.5     0%   198 cov0.67 R3.8   100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   F bundle             100%    79 cov0.04 M2.0R0.8 100%   122 cov0.08 M3.0R1.5  75%   190 cov0.48 M2.0R1.1 100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   F truncate           100%    72 cov0.17        100%   119 cov0.33        100%   188 cov0.67        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   189 cov0.75 M2.0R0.5 100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+
+## healthy 3x2, slow agents
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   103 cov0.00          0%   176 cov0.00          0%   244 cov0.00          0%   312 cov1.00        100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   letter lazy            0%    98 cov0.00 R3.0     0%   160 cov0.00 R2.0     0%   202 cov0.00 R1.0     0%   312 cov1.00        100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%   312 cov1.00        100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   letter agent-scope     0%    98 cov0.00 R3.0     0%   160 cov0.00 R2.0     0%   202 cov0.00 R1.0     0%   312 cov1.00        100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   F bundle              50%    95 cov0.04 M2.0R0.8  50%   146 cov0.08 M3.0R1.5   0%   202 cov0.35 FK1.5M2.0R1.1   0%   312 cov1.00 FK0.1  100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   F truncate             0%    99 cov0.17          0%   148 cov0.33 FK1.2    0%   200 cov0.35 FK2.8    0%   312 cov1.00 FK0.1  100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%   204 cov0.46 FK1.4M2.0R0.1   0%   312 cov1.00 FK0.1  100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+
+## 4-chain: root>dec>conv>exec
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   101 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   letter lazy           88%    89 cov0.06 FK0.9M0.1R0.9 100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   letter agent-scope     0%    99 cov0.06 M0.1R2.6 100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   F bundle             100%    70 cov0.00 R1.0   100%   117 cov0.12 M1.0R0.8 100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   F truncate           100%    70 cov0.00 R1.0   100%   117 cov0.50        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+
+## 4-chain, late conv (t=3)
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   100 cov0.88        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   letter lazy          100%    86 cov0.00 FK1.0R1.0 100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   letter agent-scope     0%    98 cov0.00 R3.0   100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   F bundle             100%    72 cov0.00 R1.0   100%   118 cov0.06 M1.0R0.9 100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   F truncate           100%    72 cov0.00 R1.0   100%   118 cov0.50        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+
+## stacked conversions
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    99 cov0.33          0%   150 cov0.42          0%   198 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   letter lazy           88%    89 cov0.04 FK0.9M0.1R0.9   0%   148 cov0.33 FK1.0R1.0   0%   198 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   letter agent-scope     0%    99 cov0.04 M0.1R2.6   0%   150 cov0.33 R3.0     0%   198 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   F bundle             100%    70 cov0.00 R1.0   100%   117 cov0.08 M1.0R0.8 100%   150 cov0.38 M0.1R0.9 100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   F truncate           100%    70 cov0.00 R1.0   100%   122 cov0.00 R1.0   100%   149 cov0.38 R0.9   100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   142 cov0.33 R1.0   100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+
+## 4 agents on one decomposer
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   100 cov1.00          0%   149 cov1.00          0%   205 cov1.00        100%   223 cov1.00 FK1.0  100%   223 cov1.00 FK1.0  100%   223 cov1.00 FK1.0  100%   223 cov1.00 FK1.0 
+   letter lazy            0%   101 cov1.00 FK1.0R1.0   0%   151 cov1.00 FK0.6R0.2 100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0 
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0 
+   letter agent-scope     0%   101 cov1.00 R2.0     0%   151 cov1.00 R0.9     0%   198 cov1.00 M1.0R1.6 100%   288 cov1.00        100%   288 cov1.00        100%   288 cov1.00        100%   288 cov1.00       
+   F bundle              25%    68 cov0.12 M1.0R2.5 100%   130 cov1.00 FK0.2M0.9R1.5 100%   158 cov1.00 R1.0   100%   272 cov1.00 M0.8R0.5 100%   288 cov1.00        100%   288 cov1.00        100%   288 cov1.00       
+   F truncate           100%    70 cov0.50 R1.0   100%   129 cov1.00 R1.0   100%   158 cov1.00 R1.0   100%   271 cov1.00        100%   288 cov1.00        100%   288 cov1.00        100%   288 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   158 cov1.00 R1.0   100%   239 cov1.00 R0.8   100%   288 cov1.00        100%   288 cov1.00        100%   288 cov1.00       
+
+## root warned twice
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   151 cov0.12          0%   206 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0     0%   149 cov0.33 R5.5     0%   199 cov0.67 FK0.5R3.5 100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   letter agent-scope     0%    98 cov0.00 R9.0     0%   149 cov0.33 R5.5     0%   198 cov0.67 R3.8   100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   F bundle              50%    95 cov0.04 M2.0R0.8  88%   139 cov0.08 M3.0R1.5  12%   198 cov0.48 M2.0R1.1 100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   F truncate           100%    89 cov0.17        100%   136 cov0.33          0%   199 cov0.67        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%   198 cov0.75 M2.0R0.5 100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+
+## root executed once
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   151 cov0.12          0%   206 cov1.00          0%   318 cov1.00        100%   462 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0     0%   149 cov0.33 R5.5     0%   199 cov0.67 FK0.5R3.5   0%   254 cov1.00 FK0.8M0.2R0.5  25%   294 cov1.00 FK0.8   25%   294 cov1.00 FK0.8   25%   294 cov1.00 FK0.8 
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%   232 cov1.00 R1.0   100%   462 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+   letter agent-scope     0%    98 cov0.00 R9.0     0%   149 cov0.33 R5.5     0%   198 cov0.67 R3.8     0%   304 cov1.00 M0.6R2.4 100%   462 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+   F bundle               0%    79 cov0.04 M2.0R1.8   0%   122 cov0.08 M3.0R2.5   0%   190 cov0.48 M2.0R1.9   0%   232 cov1.00 R1.0   100%   462 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+   F truncate             0%    72 cov0.17 R1.0     0%   119 cov0.33 R1.0     0%   188 cov0.67 R1.0     0%   232 cov1.00 R1.0   100%   462 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%   189 cov0.75 M2.0R1.5   0%   232 cov1.00 R1.0   100%   462 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+
+## exec warn-loop runaway
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   153 cov0.42          0%   202 cov0.83         25%   295 cov0.83        100%   296 cov0.83        100%   296 cov0.83        100%   296 cov0.83       
+   letter lazy            0%    98 cov0.00 R9.0     0%   150 cov0.17 R7.0     0%   200 cov0.50 FK0.1R4.5 100%   253 cov0.83        100%   253 cov0.83        100%   253 cov0.83        100%   253 cov0.83       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   253 cov0.83        100%   253 cov0.83        100%   253 cov0.83        100%   253 cov0.83       
+   letter agent-scope     0%    98 cov0.00 R9.0     0%   150 cov0.17 R7.0     0%   200 cov0.50 R4.6     0%   301 cov0.83 R0.1   100%   321 cov0.83        100%   321 cov0.83        100%   321 cov0.83       
+   F bundle             100%    79 cov0.04 M2.0R0.8 100%   122 cov0.08 M3.0R1.5  75%   194 cov0.31 M2.0R1.1 100%   279 cov0.83 R0.6   100%   321 cov0.83        100%   321 cov0.83        100%   321 cov0.83       
+   F truncate           100%    81 cov0.00 R1.0   100%   128 cov0.17 R1.0   100%   189 cov0.50        100%   279 cov0.83 R0.6   100%   321 cov0.83        100%   321 cov0.83        100%   321 cov0.83       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   186 cov0.52 M2.0R0.9 100%   279 cov0.83 R0.6   100%   321 cov0.83        100%   321 cov0.83        100%   321 cov0.83       
+
+## exec dies every time
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   153 cov0.42          0%   200 cov0.83        100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83       
+   letter lazy            0%    98 cov0.00 R9.0    12%   148 cov0.17 R6.8     0%   199 cov0.50 FK0.2R4.0 100%   250 cov0.83        100%   250 cov0.83        100%   250 cov0.83        100%   250 cov0.83       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   250 cov0.83        100%   250 cov0.83        100%   250 cov0.83        100%   250 cov0.83       
+   letter agent-scope     0%    98 cov0.00 R9.0    12%   148 cov0.17 R7.1     0%   199 cov0.50 R4.6   100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83       
+   F bundle             100%    79 cov0.04 M2.0R0.8 100%   122 cov0.08 M3.0R1.5  75%   188 cov0.31 M2.0R1.8 100%   270 cov0.83 R0.8   100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83       
+   F truncate           100%    77 cov0.00 R0.9   100%   133 cov0.17 R0.9   100%   186 cov0.50 R0.9   100%   270 cov0.83 R0.8   100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   186 cov0.58 M2.0R1.4 100%   270 cov0.83 R0.8   100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83       
+
+## exec ok on 3rd agent
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   156 cov0.42          0%   205 cov0.83        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0    12%   150 cov0.17 FK0.1R6.9   0%   199 cov0.50 FK0.8R3.0 100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0 
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0 
+   letter agent-scope     0%    98 cov0.00 R9.0    12%   150 cov0.17 R7.0     0%   201 cov0.50 R3.5   100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00       
+   F bundle             100%    79 cov0.04 M2.0R0.8 100%   122 cov0.08 M3.0R1.5  25%   198 cov0.31 FK1.0M2.0R1.1 100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00       
+   F truncate           100%    79 cov0.00 R1.0   100%   126 cov0.17 R1.0    75%   194 cov0.50 FK0.9R0.1 100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0    62%   195 cov0.56 FK1.0M2.0R0.6 100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00       
+
+## exec 2 warns then ok
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   152 cov0.10          0%   213 cov0.83        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0     0%   150 cov0.33 R6.0     0%   199 cov0.67 R3.0   100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   letter agent-scope     0%    98 cov0.00 R9.0     0%   150 cov0.33 R6.0     0%   199 cov0.67 R3.0   100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   F bundle             100%    79 cov0.04 M2.0R0.8 100%   122 cov0.08 M3.0R1.5  25%   200 cov0.31 FK1.0M2.0R1.1 100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   F truncate            88%    93 cov0.17        100%   141 cov0.33         50%   197 cov0.50 FK1.0  100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0    38%   197 cov0.58 FK1.0M2.0R0.5 100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+
+## exec ok on 2nd agent
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   156 cov0.42          0%   205 cov0.83        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0    12%   149 cov0.19 R6.9     0%   199 cov0.50 FK0.8R3.0 100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4 
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4 
+   letter agent-scope     0%    98 cov0.00 R9.0    12%   149 cov0.19 R6.9     0%   200 cov0.58 R3.0   100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00       
+   F bundle             100%    79 cov0.04 M2.0R0.8 100%   122 cov0.08 M3.0R1.5  25%   198 cov0.31 FK1.0M2.0R1.1 100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00       
+   F truncate           100%    79 cov0.00 R1.0   100%   126 cov0.17 R1.0    75%   194 cov0.50 FK0.9R0.1 100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0    62%   195 cov0.56 FK1.0M2.0R0.6 100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00       
+
+## root batch of 5 (overflow)
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    98 cov0.00          0%   153 cov0.60          0%   208 cov0.60        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   letter lazy            0%    99 cov0.00 M1.0R9.0   0%   150 cov0.00 FK0.2R15.0  12%   197 cov0.40 FK0.4R9.5 100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   letter cap             0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   210 cov1.00 M1.0   100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   letter agent-scope     0%    99 cov0.00 M1.0R9.0   0%   151 cov0.00 R15.0   50%   196 cov0.40 R9.5   100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   F bundle             100%    81 cov0.05 M2.0R0.8 100%   126 cov0.30 M2.0R0.5  88%   190 cov0.62 M2.0R0.9 100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   F truncate           100%    74 cov0.20        100%   120 cov0.40        100%   164 cov0.60        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   F exp-provisional      0%     0 cov0.00 R1.0     0%     0 cov0.00 R1.0   100%   188 cov1.00 M1.0   100%   210 cov1.00 M1.0   100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       

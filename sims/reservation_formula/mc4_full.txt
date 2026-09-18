@@ -1,0 +1,32 @@
+
+### root completed   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)      89%     94%     93%     96%    100%    100%    100%    100%
+
+### useful = coverage if root completed else 0   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)     0.15    0.27    0.41    0.65    0.84    0.86    0.86    0.86
+
+### energy death   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)       6%      2%      3%      0%      0%      0%      0%      0%
+
+### root refused at bootstrap   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)       0%      0%      0%      0%      0%      0%      0%      0%
+
+### false ceiling kills per run (task would have succeeded)   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)     0.00    0.00    0.01    0.01    0.01    0.01    0.01    0.01
+
+### runs whose ROOT was false-killed   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)     0.0%    0.0%    0.0%    0.0%    0.0%    0.0%    0.0%    0.0%
+
+### energy spent on doomed tasks per run   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)      0.8     2.9     6.8    14.7    24.0    28.4    28.4    28.4
+
+### overspend past B per run   [full_n200_f1.0_implemented]
+   config                     B=100   B=150   B=200   B=300   B=500   B=800  B=1500  B=3000
+   implemented (live code)      0.1     0.0     0.0     0.0     0.0     0.0     0.0     0.0

@@ -82,6 +82,12 @@ BUDGET_OVERRIDE_ENV = "HIVE_BUDGET_OVERRIDE"
 # identical transcript end to end.
 SEED_ENV = "HIVE_SEED"
 
+# Every real run appends its per-task energy records here (one JSON line per
+# run); sims/reservation_formula/refit_from_runs.py re-fits the orchestrator's
+# RESERVE_* figures from them. Set HIVE_ENERGY_TRACE= (empty) to turn it off.
+ENERGY_TRACE_ENV = "HIVE_ENERGY_TRACE"
+DEFAULT_ENERGY_TRACE = "hive_energy_trace.jsonl"
+
 
 def _seed_everything():
     """Draws (or reads) this run's seed, seeds torch, and returns it for the
@@ -271,6 +277,7 @@ def build_orchestrator() -> Orchestrator:
         tokeniser=tokeniser,
         embed_model=shared_embedder,
         budget_override=budget_override,
+        energy_trace_path=os.environ.get(ENERGY_TRACE_ENV, DEFAULT_ENERGY_TRACE) or None,
     )
     return orchestrator
 

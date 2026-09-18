@@ -1,0 +1,172 @@
+
+######## cost model: full   cell = success% | mean spent | leaf coverage | FK/M/R flags
+
+## healthy 3x2
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   151 cov0.12          0%   206 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0    12%   148 cov0.33 R5.5     0%   199 cov0.67 FK0.5R3.5 100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+   RECOMMENDED          100%    72 cov0.17        100%    93 cov0.33        100%   141 cov0.50        100%   211 cov0.83        100%   232 cov1.00        100%   232 cov1.00        100%   232 cov1.00       
+
+## healthy 3x2, slow agents
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   103 cov0.00          0%   176 cov0.00          0%   244 cov0.00          0%   312 cov1.00        100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   letter lazy            0%    98 cov0.00 R3.0     0%   160 cov0.00 R2.0     0%   202 cov0.00 R1.0     0%   312 cov1.00        100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+   RECOMMENDED            0%    99 cov0.17        100%   137 cov0.33          0%   199 cov0.50         12%   301 cov0.83        100%   343 cov1.00        100%   343 cov1.00        100%   343 cov1.00       
+
+## 4-chain: root>dec>conv>exec
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   101 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   letter lazy           88%    89 cov0.06 FK0.9M0.1R0.9 100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+   RECOMMENDED          100%    70 cov0.00 R1.0   100%   117 cov0.50        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00        100%   138 cov1.00       
+
+## 4-chain, late conv (t=3)
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   100 cov0.88        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   letter lazy          100%    86 cov0.00 FK1.0R1.0 100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+   RECOMMENDED          100%    72 cov0.00 R1.0   100%   106 cov0.38 R0.2   100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00        100%   140 cov1.00       
+
+## stacked conversions
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    99 cov0.33          0%   150 cov0.42          0%   198 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   letter lazy           88%    89 cov0.04 FK0.9M0.1R0.9   0%   148 cov0.33 FK1.0R1.0   0%   198 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+   RECOMMENDED          100%    70 cov0.00 R1.0   100%   122 cov0.00 R1.0   100%   142 cov0.33 R1.0   100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00        100%   210 cov1.00       
+
+## 4 agents on one decomposer
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   100 cov1.00          0%   149 cov1.00          0%   205 cov1.00        100%   223 cov1.00 FK1.0  100%   223 cov1.00 FK1.0  100%   223 cov1.00 FK1.0  100%   223 cov1.00 FK1.0 
+   letter lazy            0%   101 cov1.00 FK1.0R1.0   0%   151 cov1.00 FK0.6R0.2 100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0  100%   159 cov1.00 FK1.0 
+   RECOMMENDED          100%    70 cov0.50 R1.0   100%    91 cov1.00 R1.0   100%   158 cov1.00 R1.0   100%   228 cov1.00 FK0.9R0.1 100%   229 cov1.00 FK1.0  100%   229 cov1.00 FK1.0  100%   229 cov1.00 FK1.0 
+
+## root warned twice
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   151 cov0.12          0%   206 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0     0%   149 cov0.33 R5.5     0%   199 cov0.67 FK0.5R3.5 100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+   RECOMMENDED          100%    89 cov0.17        100%   110 cov0.33        100%   157 cov0.50        100%   227 cov0.83        100%   249 cov1.00        100%   249 cov1.00        100%   249 cov1.00       
+
+## root executed once
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   151 cov0.12          0%   206 cov1.00          0%   318 cov1.00        100%   462 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0     0%   149 cov0.33 R5.5     0%   199 cov0.67 FK0.5R3.5   0%   254 cov1.00 FK0.8M0.2R0.5  25%   294 cov1.00 FK0.8   25%   294 cov1.00 FK0.8   25%   294 cov1.00 FK0.8 
+   RECOMMENDED            0%    72 cov0.17 R1.0     0%    93 cov0.33 R1.0     0%   141 cov0.50 R1.0     0%   211 cov0.83 R1.0   100%   420 cov1.00        100%   462 cov1.00        100%   462 cov1.00       
+
+## exec warn-loop runaway
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   153 cov0.42          0%   202 cov0.83         25%   295 cov0.83        100%   296 cov0.83        100%   296 cov0.83        100%   296 cov0.83       
+   letter lazy            0%    98 cov0.00 R9.0     0%   150 cov0.17 R7.0     0%   200 cov0.50 FK0.1R4.5 100%   253 cov0.83        100%   253 cov0.83        100%   253 cov0.83        100%   253 cov0.83       
+   RECOMMENDED          100%    81 cov0.00 R1.0   100%   123 cov0.17 R1.0   100%   170 cov0.33 R1.0   100%   266 cov0.67 R1.0   100%   296 cov0.83        100%   296 cov0.83        100%   296 cov0.83       
+
+## exec dies every time
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   153 cov0.42          0%   200 cov0.83        100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83       
+   letter lazy            0%    98 cov0.00 R9.0    12%   148 cov0.17 R6.8     0%   199 cov0.50 FK0.2R4.0 100%   250 cov0.83        100%   250 cov0.83        100%   250 cov0.83        100%   250 cov0.83       
+   RECOMMENDED          100%    69 cov0.00 R1.0   100%   111 cov0.17 R1.0   100%   156 cov0.33 R1.0   100%   259 cov0.67 R0.2   100%   286 cov0.83        100%   286 cov0.83        100%   286 cov0.83       
+
+## exec ok on 3rd agent
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   156 cov0.42          0%   205 cov0.83        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0    12%   150 cov0.17 FK0.1R6.9   0%   199 cov0.50 FK0.8R3.0 100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0  100%   257 cov0.83 FK1.0 
+   RECOMMENDED          100%    79 cov0.00 R1.0   100%   126 cov0.17 R1.0   100%   172 cov0.33 R1.0   100%   265 cov0.83        100%   286 cov1.00        100%   286 cov1.00        100%   286 cov1.00       
+
+## exec 2 warns then ok
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   150 cov0.00          0%   152 cov0.10          0%   213 cov0.83        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0     0%   150 cov0.33 R6.0     0%   199 cov0.67 R3.0   100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+   RECOMMENDED           88%    93 cov0.17        100%   114 cov0.33        100%   161 cov0.50        100%   232 cov0.83        100%   252 cov1.00        100%   252 cov1.00        100%   252 cov1.00       
+
+## exec ok on 2nd agent
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   145 cov0.00          0%   156 cov0.42          0%   205 cov0.83        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00       
+   letter lazy            0%    98 cov0.00 R9.0    12%   149 cov0.19 R6.9     0%   199 cov0.50 FK0.8R3.0 100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4  100%   256 cov0.94 FK0.4 
+   RECOMMENDED          100%    79 cov0.00 R1.0   100%   124 cov0.33        100%   171 cov0.50        100%   239 cov0.83        100%   260 cov1.00        100%   260 cov1.00        100%   260 cov1.00       
+
+## root batch of 5 (overflow)
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    98 cov0.00          0%   153 cov0.60          0%   208 cov0.60        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   letter lazy            0%    99 cov0.00 M1.0R9.0   0%   150 cov0.00 FK0.2R15.0  12%   197 cov0.40 FK0.4R9.5 100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+   RECOMMENDED          100%    74 cov0.20        100%    74 cov0.20        100%   120 cov0.40        100%   209 cov0.80        100%   255 cov1.00        100%   255 cov1.00        100%   255 cov1.00       
+
+######## cost model: lean   cell = success% | mean spent | leaf coverage | FK/M/R flags
+
+## healthy 3x2
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   102 cov0.00          0%   148 cov1.00        100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00       
+   letter lazy            0%   103 cov0.33 R6.0     0%   148 cov0.73 M1.0R1.1 100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00       
+   RECOMMENDED          100%    66 cov0.33        100%   100 cov0.50        100%   150 cov0.83        100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00        100%   164 cov1.00       
+
+## healthy 3x2, slow agents
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   109 cov0.00          0%   157 cov0.00          0%   207 cov1.00        100%   229 cov1.00        100%   229 cov1.00        100%   229 cov1.00        100%   229 cov1.00       
+   letter lazy            0%   100 cov0.04 R2.8     0%   150 cov0.73 M1.0     0%   207 cov1.00        100%   229 cov1.00        100%   229 cov1.00        100%   229 cov1.00        100%   229 cov1.00       
+   RECOMMENDED          100%    91 cov0.33        100%   136 cov0.50          0%   200 cov0.83        100%   229 cov1.00        100%   229 cov1.00        100%   229 cov1.00        100%   229 cov1.00       
+
+## 4-chain: root>dec>conv>exec
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81       12%    96 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00       
+   letter lazy           12%    96 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00       
+   RECOMMENDED          100%    49 cov0.00 R1.0   100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00        100%    97 cov1.00       
+
+## 4-chain, late conv (t=3)
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    97 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00       
+   letter lazy            0%    97 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00       
+   RECOMMENDED          100%    50 cov0.00 R1.0   100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00        100%    99 cov1.00       
+
+## stacked conversions
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   101 cov0.33         38%   147 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00       
+   letter lazy            0%    98 cov0.33 FK0.5R1.5  38%   147 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00       
+   RECOMMENDED          100%    49 cov0.00 R1.0   100%    99 cov0.33 R1.0   100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00        100%   148 cov1.00       
+
+## 4 agents on one decomposer
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    99 cov1.00          0%   148 cov1.00         25%   196 cov1.00 FK0.6  100%   199 cov1.00 FK0.6  100%   199 cov1.00 FK0.6  100%   199 cov1.00 FK0.6  100%   199 cov1.00 FK0.6 
+   letter lazy           62%    80 cov1.00 FK0.6  100%    86 cov1.00 FK1.0  100%    86 cov1.00 FK1.0  100%    86 cov1.00 FK1.0  100%    86 cov1.00 FK1.0  100%    86 cov1.00 FK1.0  100%    86 cov1.00 FK1.0 
+   RECOMMENDED          100%    64 cov1.00 R1.0   100%   111 cov1.00 R1.0   100%   157 cov1.00 R1.0   100%   162 cov1.00 FK1.0  100%   162 cov1.00 FK1.0  100%   162 cov1.00 FK1.0  100%   162 cov1.00 FK1.0 
+
+## root warned twice
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   102 cov0.00          0%   148 cov1.00        100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00       
+   letter lazy            0%   103 cov0.33 R6.0     0%   148 cov0.73 M1.0R1.1 100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00       
+   RECOMMENDED          100%    76 cov0.33        100%   110 cov0.50        100%   160 cov0.83        100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00        100%   176 cov1.00       
+
+## root executed once
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   102 cov0.00          0%   148 cov1.00          0%   202 cov1.00          0%   308 cov1.00        100%   328 cov1.00        100%   328 cov1.00        100%   328 cov1.00       
+   letter lazy            0%   103 cov0.33 R6.0     0%   148 cov0.73 M1.0R1.1   0%   170 cov1.00 FK1.0    0%   170 cov1.00 FK1.0    0%   170 cov1.00 FK1.0    0%   170 cov1.00 FK1.0    0%   170 cov1.00 FK1.0 
+   RECOMMENDED            0%    66 cov0.33 R1.0     0%   100 cov0.50 R1.0     0%   150 cov0.83 R1.0   100%   265 cov1.00        100%   328 cov1.00        100%   328 cov1.00        100%   328 cov1.00       
+
+## exec warn-loop runaway
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    99 cov0.00          0%   149 cov0.83          0%   197 cov0.83        100%   219 cov0.83        100%   219 cov0.83        100%   219 cov0.83        100%   219 cov0.83       
+   letter lazy            0%    99 cov0.17 R7.0     0%   148 cov0.56 M1.0R2.1 100%   178 cov0.83        100%   178 cov0.83        100%   178 cov0.83        100%   178 cov0.83        100%   178 cov0.83       
+   RECOMMENDED          100%    71 cov0.17 R1.0   100%   122 cov0.33 R1.0   100%   171 cov0.67 R1.0   100%   206 cov0.83        100%   206 cov0.83        100%   206 cov0.83        100%   206 cov0.83       
+
+## exec dies every time
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    98 cov0.00          0%   148 cov0.83         12%   198 cov0.83        100%   199 cov0.83        100%   199 cov0.83        100%   199 cov0.83        100%   199 cov0.83       
+   letter lazy            0%   100 cov0.17 R7.0     0%   148 cov0.56 M1.0R0.9 100%   175 cov0.83        100%   175 cov0.83        100%   175 cov0.83        100%   175 cov0.83        100%   175 cov0.83       
+   RECOMMENDED          100%    77 cov0.17 R1.0   100%   122 cov0.33 R1.0   100%   171 cov0.67 R1.0   100%   199 cov0.83        100%   199 cov0.83        100%   199 cov0.83        100%   199 cov0.83       
+
+## exec ok on 3rd agent
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    98 cov0.00          0%   149 cov0.83         38%   196 cov1.00        100%   197 cov1.00        100%   197 cov1.00        100%   197 cov1.00        100%   197 cov1.00       
+   letter lazy            0%    97 cov0.17 R7.0     0%   149 cov0.56 FK0.4M1.0R1.2 100%   179 cov0.83 FK1.0  100%   179 cov0.83 FK1.0  100%   179 cov0.83 FK1.0  100%   179 cov0.83 FK1.0  100%   179 cov0.83 FK1.0 
+   RECOMMENDED          100%    70 cov0.17 R1.0   100%   120 cov0.33 R1.0   100%   169 cov0.69 R0.9   100%   197 cov1.00        100%   197 cov1.00        100%   197 cov1.00        100%   197 cov1.00       
+
+## exec 2 warns then ok
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%   102 cov0.00          0%   148 cov0.88        100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00       
+   letter lazy            0%    99 cov0.25 R5.0     0%   149 cov0.73 M1.0R0.6 100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00       
+   RECOMMENDED          100%    78 cov0.33        100%   112 cov0.50        100%   164 cov0.83        100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00        100%   177 cov1.00       
+
+## exec ok on 2nd agent
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    98 cov0.00          0%   149 cov0.83        100%   181 cov1.00        100%   181 cov1.00        100%   181 cov1.00        100%   181 cov1.00        100%   181 cov1.00       
+   letter lazy            0%    97 cov0.17 R7.0     0%   149 cov0.60 FK0.1M1.0R1.2 100%   179 cov0.94 FK0.4  100%   179 cov0.94 FK0.4  100%   179 cov0.94 FK0.4  100%   179 cov0.94 FK0.4  100%   179 cov0.94 FK0.4 
+   RECOMMENDED          100%    70 cov0.17 R1.0   100%   119 cov0.50        100%   166 cov0.83        100%   181 cov1.00        100%   181 cov1.00        100%   181 cov1.00        100%   181 cov1.00       
+
+## root batch of 5 (overflow)
+   config                                B=100                  B=150                  B=200                  B=300                  B=500                  B=800                 B=3000
+   baseline flat81        0%    99 cov0.60          0%   152 cov0.65        100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00       
+   letter lazy           50%    95 cov0.20 M1.0R8.0   0%   145 cov0.60 R4.5   100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00       
+   RECOMMENDED          100%    53 cov0.20        100%    86 cov0.40        100%   152 cov0.80        100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00        100%   184 cov1.00       

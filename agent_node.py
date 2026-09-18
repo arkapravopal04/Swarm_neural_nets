@@ -103,8 +103,9 @@ def role_may_use_tools(role):
 
 
 # Per-role ceiling on think()'s generation, module level for the same reason
-# role_may_use_tools is: Agent._get_role_cap spends it and the orchestrator's
-# per-task energy ceiling budgets for it, and the two must not drift apart.
+# role_may_use_tools is: more than one place reads it. Changing it changes what
+# an attempt costs, so the orchestrator's RESERVE_* figures need re-fitting
+# (sims/reservation_formula/fit_quantiles.py) when it moves.
 THINK_TOKEN_CAPS = {"decomposer": 64, "executor": 128, "verifier": 64}
 DEFAULT_THINK_TOKEN_CAP = 128
 
@@ -114,12 +115,12 @@ def think_token_cap(role):
 
 
 def agent_cycle_tokens(role):
-    """Most tokens one full think() + decide() cycle can generate for this
-    role. Not an estimate: think() is a hand-rolled forward-pass loop with no
-    EOS check, so it always runs its whole cap (see Agent._get_role_cap), and
-    decide()'s payload is stopped at REPORT_MAX_NEW_TOKENS. That makes what an
-    agent may spend computable rather than sampled, which is what lets
-    Orchestrator.task_energy_ceiling be derived instead of guessed."""
+    """Tokens one think() + REPORT decide() cycle can generate for this role:
+    think() has no EOS check, so it always runs its whole cap (see
+    Agent._get_role_cap), and a REPORT is stopped at REPORT_MAX_NEW_TOKENS.
+    NOT a bound on every cycle: THINK/DIE/SPAWN decisions run to decide()'s
+    400-token max_new_tokens, so the orchestrator's energy ceiling is fitted
+    from measured spend rather than derived from this."""
     return think_token_cap(role) + _ActionPayloadStop.REPORT_MAX_NEW_TOKENS
 
 

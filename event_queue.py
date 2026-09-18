@@ -50,9 +50,13 @@ class Messenger:
         self._events = []
         return temp
 
-# orchestrator wants to peep   
+# orchestrator wants to peep
     def peek(self):
         return len(self._events)
+
+# read-only copy of what is queued, for reports that must not drain it
+    def pending(self):
+        return list(self._events)
     
 # massive help to agents
     def push_event(self, event_type: str, from_agent: str, payload: dict = None):
