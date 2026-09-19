@@ -12,6 +12,7 @@ dependencies (list of task_ids that must complete first)
 dependents (list of task_ids waiting on this one)
 in_degree (count of incomplete dependencies)
 result (populated when complete)
+parent_task_id (the task that SPAWNed this one; None on the root)
 
 
 graph_class
@@ -20,6 +21,7 @@ complete_task(task_id): mark done, decrement dependents in_degree return list of
 fail_task(task_id): mark failed, handle dependents
 get_ready_tasks(): return all tasks with in_degree == 0 and status == pending
 assign_agent(task_id, agent_id): link a task to the agent working it
+direct_children(task_id): the tasks SPAWNed for this task, by parent_task_id
 get_snapshot(): full graph state for the orchestrator
 '''
 
@@ -55,6 +57,14 @@ class TaskNode:
                                          # separate description to compare against (its
                                          # description IS the colony goal already covered
                                          # by colony.goal_embedding).
+    parent_task_id : str | None = None  # the task whose agent SPAWNed this one. Set once, in
+                                         # orchestrator._spawn_child_task; nothing rewrites it.
+                                         # NOT AgentNode.children: ColonyState.unregister_agent
+                                         # moves a retired agent's children onto its own parent,
+                                         # so an agent's `children` also holds grandchildren.
+                                         # None on the root.
+    label : str | None = None  # the "label" its SPAWN batch gave it, if any -- how the
+                               # decomposer that wrote the batch refers to it
 
 
 class TaskGraph:
@@ -96,6 +106,20 @@ class TaskGraph:
                 f"WARNING: Task '{task.task_id}' introduces a dependency cycle. "
                 f"This task graph may never fully resolve."
             )
+
+    def direct_children(self, task_id: str) -> list:
+        """The tasks SPAWNed for `task_id` itself (parent_task_id == task_id),
+        in creation order.
+
+        Read from the graph only. AgentNode.children answers a different
+        question -- which agents currently report to this one -- and after a
+        child decomposer is retired it also holds that child's children,
+        which is how run 3's root passed its own structural gate with none
+        of its three subtasks completed.
+        """
+        if not task_id:
+            return []
+        return [t for t in self.tasks.values() if t.parent_task_id == task_id]
 
     def _creates_cycle(self, start_id: str) -> bool:
         """BFS over dependents from start_id; True if we loop back to start_id."""

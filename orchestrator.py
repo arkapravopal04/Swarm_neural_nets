@@ -28,6 +28,8 @@ from agent_node import (
     Agent,
     _dedupe_repeated_sentences,
     EXEMPLAR_SUBTASK_DESCRIPTIONS,
+    EXEMPLAR_REPORT_TEXTS,
+    PROMPT_EXEMPLARS,
     role_may_use_tools,
 )
 from tools import ToolRegistry
@@ -41,6 +43,8 @@ from text_utils import (
     scrub_result,
     cut_adjacent_repeat,
     trim_degenerate_tails,
+    trim_artifact_tail,
+    is_exemplar_echo,
     asks_for_software,
     plain_register,
     software_artifact_reason,
@@ -752,6 +756,11 @@ class Orchestrator:
 
         if self.model is not None and self.tokeniser is not None:
             live_agent = Agent(self.tokeniser, self.model, self.messenger, new_agent)
+            # Read at prompt time, so a decomposer's prompt states its
+            # subtasks' current status from the graph, not from whatever
+            # child-result injections are still inside its thought window.
+            live_agent.child_status_fn = (
+                lambda tid=task_id: self._direct_child_statuses(tid))
             self.live_agents[agent_id] = live_agent
 
         return agent_id
@@ -954,7 +963,7 @@ class Orchestrator:
         """
         if not isinstance(result, str) or not result.strip() or self._looks_like_code(result):
             return result
-        kept, reasons = scrub_result(result, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS,
+        kept, reasons = scrub_result(result, exemplars=PROMPT_EXEMPLARS,
                                      grounding=self._grounding_for(task_id))
         if not reasons:
             return result
@@ -1025,7 +1034,8 @@ class Orchestrator:
         )
 
     def _spawn_child_task(self, description: str, role: str, parent_id: Optional[str],
-                           dependencies: Optional[list] = None, task_id: Optional[str] = None):
+                           dependencies: Optional[list] = None, task_id: Optional[str] = None,
+                           label: Optional[str] = None):
         if task_id is None:
             task_id = self._generate_task_id()
         full_requirements = self.spec.get("requirement", []) if self.spec else []
@@ -1035,12 +1045,19 @@ class Orchestrator:
         else:
             requirements = self._filter_requirements_for_task(description, full_requirements)
 
+        parent_node = self.colony.get_agent(parent_id) if parent_id else None
         child_node = TaskNode(
             task_id=task_id,
             description=description,
             dependencies=dependencies or [],
             required_role=role,
             requirements=requirements,
+            # The spawning agent's TASK, fixed here. parent_id is an agent id:
+            # that agent can be retired and its children handed to its own
+            # parent (ColonyState.unregister_agent). The task it was working
+            # on does not change.
+            parent_task_id=getattr(parent_node, "task_id", None),
+            label=self._short_label(label),
         )
         # N2b: embed this task's own description once, at spawn time, so
         # judge.decide's tier-2 check has a target that actually matches
@@ -1557,7 +1574,9 @@ class Orchestrator:
             return
 
         parent_node = self.colony.get_agent(parent_id)
-        has_children = bool(parent_node is not None and parent_node.has_spawned)
+        parent_task_id = getattr(parent_node, "task_id", None)
+        tally = self._direct_child_tally(parent_task_id)
+        has_completed_child = self._has_completed_direct_child(parent_task_id)
         was_capped = getattr(live_parent, "cycles_capped", False)
 
         # Two cases where releasing it to try again cannot help, so it goes
@@ -1566,15 +1585,28 @@ class Orchestrator:
         #    action; releasing it again let a batch that looks valid but
         #    starts nothing (e.g. {"subtasks": ["junk"]}) repeat forever
         #    past the cap.
-        #  * no energy, and it never had a child. Another SPAWN is refused
-        #    the same way, and there is nothing to REPORT.
+        #  * no energy, and not one of its DIRECT subtasks completed. Another
+        #    SPAWN is refused the same way, and there is nothing to REPORT:
+        #    subtasks that were all abandoned or never started leave only
+        #    [ABANDONED]/[NOT STARTED] markers, and a REPORT on those is the
+        #    decomposer describing work that never happened. Run 3's root did
+        #    exactly that with 0 of 3 subtasks completed, and was accepted.
+        #    Counted from TaskGraph.direct_children -- not has_spawned (true
+        #    once any child existed, whatever became of it), and not
+        #    AgentNode.children (grandchildren adopted from a retired child
+        #    decomposer land there).
         # `awaiting` stays set so it is not ticked before the failure event
         # is routed on the next tick.
-        if was_capped or (out_of_energy and not has_children):
-            why = (
-                "no energy left to start its subtasks" if out_of_energy
-                else "its final allowed SPAWN started no subtasks"
-            )
+        if was_capped or (out_of_energy and not has_completed_child):
+            if not out_of_energy:
+                why = "its final allowed SPAWN started no subtasks"
+            elif tally["failed"]:
+                why = (f"no energy left to start its subtasks, and none of its "
+                       f"{tally['failed']} earlier subtask(s) completed")
+            else:
+                why = "no energy left to start its subtasks"
+            if out_of_energy and not has_completed_child:
+                self.colony.record_verdict("spawn_refused_no_completed_child")
             print(f"  [handle_spawn] {parent_id}'s SPAWN started no subtasks "
                   f"and it cannot usefully retry ({why}) -- routing to failure.")
             if parent_node is not None:
@@ -1595,7 +1627,11 @@ class Orchestrator:
               f"releasing it from awaiting instead of leaving it to hang.")
         if out_of_energy:
             # Asking for a corrected batch would only be refused again. Only
-            # reached with finished children, so REPORT is on its menu.
+            # reached with at least one DIRECT subtask completed (status 2):
+            # every out-of-energy case without one took the fail branch
+            # above. So REPORT is on its menu and there is something real to
+            # put in it; the YOUR SUBTASKS block in its prompt says which
+            # subtasks completed and which did not.
             # Closed structurally, not just in the fail_reason: think() never
             # sees that text (it continues its KV cache) and decide() still
             # offered SPAWN, so the same batch came back at full think cost
@@ -1604,8 +1640,8 @@ class Orchestrator:
             live_parent.fail_reason = (
                 "SPAWN Action Failed: none of your requested subtasks were "
                 "started because the colony is out of energy to start new "
-                "agents. Do not SPAWN again. REPORT what your finished "
-                "children produced, or DIE if there is nothing."
+                "agents. Do not SPAWN again. REPORT what your completed "
+                "subtasks produced, and say plainly which did not complete."
             )
             if hasattr(live_parent, "spawn_closed"):
                 live_parent.spawn_closed = True
@@ -1787,6 +1823,7 @@ class Orchestrator:
                     parent_id=parent_id,
                     dependencies=resolved_deps,
                     task_id=task_id,
+                    label=sub.get("label"),
                 )
                 if cap is not None and i >= cap:
                     # Queued rather than spawned now. NOTE (known edge case,
@@ -1903,21 +1940,113 @@ class Orchestrator:
         live_parent.awaiting = None
 
     def _open_child_task_ids(self, parent_id: str) -> list:
-        """Task ids of this agent's children that are pending or running,
-        plus overflow subtasks queued for it but not spawned yet."""
+        """Task ids still IN FLIGHT under this agent -- status 0 (pending) or
+        1 (running) -- plus overflow subtasks queued for it but not spawned.
+
+        "Open" means "may still send this agent a parent_notification", and
+        nothing more. A child that is not open is CLOSED, and closed is
+        either completed (2) or failed / abandoned / never started (3). So
+        "no open children" does NOT mean "the children succeeded": anything
+        that needs to know whether something succeeded reads
+        _direct_child_tally's `completed`, as the SPAWN-refusal fail
+        predicate does. Status 3 stays closed rather than open on purpose --
+        counted as open, a decomposer would wait forever on a child that
+        will never report again.
+
+        Two sources, unioned, so this and the fail predicate cannot disagree
+        about a direct child:
+          * the agent's task's direct children (TaskGraph.direct_children),
+            the view the fail predicate counts;
+          * the agent-level `children` list, which also holds grandchildren
+            adopted when a child decomposer was retired
+            (ColonyState.unregister_agent). Those report to this agent now,
+            so it keeps waiting on them as before.
+        A direct child from an earlier agent on the same task cannot be open
+        here: a decomposer is never ticked -- so cannot REPORT or DIE --
+        while a child is open, so its successor starts after they closed.
+        """
         open_ids = []
         parent = self.colony.get_agent(parent_id)
         if parent is not None:
+            for child in self.task_graph.direct_children(parent.task_id):
+                if child.status in (0, 1):
+                    open_ids.append(child.task_id)
             for child_id in parent.children:
                 child = self.colony.get_agent(child_id)
                 if child is None:
                     continue
                 task = self.task_graph.tasks.get(child.task_id)
-                if task is not None and task.status in (0, 1):
+                if (task is not None and task.status in (0, 1)
+                        and child.task_id not in open_ids):
                     open_ids.append(child.task_id)
         for queued in self.pending_overflow.get(parent_id) or []:
             open_ids.append(queued.get("task_id"))
         return open_ids
+
+    def _direct_child_tally(self, task_id: Optional[str]) -> Dict[str, int]:
+        """How this task's DIRECT children stand: open (status 0/1),
+        completed (2), failed (3: abandoned, never started, or failed by a
+        cascade). The three always add up to len(direct_children)."""
+        tally = {"open": 0, "completed": 0, "failed": 0}
+        for child in self.task_graph.direct_children(task_id):
+            if child.status in (0, 1):
+                tally["open"] += 1
+            elif child.status == 2:
+                tally["completed"] += 1
+            else:
+                tally["failed"] += 1
+        return tally
+
+    def _has_completed_direct_child(self, task_id: Optional[str]) -> bool:
+        """The one predicate shared by the SPAWN-refusal fail branch and the
+        decomposer REPORT gate: did at least one DIRECT subtask complete?"""
+        return self._direct_child_tally(task_id)["completed"] > 0
+
+    def _direct_child_status_label(self, child: TaskNode) -> str:
+        if child.status == 2:
+            return "completed"
+        if child.status == 1:
+            return "running"
+        if child.status == 0:
+            return "pending"
+        if child.task_id in self.unstarted_tasks:
+            return "not started"
+        if child.task_id in self.abandoned_tasks:
+            return "abandoned"
+        return "failed"
+
+    # How much of a completed subtask's result the YOUR SUBTASKS block shows.
+    # Enough to name what it decided; the full result is in the injection.
+    CHILD_EXCERPT_CHARS = 140
+
+    @staticmethod
+    def _short_label(label) -> Optional[str]:
+        """A SPAWN label worth showing back to its decomposer: a short
+        string. Anything else (missing, a dict, a paragraph) is dropped."""
+        if label is None or isinstance(label, (dict, list)):
+            return None
+        label = " ".join(str(label).split())
+        return label if 0 < len(label) <= 40 else None
+
+    def _direct_child_statuses(self, task_id: Optional[str]) -> list:
+        """One row per DIRECT child of this task, read fresh from the graph:
+        what Agent.child_status_fn hands a decomposer's prompt, so what it is
+        told about its subtasks never depends on which injections are still
+        inside its 500-character thought window -- run 3's root decided with
+        all three [ABANDONED] injections pushed out of it."""
+        rows = []
+        for child in self.task_graph.direct_children(task_id):
+            status = self._direct_child_status_label(child)
+            excerpt = None
+            if status == "completed" and child.result:
+                excerpt = " ".join(str(child.result).split())
+                if len(excerpt) > self.CHILD_EXCERPT_CHARS:
+                    excerpt = excerpt[:self.CHILD_EXCERPT_CHARS].rstrip() + "..."
+            rows.append({"task": child.description or child.task_id,
+                         "status": status,
+                         "label": child.label,
+                         "excerpt": excerpt})
+        return rows
 
     def handle_completion(self, event: Event):
         """PROMOTE: Routes completed results to parents, unblocks tasks, or triggers synthesizer."""
@@ -1988,6 +2117,37 @@ class Orchestrator:
                       f"{len(str(result))} -> {len(trimmed)} chars before judging.")
                 result = trimmed
 
+        # The prompt's own worked example handed back as the answer. It is
+        # domain-free by design, so it answers nothing: run 3 got it back as
+        # agent_8d992982's whole REPORT, which was stopped only because tier 2
+        # happened to run on its 14 words -- at 12 or fewer, or from a
+        # decomposer, tier 2 is skipped and tier 3 alone would have read it.
+        # Rejected here whatever the length or role, before the judge and
+        # before last_partial_result, so it is never salvaged for a parent
+        # either. Reads the untrimmed payload, like the check below. A REPORT
+        # that quotes the example and then gives its own answer is not
+        # rejected: the promotion scrub cuts the quoted sentence out of it.
+        # The worked REPORT only: an echoed SPAWN placeholder still goes to
+        # the judge, and the promotion scrub marks it if it gets that far.
+        echo_agent = self.colony.get_agent(agent_id)
+        if echo_agent is not None and is_exemplar_echo(payload.get("result"),
+                                                       EXEMPLAR_REPORT_TEXTS):
+            self.colony.record_verdict("report_exemplar_echo_rejected")
+            print(f"REJECT (structural) on {agent_id}/{task_id}: the REPORT is the "
+                  f"prompt's own worked example, not an answer -- rejected before "
+                  f"the judge.")
+            echo_agent.fail_reason = (
+                "Previous attempt was REJECTED: your REPORT repeated the example "
+                "answer from the instructions instead of answering your task. "
+                "That example is not about your task. REPORT your own answer to "
+                "YOUR task, in your own words."
+            )
+            self._kill_and_respawn(
+                agent_id, task_id, echo_agent.role, echo_agent.parent_id,
+                verdict={"verdict": "execute", "reason": echo_agent.fail_reason},
+            )
+            return
+
         # Software framing: a REPORT that is a file list, a function or a
         # made-up checksum on a project that never asked for software is not
         # an answer to it, however well the judge's similarity score rates
@@ -2022,47 +2182,62 @@ class Orchestrator:
             )
             return
 
+        agent_node = self.colony.get_agent(agent_id)
+
+        # FIX (root-acceptance bug, widened to every decomposer): a
+        # decomposer's answer is its children's work rolled up. With not one
+        # DIRECT subtask completed there is nothing to roll up, so the REPORT
+        # is the decomposer answering the task itself -- rejected
+        # structurally, before the judge and its expensive tier-3 critique,
+        # and respawned rather than allowed to fall through as a "result".
+        #
+        # On every path, not only at the end of a run: Agent.final_actions
+        # withholds REPORT from a decomposer with nothing completed once it
+        # is capped or SPAWN-closed, but a decomposer woken by its last
+        # child's abandonment still has REPORT on its ordinary menu, and only
+        # tier 3 read what it wrote. It also covers a decomposer that never
+        # spawned at all, including an executor converted by TASK TOO LARGE.
+        #
+        # Same predicate as the SPAWN-refusal fail branch, over
+        # TaskGraph.direct_children: AgentNode.children holds grandchildren
+        # adopted from retired child decomposers, which is how run 3's root
+        # passed the old root-only version of this gate with 0 of its 3
+        # subtasks completed.
+        #
+        # Checked BEFORE last_partial_result below, like the two checks
+        # above: recorded first, a task later abandoned would hand its parent
+        # exactly the text rejected here as its salvaged answer.
+        if (agent_node is not None and agent_node.role == "decomposer"
+                and not self._has_completed_direct_child(task_id)):
+            is_root = task_id == self.root_task_id
+            self.colony.record_verdict("decomposer_report_no_completed_child")
+            print(f"REJECT (structural) on {agent_id}/{task_id}: "
+                  f"{'root ' if is_root else ''}decomposer REPORTed with no "
+                  f"completed subtasks -- a decomposer submits what its "
+                  f"children produced, it does not answer the task itself.")
+            agent_node.fail_reason = (
+                "Previous attempt was REJECTED: you REPORTed a final answer "
+                "directly instead of decomposing the task. As the ROOT "
+                "decomposer (generation 0) your job is to SPAWN subtasks, "
+                "not answer the question yourself."
+                if is_root else
+                "Previous attempt was REJECTED: you REPORTed an answer of your "
+                "own, but none of your subtasks completed, so there were no "
+                "results to combine. SPAWN the work as subtasks, or DIE if it "
+                "cannot be decomposed."
+            )
+            self._kill_and_respawn(
+                agent_id, task_id, agent_node.role, agent_node.parent_id,
+                verdict={"verdict": "execute", "reason": agent_node.fail_reason},
+            )
+            return
+
         # Remembered whatever the judge decides next: if this task is later
         # abandoned by the attempt cap, this is the salvage value handed to
         # the parent. Recorded before judging on purpose -- a rejected
         # REPORT is still more than nothing.
         if result and task_id:
             self.last_partial_result[task_id] = str(result)
-
-        agent_node = self.colony.get_agent(agent_id)
-
-        # FIX (root-acceptance bug): a generation-0 decomposer's contract is
-        # to SPAWN, not to answer the goal itself. A REPORT on the root task
-        # with no completed children means it skipped decomposition entirely
-        # -- reject it structurally, before the judge (and its expensive
-        # tier-3 critique) ever sees it, and force a respawn instead of
-        # letting it fall through as a "result".
-        if (task_id == self.root_task_id and agent_node is not None
-                and agent_node.role == "decomposer" and agent_node.generation == 0):
-            has_completed_child = False
-            for child_id in agent_node.children:
-                child_agent = self.colony.get_agent(child_id)
-                if child_agent is None:
-                    continue
-                child_task = self.task_graph.tasks.get(child_agent.task_id)
-                if child_task is not None and child_task.status == 2:
-                    has_completed_child = True
-                    break
-            if not has_completed_child:
-                print(f"REJECT (structural) on {agent_id}/{task_id}: root decomposer "
-                      f"REPORTed with no completed children -- a generation-0 "
-                      f"decomposer must SPAWN, not answer the goal directly.")
-                agent_node.fail_reason = (
-                    "Previous attempt was REJECTED: you REPORTed a final answer "
-                    "directly instead of decomposing the task. As the ROOT "
-                    "decomposer (generation 0) your job is to SPAWN subtasks, "
-                    "not answer the question yourself."
-                )
-                self._kill_and_respawn(
-                    agent_id, task_id, agent_node.role, agent_node.parent_id,
-                    verdict={"verdict": "execute", "reason": agent_node.fail_reason},
-                )
-                return
 
         verdict = {"verdict": "promote", "reason": "no judge configured"}
         if self.judge is not None and agent_node is not None:
@@ -2334,6 +2509,9 @@ class Orchestrator:
                     final_answer = self.synthesizer.run(
                         self.colony, self.task_graph, goal_text, root_task_id=self.root_task_id
                     )
+                    # Read by terminate()'s partial banner: this answer is a
+                    # synthesis, not the root agent's raw REPORT.
+                    self._final_spec_synthesized = True
                 except Exception:
                     print(f"Warning: Synthesizer failed on root completion -- "
                           f"falling back to the raw agent result instead of crashing.\n"
@@ -2528,6 +2706,32 @@ class Orchestrator:
         self.colony.unregister_agent(agent_id)
         return ghost_context
 
+    def _note_root_cache_lookup(self, task_node, task_id: str) -> None:
+        """Count a root cache lookup that was not served, and say whether an
+        accepted entry WOULD have completed the root had it been.
+
+        The probe is read-only -- get_success_cache queries the index and
+        builds a result, writing nothing -- and it deliberately touches none
+        of the cache's own counters: those belong to the serving path above,
+        where they keep counting only lookups that could actually serve.
+        """
+        self.colony.record_verdict("root_cache_lookup_skipped")
+        try:
+            lookup = self.memory_store.get_success_cache(task_node.description,
+                                                         task_id=task_id)
+        except Exception:
+            print(f"Warning: root success-cache probe failed for {task_id}:\n"
+                  f"{traceback.format_exc()}")
+            return
+        hit = getattr(lookup, "hit", None)
+        if hit is None or hit.get("outcome") != CACHE_OUTCOME_ACCEPTED:
+            return
+        self.colony.record_verdict("root_cache_hit_withheld")
+        print(f"  [success-cache] {task_id} is the ROOT: an accepted entry "
+              f"(donor {hit.get('task_id')}, score "
+              f"{getattr(lookup, 'hit_score', 0.0):.2f}) would have completed it "
+              f"-- withheld. The root is never completed from the cache.")
+
     def _kill_and_respawn(self, agent_id: str, task_id: Optional[str], role: str,
                            parent_id: Optional[str], verdict: Optional[Dict[str, Any]] = None,
                            count_attempt: bool = True):
@@ -2549,7 +2753,18 @@ class Orchestrator:
         task_node = self.task_graph.tasks.get(task_id)
         if count_attempt:
             self._write_cache_outcome(task_node, task_id, None, self._cache_outcome(verdict))
-        if self.memory_store is not None and task_node is not None:
+        if (self.memory_store is not None and task_node is not None
+                and task_id == self.root_task_id):
+            # The root is never completed from the cache. Serving it here
+            # would end the run on a donor task's answer with no synthesis at
+            # all: handle_completion's root branch is the only caller of the
+            # synthesizer and is not on this path, so
+            # colony.results["final_spec"] stays empty and terminate() ships
+            # the cached string whole. A root that fails, fails. This path
+            # became reachable when the SPAWN-refusal fail branch started
+            # routing a root whose subtasks all failed down the DIE path.
+            self._note_root_cache_lookup(task_node, task_id)
+        elif self.memory_store is not None and task_node is not None:
             lookup = self.memory_store.get_success_cache(task_node.description,
                                                          task_id=task_id)
             cached = getattr(lookup, "hit", None)
@@ -3385,6 +3600,11 @@ class Orchestrator:
             print(f"      of which cross-task donor : {verdicts.get('cache_hit_served_cross_task', 0)}")
             print(f"    misses on a negative match  : {verdicts.get('cache_miss_negative_match', 0)}")
             print(f"    cross-task below threshold  : {verdicts.get('cache_cross_task_below_threshold', 0)}")
+            # The root is never served from the cache (see
+            # _note_root_cache_lookup). The second line is what a hit would
+            # have completed the run with, had it been allowed to.
+            print(f"    root lookups not served     : {verdicts.get('root_cache_lookup_skipped', 0)}")
+            print(f"      would have hit            : {verdicts.get('root_cache_hit_withheld', 0)}")
 
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
             # Read these three together. "decisions at the cap" is the number
@@ -3428,6 +3648,12 @@ class Orchestrator:
                 print(f"      SPAWN batches rejected : {verdicts.get('software_framing_spawn_rejected', 0)}")
                 print(f"      REPORTs rejected       : {verdicts.get('software_framing_report_rejected', 0)}")
                 print(f"      DIE reasons withheld   : {verdicts.get('software_framing_die_scrubbed', 0)}")
+
+            print(chr(10) + "  STRUCTURAL REJECTS (caught before the judge)")
+            print(f"    decomposer REPORT, no completed subtask : "
+                  f"{verdicts.get('decomposer_report_no_completed_child', 0)}")
+            print(f"    REPORT was the prompt's worked example  : "
+                  f"{verdicts.get('report_exemplar_echo_rejected', 0)}")
 
             print("\n  RESPAWNS (top 10 by count)")
             respawns = getattr(self, "respawn_counts", {}) or {}
@@ -3513,6 +3739,8 @@ class Orchestrator:
                                ("respawns refused", "admission_respawn_refused"),
                                ("root refused at bootstrap", "admission_root_refused"),
                                ("SPAWN closed (no energy)", "spawn_closed_no_energy"),
+                               ("SPAWN refused, no subtask completed",
+                                "spawn_refused_no_completed_child"),
                                ("overflow dropped, parent retired", "overflow_dropped_parent_retired")):
                 print(f"    {label:<35}: {verdicts.get(key, 0)}")
 
@@ -3535,6 +3763,13 @@ class Orchestrator:
             if task_id != self.root_task_id and task.result is not None:
                 parts.append(str(task.result))
         return "\n".join(parts)
+
+    # trim_artifact_tail's reason -> the verdict counter it bumps.
+    _ARTIFACT_VERDICTS = {
+        "code fence": "final_answer_artifact_fence",
+        "JSON tail": "final_answer_artifact_json",
+        "separator run": "final_answer_artifact_separator",
+    }
 
     def _guard_final_answer(self, best_result):
         """The last check between a collapsed decode and the user.
@@ -3567,12 +3802,34 @@ class Orchestrator:
         # fallback exits no dirtier than a synthesis would have.
         kept, reason = cut_adjacent_repeat(best_result)
         reasons = [reason] if reason else []
-        kept, reason = degeneracy_cut(kept, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS)
+        kept, reason = degeneracy_cut(kept, exemplars=PROMPT_EXEMPLARS)
         if reason:
             reasons.append(reason)
         if kept.strip():
             kept, tail_reasons = trim_degenerate_tails(kept, self._final_answer_grounding())
             reasons += tail_reasons
+        # Scaffold artifacts: a code fence, a JSON object tail, a separator
+        # run. None of the passes above keys on them -- run 3's answer ended
+        # "--- --- --- ----", an unterminated ```json fence and a JSON copy
+        # of its own first sentence, with every counter here at 0. Fences
+        # and JSON stay when the user asked for software.
+        if kept.strip():
+            raw_text = (getattr(self, "spec", None) or {}).get("raw_text")
+            kept, artifact_reasons = trim_artifact_tail(
+                kept, allow_code=bool(raw_text) and asks_for_software(raw_text))
+            for artifact in artifact_reasons:
+                self.colony.record_verdict(self._ARTIFACT_VERDICTS[artifact])
+            reasons += artifact_reasons
+        # The walk-back again, now that something was cut. It used to run
+        # only on the raw decode, before any cut, and a cut can end the text
+        # on an unfinished sentence: a line-boundary cut, a mid-line
+        # scaffolding cut, or an artifact welded onto a sentence stump.
+        if reasons and kept.strip():
+            walked = drop_incomplete_tail(kept)
+            if walked != kept:
+                self.colony.record_verdict("final_answer_incomplete_tail_after_cut")
+                reasons.append("an unfinished sentence the cut exposed")
+                kept = walked
         if not reasons:
             return best_result
 
@@ -3628,15 +3885,24 @@ class Orchestrator:
             ("synthesis empty after its cut     ", trims.get("empty", 0)),
             ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
             ("synthesis shipped made-up metrics ", trims.get("shipped_telemetry", 0)),
+            ("synthesis stump walked back       ", trims.get("incomplete_tail_after_cut", 0)),
             ("returned answer cut on the way out", verdicts.get("final_answer_cut", 0)),
             ("returned answer empty after cut   ",
              verdicts.get("final_answer_empty_after_cut", 0)),
+            ("  code fence cut                  ", verdicts.get("final_answer_artifact_fence", 0)),
+            ("  JSON tail cut                   ", verdicts.get("final_answer_artifact_json", 0)),
+            ("  separator run cut               ",
+             verdicts.get("final_answer_artifact_separator", 0)),
+            ("  stump walked back after a cut   ",
+             verdicts.get("final_answer_incomplete_tail_after_cut", 0)),
+            ("partial banner attached           ", verdicts.get("final_answer_partial_banner", 0)),
+            ("  on a SUCCESS run                ", verdicts.get("partial_banner_on_success", 0)),
         )
         if not any(count for _, count in rows):
             return
         print("\n  FINAL ANSWER GUARDS (degeneracy reaching the user)")
         for label, count in rows:
-            print(f"    {label} : {count}")
+            print(f"    {label.ljust(34)} : {count}")
 
     def terminate(self) -> Any:
         """
@@ -3669,6 +3935,12 @@ class Orchestrator:
         if is_successful:
             print("System Status: TERMINATED [SUCCESS]")
             print("The root task successfully completed and synthesized.")
+            if self.abandoned_tasks:
+                # Both at once: the root was accepted, and some of the work
+                # under it was not done. Said here and in the answer itself.
+                print(f"PARTIAL: {len(self.abandoned_tasks)} subtask(s) were "
+                      f"abandoned -- the returned answer carries the "
+                      f"[PARTIAL RESULT] banner.")
         elif self.hit_tick_ceiling:
             print("System Status: TERMINATED [TICK CEILING]")
             print(f"The colony ran {self.tick_count} ticks without converging and "
@@ -3720,6 +3992,11 @@ class Orchestrator:
         self._write_energy_trace(outcome)
 
         best_result = self.colony.results.get("final_spec")
+        # The success path's final_spec is a synthesis unless the synthesizer
+        # was missing or raised (handle_completion then stores the root's own
+        # REPORT); the partial path below always is one.
+        synthesized = is_successful and getattr(self, "_final_spec_synthesized", False)
+        partial_synthesis = False
 
         if not best_result and not is_successful and self.synthesizer is not None:
             try:
@@ -3734,20 +4011,8 @@ class Orchestrator:
             if partial_results:
                 goal_text = self.spec.get("goal", "") if self.spec else ""
                 try:
-                    partial_answer = self.synthesizer.format_output(partial_results, goal_text)
-                    cause = (
-                        "one or more subtasks were abandoned ("
-                        + ", ".join(sorted(set(self.abandon_reasons.values())))
-                        + ")"
-                        if self.abandoned_tasks
-                        else "the colony ran out of its energy budget"
-                    )
-                    best_result = (
-                        f"[PARTIAL RESULT -- {cause} before every subtask "
-                        f"finished. {len(partial_results)} subtask(s) completed "
-                        f"and are synthesized below; anything not mentioned was "
-                        f"not reached.]\n\n{partial_answer}"
-                    )
+                    best_result = self.synthesizer.format_output(partial_results, goal_text)
+                    synthesized = partial_synthesis = True
                 except Exception as e:
                     print(f"Warning: failed synthesizing partial result: {e}")
 
@@ -3769,8 +4034,46 @@ class Orchestrator:
                 best_result = self.colony.results
 
         best_result = self._guard_final_answer(best_result)
+        # After the guard, so its cuts never reach into the banner and an
+        # answer cut to nothing is judged on the answer, not on the banner.
+        # Any run with abandoned subtasks gets it, whatever its status: run 3
+        # was SUCCESS with 8 abandoned, all three of the root's subtasks among
+        # them, and its answer carried no sign of it.
+        if partial_synthesis or self.abandoned_tasks:
+            best_result = self._with_partial_banner(best_result, is_successful, synthesized)
         self._print_final_answer_report()
         return best_result
+
+    def _with_partial_banner(self, answer, is_successful: bool, synthesized: bool):
+        """`answer` under the [PARTIAL RESULT] banner. Left alone when it is
+        not a string, or when no subtask completed -- the answer is then
+        already an explicit no-result message, and a banner promising
+        completed subtasks below it would be false."""
+        if not isinstance(answer, str) or not answer.strip():
+            return answer
+        completed = sum(
+            1 for task_id, task in self.task_graph.tasks.items()
+            if task_id != self.root_task_id and task.status == 2 and task.result is not None
+        )
+        if not completed:
+            return answer
+        cause = (
+            "one or more subtasks were abandoned ("
+            + ", ".join(sorted(set(self.abandon_reasons.values())))
+            + ")"
+            if self.abandoned_tasks
+            else "the colony ran out of its energy budget"
+        )
+        below = ("are synthesized below" if synthesized
+                 else "the answer below is the colony's own final report")
+        self.colony.record_verdict("final_answer_partial_banner")
+        if is_successful:
+            self.colony.record_verdict("partial_banner_on_success")
+        return (
+            f"[PARTIAL RESULT -- {cause} before every subtask finished. "
+            f"{completed} subtask(s) completed and {below}; anything not "
+            f"mentioned was not reached.]\n\n{answer}"
+        )
 
     def run(self, problem_spec: str) -> Any:
         """

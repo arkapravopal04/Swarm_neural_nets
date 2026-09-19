@@ -175,6 +175,22 @@ EXEMPLAR_SUBTASK_DESCRIPTIONS = (
     _EX_FINAL_ABC,
 )
 
+# The prompt's one worked REPORT (see _get_format_example). Domain-free on
+# purpose, which also means a copy of it is never an answer to anything: run
+# 3 got it back as REPORT content three times, once as a whole REPORT
+# (agent_8d992982). Defined here, like the SPAWN placeholders, so the echo
+# checks read the exact string the prompt prints.
+_EX_WORKED_REPORT = ("Both options meet every constraint, and the second costs "
+                     "less, so choose the second.")
+EXEMPLAR_REPORT_TEXTS = (_EX_WORKED_REPORT,)
+
+# Every piece of example CONTENT the prompt shows: what degeneracy_cut's
+# exemplar pass cuts at. The whole-REPORT reject in
+# orchestrator.handle_completion matches EXEMPLAR_REPORT_TEXTS only, and
+# copied SPAWN descriptions are still judged against
+# EXEMPLAR_SUBTASK_DESCRIPTIONS alone (orchestrator._matching_exemplar).
+PROMPT_EXEMPLARS = EXEMPLAR_SUBTASK_DESCRIPTIONS + EXEMPLAR_REPORT_TEXTS
+
 
 class _ActionPayloadStop(StoppingCriteria):
     """
@@ -402,6 +418,13 @@ class Agent:
         # per refused batch until the cycle cap. Once set it is on the
         # capped path immediately: no think(), REPORT/DIE only.
         self.spawn_closed = False
+        # Set by the orchestrator when it creates this agent (spawn_agent):
+        # returns this agent's task's DIRECT subtasks, read fresh from the
+        # task graph on every call, as [{"task", "status", ...}] with status
+        # one of completed / running / pending / abandoned / not started /
+        # failed. None -- a bare Agent, as in tests -- means no colony view,
+        # and then nothing is claimed about the subtasks at all.
+        self.child_status_fn = None
         # Set by decide() when the cap forced a different action than the
         # model chose; the orchestrator reads it after run() to tally it.
         self.cap_coerced_last_run = False
@@ -442,6 +465,29 @@ class Agent:
         return (self.role == "decomposer" and not self.spawn_closed
                 and not getattr(self.node, "has_spawned", False))
 
+    def _direct_child_statuses(self):
+        """child_status_fn's rows, or None when there is no colony view."""
+        if self.child_status_fn is None:
+            return None
+        try:
+            return list(self.child_status_fn() or [])
+        except Exception:
+            return None
+
+    @property
+    def _decomposer_without_completed_child(self):
+        """A decomposer that has spawned, whose direct subtasks are all
+        closed with not one completed. Its children were all abandoned or
+        never started, so a REPORT from it can only describe work that did
+        not happen. False without a colony view."""
+        if self.role != "decomposer" or not getattr(self.node, "has_spawned", False):
+            return False
+        children = self._direct_child_statuses()
+        if children is None:
+            return False
+        return not any(c.get("status") in ("completed", "running", "pending")
+                       for c in children)
+
     @property
     def final_actions(self):
         """The whole menu once final_only. A decomposer that has not
@@ -449,10 +495,72 @@ class Agent:
         structurally rejected (root) or its own planning notes judged as a
         subtask's answer (non-root). Once its children exist the
         orchestrator only runs it after all of them finish, so REPORT is
-        then the real roll-up."""
+        then the roll-up -- provided at least one of them completed. If
+        none did, there is nothing to roll up, and DIE is the whole menu."""
         if self._decomposer_awaiting_first_spawn:
             return ("SPAWN", "DIE")
+        if self._decomposer_without_completed_child:
+            return ("DIE",)
         return ("REPORT", "DIE")
+
+    @staticmethod
+    def _child_status_block(children):
+        """The decomposer's subtasks as the colony recorded them, one line
+        each: label, status and, for a completed one, the start of its
+        result. Built from child_status_fn at prompt time and rendered
+        outside YOUR PREVIOUS THOUGHTS, so it is not subject to that
+        section's 500-character window -- where a 64-token think and one
+        [earlier choice: SPAWN] record were enough to push run 3's three
+        [ABANDONED] child results out of the root's sight."""
+        if not children:
+            return ""
+        lines = []
+        for c in children:
+            task = " ".join(str(c.get("task") or "").split())
+            if len(task) > 70:
+                task = task[:67] + "..."
+            label = f"{c['label']} " if c.get("label") else ""
+            line = f'- {label}"{task}": {c.get("status")}'
+            if c.get("excerpt"):
+                line += f" -- {c['excerpt']}"
+            lines.append(line)
+        return (
+            "[YOUR SUBTASKS -- their status as the colony recorded it. This is "
+            "a record, not your notes: only a subtask marked completed "
+            "produced a result you can report.]\n"
+            + "\n".join(lines)
+            + "\n[END OF YOUR SUBTASKS]\n"
+        )
+
+    def _decomposer_final_rule(self, children):
+        """The role rule for a decomposer at the end of its run, stating what
+        its subtasks actually did. It used to say "your subtasks are finished
+        and their results are in your previous thoughts" whatever had
+        happened -- run 3's root read that with all three of its subtasks
+        abandoned and REPORTed a finished pipeline."""
+        tail = ("Do not create new subtasks and do not solve anything your "
+                "children did not.\n")
+        if children is None:
+            return ("CRITICAL RULE: whatever your subtasks produced is in your "
+                    "previous thoughts. Your ONLY job now is to combine those "
+                    "results for your parent and state plainly what they did "
+                    "not cover. " + tail)
+        completed = sum(1 for c in children if c.get("status") == "completed")
+        others = {}
+        for c in children:
+            if c.get("status") != "completed":
+                others[c.get("status")] = others.get(c.get("status"), 0) + 1
+        others_str = ", ".join(f"{n} {status}" for status, n in others.items())
+        if not completed:
+            return (f"CRITICAL RULE: none of your {len(children)} subtask(s) "
+                    f"completed{' (' + others_str + ')' if others_str else ''}, "
+                    f"so there are no results to combine and nothing to "
+                    f"report. " + tail)
+        return (f"CRITICAL RULE: {completed} of your {len(children)} subtask(s) "
+                f"completed{'; the rest: ' + others_str if others_str else ''}. "
+                f"YOUR SUBTASKS below lists which. Your ONLY job now is to "
+                f"combine those results for your parent and state plainly "
+                f"which subtasks did not complete. " + tail)
 
     @property
     def _role_may_tool(self):
@@ -549,7 +657,7 @@ class Agent:
         except Exception:
             return []
 
-    def _get_format_example(self, available_tools=None, final_only=False):
+    def _get_format_example(self, available_tools=None, final_only=False, die_only=False):
         examples = {
             "decomposer": (
                 'ACTION: SPAWN\n'
@@ -562,7 +670,7 @@ class Agent:
             # subject, so it says nothing about what kind of answer to give.
             "verifier": (
                 'ACTION: REPORT\n'
-                'PAYLOAD: Both options meet every constraint, and the second costs less, so choose the second.'
+                'PAYLOAD: ' + _EX_WORKED_REPORT
             ),
             "executor": (
                 'ACTION: TOOL\n'
@@ -584,9 +692,16 @@ class Agent:
 
         if final_only:
             # Cycle cap reached with a REPORT/DIE menu, so the only worked
-            # example is a REPORT -- no SPAWN batches, no tool reference.
+            # example is a REPORT -- no SPAWN batches, no tool reference. A
+            # decomposer none of whose subtasks completed has DIE alone, and
+            # a worked REPORT would contradict that menu.
+            valid = (
+                'ACTION: DIE\nPAYLOAD: None of my subtasks completed, so there '
+                'is no result to report.'
+                if die_only else examples['verifier']
+            )
             return (
-                f"Example of a VALID response:\n{examples['verifier']}\n\n"
+                f"Example of a VALID response:\n{valid}\n\n"
                 f"Example of an INVALID response (do NOT do this -- free-form "
                 f"reasoning with no ACTION: line is never an acceptable output):\n"
                 f"<free-form reasoning with no ACTION: line -- placeholder, not a task>\n\n"
@@ -943,6 +1058,11 @@ class Agent:
         )
         format_example_str = self._get_format_example(available_tools)
         role_constraint_str = self._get_role_constraint_str(available_tools)
+        # What the colony recorded about this decomposer's direct subtasks,
+        # fetched once so the role rule, the menu and the YOUR SUBTASKS block
+        # below all state the same thing. None without a colony view.
+        child_statuses = self._direct_child_statuses() if self.role == "decomposer" else None
+        child_status_str = self._child_status_block(child_statuses)
 
         # Circuit breaker open: TOOL is refused by request_tool anyway, so
         # advertising it here only invites another wasted decide() cycle that
@@ -1039,18 +1159,22 @@ class Agent:
             else:
                 spawn_action_line = spawn_format_line = ""
                 if self.role == "decomposer":
-                    role_constraint_str = (
-                        "CRITICAL RULE: your subtasks are finished and their "
-                        "results are in your previous thoughts. Your ONLY job "
-                        "now is to combine those results for your parent. Do "
-                        "not create new subtasks and do not solve anything "
-                        "your children did not.\n"
+                    role_constraint_str = self._decomposer_final_rule(child_statuses)
+                die_only = self._decomposer_without_completed_child
+                if die_only:
+                    # final_actions is ("DIE",): the REPORT lines go too, so
+                    # the menu, the rule above and the example all agree.
+                    report_action_line = report_format_line = ""
+                    think_cap_str = (
+                        "[NOTHING TO REPORT -- none of your subtasks completed. "
+                        "You must finish now: DIE, and say that no subtask "
+                        "completed.]\n"
                     )
-                if self.spawn_closed and not self.cycles_capped:
+                elif self.spawn_closed and not self.cycles_capped:
                     think_cap_str = (
                         "[NO ENERGY FOR NEW SUBTASKS -- SPAWN is closed. You "
-                        "must finish now: REPORT what your finished children "
-                        "produced (state plainly what was not covered), or DIE "
+                        "must finish now: REPORT what your completed subtasks "
+                        "produced (state plainly which did not complete), or DIE "
                         "if there is nothing usable.]\n"
                     )
                 else:
@@ -1060,14 +1184,15 @@ class Agent:
                         f"finish now: REPORT your best result (state plainly anything "
                         f"you could not work out), or DIE if you have nothing usable.]\n"
                     )
-                format_example_str = self._get_format_example(available_tools, final_only=True)
+                format_example_str = self._get_format_example(
+                    available_tools, final_only=True, die_only=die_only)
 
         prompt = f"""You are an AI agent in a colony of agents working together to solve problems.
 Your Agent ID: {self.agent_id}
 Your Role: {self.role}
 {role_constraint_str}Your Task: {self.task}
 
-{requirements_str}{ghost_str}{fail_str}{tool_result_str}{thoughts_str}{think_cap_str}
+{requirements_str}{ghost_str}{fail_str}{tool_result_str}{thoughts_str}{child_status_str}{think_cap_str}
 Available actions:
 {think_action_line}{spawn_action_line}{tool_action_line}{report_action_line}- DIE    — you cannot complete this task, signal failure to your parent.
 
@@ -1668,6 +1793,8 @@ Your next action:"""
             return "REPORT", _dedupe_repeated_sentences(trim_closer_tail(text), max_chars=2000)
         if self._decomposer_awaiting_first_spawn:
             reason = "without producing a usable SPAWN"
+        elif self._decomposer_without_completed_child:
+            reason = "with none of its subtasks completed"
         else:
             reason = "with no usable result to report"
         if self.spawn_closed and not self.cycles_capped:

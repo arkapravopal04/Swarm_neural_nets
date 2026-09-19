@@ -1382,6 +1382,33 @@ def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
     return text, None
 
 
+# A REPORT that is one of the prompt's exemplars plus at most this many words
+# of its own -- "Final answer:", the "end" of a "---END--" tail -- is the
+# exemplar, not an answer.
+EXEMPLAR_ONLY_MAX_EXTRA_WORDS = 3
+
+
+def is_exemplar_echo(text, exemplars=()):
+    """True when `text` is substantially one of `exemplars` and nothing else.
+
+    Compared word-normalized, so punctuation, case and a trailing delimiter
+    do not hide the copy. A text that quotes an exemplar and then goes on
+    to its own answer is NOT an echo by this test -- degeneracy_cut removes
+    the quoted sentence from that one and keeps the rest.
+    """
+    normalized = normalize_words(text)
+    if not normalized:
+        return False
+    for exemplar in exemplars or ():
+        target = normalize_words(exemplar)
+        if not target:
+            continue
+        rest, hits = re.subn(rf"(?<!\S){re.escape(target)}(?!\S)", " ", normalized)
+        if hits and len(rest.split()) <= EXEMPLAR_ONLY_MAX_EXTRA_WORDS:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Status-report tails.
 #
@@ -1637,6 +1664,103 @@ def trim_degenerate_tails(text, grounding=None):
             text = kept
         if text == before:
             return text, reasons
+
+
+# ---------------------------------------------------------------------------
+# Scaffold artifacts at the end of a final answer.
+#
+# Run 3 shipped "...conflict escalation framework. --- --- --- ----", then an
+# unterminated ```json fence, then {"status": "complete", "output": "<the
+# answer's own first sentence>". None of the passes above reads that as
+# degenerate: they key on repetition, scaffold phrases and log tails, a fence
+# plus a brace is 4 of degeneracy_cut's noise characters against a floor of
+# 8, and dashes are not noise characters at all. The copied sentence got past
+# the repeat counter too, because it shares one "sentence" span with the
+# dash run and the fence in front of it.
+#
+# Cut from the first artifact to the end, like the other tail trimmers:
+#   * a markdown code fence (``` or ~~~) and everything after it,
+#   * a JSON object tail -- a {"key": opening at a line start or right after
+#     a sentence end -- and everything after it,
+#   * a trailing run of separator tokens: dashes, underscores, =, *, ~, #,
+#     |, en/em dashes, optionally around END/EOF/STOP ("---END--"), also
+#     when glued to a sentence end ("discussion.---END--").
+# The fence and JSON cuts are the caller's to switch off (allow_code) for a
+# request that asked for software, where a code block can be the answer.
+# ---------------------------------------------------------------------------
+
+_SEPARATOR_CHARS = "-_=*~#|–—"
+_SEP = "[" + re.escape(_SEPARATOR_CHARS) + "]"
+_SEPARATOR_TOKEN_RE = re.compile(rf"{_SEP}+(?:(?:END|EOF|STOP){_SEP}*)?")
+_GLUED_SEPARATOR_RE = re.compile(
+    rf"(?<=[.!?\"'\)\]]){_SEP}+(?:(?:END|EOF|STOP){_SEP}*)?$"
+)
+# Fewer separator characters than this is prose: a closing em dash, a lone
+# table pipe, "--" standing in for a dash.
+SEPARATOR_MIN_CHARS = 3
+_JSON_OBJECT_TAIL_RE = re.compile(
+    r'(?:^|(?<=[.!?:]))[ \t]*\{[ \t]*"[^"\n]{1,40}"[ \t]*:', re.MULTILINE
+)
+
+
+def _separator_tail_start(text):
+    """Offset where a trailing run of separator tokens starts, or None."""
+    pos = len(text.rstrip())
+    start = None
+    count = 0
+    while pos > 0:
+        tok_start = pos
+        while tok_start > 0 and not text[tok_start - 1].isspace():
+            tok_start -= 1
+        token = text[tok_start:pos]
+        if _SEPARATOR_TOKEN_RE.fullmatch(token):
+            count += sum(1 for c in token if c in _SEPARATOR_CHARS)
+            start = tok_start
+            pos = tok_start
+            while pos > 0 and text[pos - 1].isspace():
+                pos -= 1
+            continue
+        glued = _GLUED_SEPARATOR_RE.search(token)
+        if glued is not None:
+            count += sum(1 for c in glued.group(0) if c in _SEPARATOR_CHARS)
+            start = tok_start + glued.start()
+        break
+    if start is None or count < SEPARATOR_MIN_CHARS:
+        return None
+    return start
+
+
+def trim_artifact_tail(text, allow_code=False):
+    """Cut scaffold artifacts off the end of `text`, as (kept, reasons).
+
+    reasons names each kind cut, once: "code fence", "JSON tail",
+    "separator run". Repeated until none applies, because one cut exposes
+    the next (the fence goes, and the dash run in front of it is then the
+    tail). Only ever cuts a prefix, so a second call is a no-op. Can return
+    "" when the whole text is an artifact; what that means is the caller's
+    decision, the degeneracy_cut contract.
+    """
+    if not text or not str(text).strip():
+        return text, []
+    text = str(text)
+    reasons = []
+    while True:
+        before = text
+        if not allow_code:
+            fence = _ANY_FENCE_RE.search(text)
+            if fence is not None:
+                text = text[:fence.start()].rstrip()
+                reasons.append("code fence")
+            json_tail = _JSON_OBJECT_TAIL_RE.search(text)
+            if json_tail is not None:
+                text = text[:json_tail.start()].rstrip()
+                reasons.append("JSON tail")
+        separators = _separator_tail_start(text)
+        if separators is not None:
+            text = text[:separators].rstrip()
+            reasons.append("separator run")
+        if text == before or not text.strip():
+            return text, list(dict.fromkeys(reasons))
 
 
 def scrub_result(text, exemplars=(), grounding=None):

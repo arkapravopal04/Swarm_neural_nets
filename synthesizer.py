@@ -33,7 +33,7 @@ from text_utils import (
 # rather than restated here -- same reason Orchestrator._matching_exemplar
 # imports them. A copy would keep matching text the prompt no longer uses
 # the moment someone rewords an example, which is worse than no check.
-from agent_node import EXEMPLAR_SUBTASK_DESCRIPTIONS
+from agent_node import PROMPT_EXEMPLARS
 
 
 class Synthesizer:
@@ -280,7 +280,7 @@ class Synthesizer:
             print(f"  [synthesis-trim] final answer cut at {reason} "
                   f"({len(uncut)} -> {len(cleaned)} chars).")
 
-        kept, reason = _degeneracy_cut(cleaned, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS)
+        kept, reason = _degeneracy_cut(cleaned, exemplars=PROMPT_EXEMPLARS)
         if reason is not None:
             self._record_trim("cut")
             print(f"  [synthesis-trim] final answer cut at {reason} "
@@ -292,6 +292,18 @@ class Synthesizer:
             self._record_trim("status_tail")
             print(f"  [synthesis-trim] final answer cut at a status-report tail "
                   f"({len(untrimmed)} -> {len(kept)} chars).")
+
+        # The walk-back again, after the cuts. _drop_incomplete_tail above ran
+        # on the raw decode only; a cut at a line boundary (the repeat and
+        # status-tail cuts walk lines too) or mid-line (a scaffolding echo)
+        # can leave the answer ending on an unfinished sentence.
+        if kept != uncut and kept.strip():
+            walked = _drop_incomplete_tail(kept)
+            if walked != kept:
+                self._record_trim("incomplete_tail_after_cut")
+                print(f"  [synthesis-trim] dropped an unfinished sentence the cut "
+                      f"exposed ({len(kept)} -> {len(walked)} chars).")
+                kept = walked
         if not kept.strip():
             self._record_trim("empty")
             print("  [synthesis-trim] nothing survived the cut -- the final "
