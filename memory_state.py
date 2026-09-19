@@ -13,6 +13,8 @@ import os
 import json
 import time
 import threading
+from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import faiss
@@ -23,6 +25,19 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 
 SUCCESS_CACHE_THRESHOLD = 0.45
+
+# Judging outcome recorded on every success-cache entry. Only ACCEPTED is
+# servable; anything else -- including an entry with no outcome at all --
+# is stored and counted but never served.
+OUTCOME_ACCEPTED = "accepted"
+
+
+@dataclass
+class SuccessLookup:
+    hit: Optional[dict] = None      # an ACCEPTED entry, or None (a miss)
+    hit_score: float = 0.0
+    negative_count: int = 0         # non-servable entries at/above threshold
+    negative_outcomes: dict = field(default_factory=dict)  # outcome -> count
 
 
 class MemoryStore:
@@ -102,14 +117,25 @@ class MemoryStore:
             })
         return results
 
-    def get_success_cache(self, task_description: str, threshold: float = SUCCESS_CACHE_THRESHOLD):
-        hits = self.query(task_description, "success", top_k=1)
-        if not hits:
-            return None
-        best = hits[0]
-        if best["score"] >= threshold:
-            return best["metadata"]
-        return None
+    def get_success_cache(self, task_description: str,
+                          threshold: float = SUCCESS_CACHE_THRESHOLD) -> SuccessLookup:
+        # Every neighbour at/above the threshold is read, not just the top
+        # one: a task's own failure scores ~1.0 against itself and would
+        # otherwise shadow an accepted entry behind it. Same embedding, same
+        # score, same threshold -- only how many neighbours are read.
+        lookup = SuccessLookup()
+        for h in self.query(task_description, "success", top_k=self.success_index.ntotal):
+            if h["score"] < threshold:
+                break
+            meta = h["metadata"]
+            if meta.get("outcome") == OUTCOME_ACCEPTED:
+                if lookup.hit is None:
+                    lookup.hit, lookup.hit_score = meta, h["score"]
+            else:
+                outcome = meta.get("outcome") or "unknown"
+                lookup.negative_count += 1
+                lookup.negative_outcomes[outcome] = lookup.negative_outcomes.get(outcome, 0) + 1
+        return lookup
 
     def query_ghosts(self, task_description: str, top_k: int = 3) -> list:
         return self.query(task_description, "ghost", top_k=top_k)

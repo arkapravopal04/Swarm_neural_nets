@@ -54,6 +54,10 @@ import ghost_extractor
 # Software-framing interventions, all on by default (see Orchestrator.__init__).
 FRAMING_LEVERS = ("reword", "block")
 
+# memory_state.OUTCOME_ACCEPTED -- repeated rather than imported because
+# memory_state pulls in faiss/sentence_transformers at import time.
+CACHE_OUTCOME_ACCEPTED = "accepted"
+
 
 def _without_quoted_example(reason: str) -> str:
     """software_artifact_reason minus its quoted evidence: "names a
@@ -2234,14 +2238,47 @@ class Orchestrator:
 
         self.colony.update_status(agent_id, "completed")
 
-        if self.memory_store is not None and task_node is not None:
-            try:
-                self.memory_store.write(
-                    "success", task_node.description, {"result": result, "task_id": task_id}
-                )
-            except Exception:
-                print(f"Warning: failed writing success cache for {task_id}:\n"
-                      f"{traceback.format_exc()}")
+        # "promote"/"pass" from judge.decide is an accepted REPORT. The "no
+        # judge configured" default is only an acceptance when there really
+        # is no judge; with a judge and no agent node, nothing ruled on it.
+        unjudged = self.judge is not None and agent_node is None
+        self._write_cache_outcome(task_node, task_id, result,
+                                  "unjudged" if unjudged else CACHE_OUTCOME_ACCEPTED)
+
+    @staticmethod
+    def _cache_outcome(verdict: Optional[Dict[str, Any]]) -> str:
+        """Failure outcome a _kill_and_respawn records in the success cache.
+        verdict is None only for a DIE: nothing sets judge_verdict."""
+        if verdict is None:
+            return "die"
+        if verdict.get("verdict") == "warn":
+            return "warn_exhausted"
+        tier = verdict.get("tier")
+        if tier == 3:
+            return "tier3_reject"
+        if tier in (1, 2):
+            return f"tier{tier}_execute"
+        return "structural_reject"  # software framing / root structural
+
+    def _write_cache_outcome(self, task_node, task_id, result, outcome: str):
+        """Every terminal outcome goes into the success cache with its
+        outcome recorded. Only CACHE_OUTCOME_ACCEPTED is ever served; a
+        negative entry carries no result, so there is nothing in it to serve."""
+        if self.memory_store is None or task_node is None:
+            return
+        accepted = outcome == CACHE_OUTCOME_ACCEPTED
+        try:
+            self.memory_store.write("success", task_node.description, {
+                "result": result if accepted else None,
+                "task_id": task_id,
+                "outcome": outcome,
+            })
+        except Exception:
+            print(f"Warning: failed writing success cache for {task_id}:\n"
+                  f"{traceback.format_exc()}")
+            return
+        self.colony.record_verdict(
+            "cache_write_positive" if accepted else f"cache_write_negative_{outcome}")
 
     def handle_failure(self, event: Event):
         """EXECUTE: Harvest context, kill agent, and respawn a smarter version."""
@@ -2288,6 +2325,7 @@ class Orchestrator:
                       f"uncommitted budget cannot fund decomposing it -- closing "
                       f"the task instead of converting.")
                 self._retire_agent(agent_id, task_id, verdict)
+                self._write_cache_outcome(self.task_graph.tasks.get(task_id), task_id, None, "die")
                 self._abandon_task(
                     task_id, parent_id, agent_id, self.respawn_counts.get(task_id, 0),
                     reason=("it was too large for one agent and there was not "
@@ -2351,10 +2389,28 @@ class Orchestrator:
             return
 
         task_node = self.task_graph.tasks.get(task_id)
+        self._write_cache_outcome(task_node, task_id, None, self._cache_outcome(verdict))
         if self.memory_store is not None and task_node is not None:
-            cached = self.memory_store.get_success_cache(task_node.description)
+            lookup = self.memory_store.get_success_cache(task_node.description)
+            cached = getattr(lookup, "hit", None)
+            negatives = getattr(lookup, "negative_count", 0)
+            if negatives:
+                print(f"  [success-cache] {task_id}: {negatives} failed outcome(s) on "
+                      f"record for this subtask or a near match "
+                      f"({getattr(lookup, 'negative_outcomes', {})}).")
+            # Never complete a node off anything but an accepted entry,
+            # whatever the store handed back.
+            if cached is not None and cached.get("outcome") != CACHE_OUTCOME_ACCEPTED:
+                cached = None
+            if cached is None and negatives:
+                self.colony.record_verdict("cache_miss_negative_match")
             if cached is not None:
-                print(f"Success cache hit for task {task_id} -- skipping respawn.")
+                self.colony.record_verdict("cache_hit_served")
+                if cached.get("task_id") != task_id:
+                    self.colony.record_verdict("cache_hit_served_cross_task")
+                print(f"Success cache hit for task {task_id} -- skipping respawn "
+                      f"(donor {cached.get('task_id')}, score "
+                      f"{getattr(lookup, 'hit_score', 0.0):.2f}).")
                 self.task_graph.complete_task(task_id)
                 cached_result = cached.get("result")
                 self.colony.store_result(task_id, cached_result)
@@ -3146,6 +3202,15 @@ class Orchestrator:
                 print(f"    accept : {accepts}")
                 print(f"    reject : {rejects}")
                 print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
+
+            print(chr(10) + "  SUCCESS CACHE (outcome-gated)")
+            neg = {k[len("cache_write_negative_"):]: v for k, v in verdicts.items()
+                   if k.startswith("cache_write_negative_")}
+            print(f"    positive writes             : {verdicts.get('cache_write_positive', 0)}")
+            print(f"    negative writes             : {sum(neg.values())} {neg if neg else ''}")
+            print(f"    servable hits               : {verdicts.get('cache_hit_served', 0)}")
+            print(f"      of which cross-task donor : {verdicts.get('cache_hit_served_cross_task', 0)}")
+            print(f"    misses on a negative match  : {verdicts.get('cache_miss_negative_match', 0)}")
 
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
             # Read these three together. "decisions at the cap" is the number
