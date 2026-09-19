@@ -226,6 +226,16 @@ class Orchestrator:
         # finish.
         self.MAX_TASK_ATTEMPTS = 3
 
+        # Whole-batch rejections by the derived-subtask guard (a copied
+        # exemplar, or software framing on a non-software project) respawn
+        # the decomposer without any agent having executed anything, so they
+        # do not spend MAX_TASK_ATTEMPTS: task_97d0d827 was abandoned on
+        # guard trips alone. They get their own, separate cap instead; past
+        # it a rejection counts as an ordinary attempt again, and the
+        # per-task energy ceiling bounds them throughout.
+        self.MAX_DERIVED_REJECTIONS = 3
+        self.derived_rejection_counts: Dict[str, int] = {}
+
         # Energy reservation, admission and the per-task ceiling. Evaluated
         # and calibrated against the real tick loop in
         # sims/reservation_formula (REPORT.md there has the numbers).
@@ -788,10 +798,38 @@ class Orchestrator:
         words = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", text.lower())
         return {w for w in words if w not in cls._REQ_FILTER_STOPWORDS}
 
-    @staticmethod
-    def _stems(words: set) -> set:
-        """Crude prefix stems, so 'cooling'/'cooled'/'coolant' can still meet."""
-        return {w[:5] for w in words if len(w) >= 5}
+    # Longest first: the first suffix that fits wins.
+    _STEM_SUFFIXES = (
+        "ations", "ation", "ments", "ment", "ings", "ing", "ers", "ies",
+        "ied", "ed", "er", "es", "ly", "s",
+    )
+
+    @classmethod
+    def _stem(cls, word: str) -> str:
+        """
+        Light suffix-stripping stem, capped at five characters.
+
+        The plain five-character prefix this replaces could never make
+        'vote'/'votes'/'voting'/'voters' meet ('votes' vs 'votin' vs
+        'voter'), and skipped words under five letters entirely, so 'book'
+        and 'books' could only ever meet as an exact match. A subtask
+        about counting book votes then shared "no vocabulary" with a goal
+        about choosing books by vote, and the derived-subtask guard threw
+        the batch away.
+        """
+        for suffix in cls._STEM_SUFFIXES:
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                word = word[:-len(suffix)]
+                break
+        if word.endswith("e") and len(word) > 3:
+            word = word[:-1]
+        return word[:5]
+
+    @classmethod
+    def _stems(cls, words: set) -> set:
+        """Stems for a word set, so 'vote'/'votes'/'voting' and
+        'cooled'/'cooling' can still meet."""
+        return {cls._stem(w) for w in words}
 
     _CODE_HINT_RE = re.compile(
         r"^\s*(def |class |import |from \w+ import |return |for \w+ in |if .+:|"
@@ -1212,34 +1250,40 @@ class Orchestrator:
                 return exemplar
         return None
 
-    def _has_no_requirement_overlap(self, description: str) -> bool:
+    def _has_no_requirement_overlap(self, description: str,
+                                    parent_task: Optional[str] = None) -> bool:
         """
         True when this description shares no vocabulary at all -- neither a
-        significant word nor a prefix stem -- with ANY of the project's
-        requirements.
+        significant word nor a stem -- with anything this project is about:
+        its requirements, its goal, the user's own request, or the task of
+        the decomposer that spawned it.
 
-        This is the exact condition _filter_requirements_for_task already
-        computes and prints its "no keyword overlap at all" warning for. That
-        warning fires on precisely the failure this guard exists to catch (a
-        newsletter-palette subtask inside a turbine-blade colony shares no
-        vocabulary with a single turbine requirement), so it is promoted from
-        a warning to a rejection here rather than reimplemented.
+        This used to read the requirements list alone. The phaser writes
+        those as abstract, domain-free sentences ("The selection process
+        requires defined criteria or voting method"), so a subtask worded in
+        the goal's own nouns ("Count the votes for each book candidate")
+        shared nothing with them and the whole batch was thrown away -- six
+        times in one run, on plainly on-topic plans. A copied exemplar (a
+        newsletter palette in a turbine colony) shares nothing with the goal
+        or the parent task either, so the wider corpus still catches it.
 
-        Kept to the requirements corpus specifically, NOT the goal text, so
-        it stays the same condition as the warning it promotes.
+        Inert without requirements, as before: no phaser spec means no
+        trustworthy picture of the project to judge a subtask against.
         """
-        requirements = self.spec.get("requirement", []) if self.spec else []
+        spec = self.spec or {}
+        requirements = spec.get("requirement", [])
         if not requirements:
             return False
         task_words = self._significant_words(description)
         if not task_words:
             return False
-        if any(task_words & self._significant_words(r) for r in requirements):
+        corpus_words = set()
+        for text in (*requirements, spec.get("goal"), spec.get("raw_text"), parent_task):
+            if isinstance(text, str):
+                corpus_words |= self._significant_words(text)
+        if task_words & corpus_words:
             return False
-        task_stems = self._stems(task_words)
-        if any(task_stems & self._stems(self._significant_words(r)) for r in requirements):
-            return False
-        return True
+        return not (self._stems(task_words) & self._stems(corpus_words))
 
     @property
     def _software_framing_guard_active(self) -> bool:
@@ -1289,13 +1333,27 @@ class Orchestrator:
         self.colony.record_verdict("software_framing_subtask_reworded")
         return plain
 
-    def _reject_derived_subtask_batch(self, event: Event, descriptions: list) -> bool:
+    def _screen_derived_subtask_batch(self, event: Event, descriptions: list,
+                                      originals: Optional[list] = None):
         """
-        Returns True if this SPAWN batch may proceed, False if it was
-        rejected and the spawner rerouted to a respawn.
+        Returns (proceed, dropped): proceed is False if the whole batch was
+        rejected and the spawner rerouted to a respawn; otherwise dropped is
+        the indices of individual subtasks to leave out.
 
-        Rejects the WHOLE batch, not the offending subtask, and does it in
-        code rather than in the prompt. Three separate rewordings of the
+        `originals` is each description as the model wrote it, before the
+        software-framing reword -- checked alongside the reworded text so the
+        reword can neither hide a copied exemplar nor cost a subtask the
+        overlap it had.
+
+        A subtask that merely shares no vocabulary with the project is
+        dropped on its own, and the rest of the batch proceeds: that check
+        is a vocabulary heuristic, and one badly worded subtask is not
+        evidence the whole plan was copied. Only when EVERY subtask in the
+        batch fails it is the batch rejected.
+
+        A near-copy of a prompt exemplar, or a software-shaped subtask on a
+        non-software project, still rejects the WHOLE batch, in code rather
+        than in the prompt. Three separate rewordings of the
         SPAWN examples have failed to stop a decomposer under load from
         lifting an example's task text straight into its own payload -- the
         colony then spends real agents, real energy and real wall-clock time
@@ -1310,7 +1368,9 @@ class Orchestrator:
         # Orchestrator-originated spawns (bootstrap, overflow drains) are
         # ours, not a model's -- nothing to reject and nobody to respawn.
         if spawner is None:
-            return True
+            return True, []
+        if originals is None or len(originals) != len(descriptions):
+            originals = list(descriptions)
 
         offending = None
         advice = (
@@ -1358,8 +1418,12 @@ class Orchestrator:
                          "task into software subtasks.")
             self.colony.record_verdict("software_framing_spawn_rejected")
 
-        for description in ([] if offending is not None else descriptions):
-            exemplar = self._matching_exemplar(description)
+        off_topic = []
+        parent_task = getattr(spawner, "task", None)
+        for i, description in enumerate([] if offending is not None else descriptions):
+            original = originals[i]
+            exemplar = (self._matching_exemplar(original)
+                        or self._matching_exemplar(description))
             if exemplar is not None:
                 offending = (
                     f"subtask '{description[:80]}' is a near-copy of the "
@@ -1367,16 +1431,21 @@ class Orchestrator:
                     f"illustration text, not work belonging to this project"
                 )
                 break
-            if self._has_no_requirement_overlap(description):
-                offending = (
-                    f"subtask '{description[:80]}' shares no vocabulary at "
-                    f"all with any of this project's requirements, which is "
-                    f"what a subtask copied from an example looks like"
-                )
-                break
+            if self._has_no_requirement_overlap(f"{original} {description}",
+                                                parent_task=parent_task):
+                off_topic.append(i)
+
+        if offending is None and off_topic and len(off_topic) == len(descriptions):
+            offending = (
+                f"subtask '{descriptions[off_topic[0]][:80]}' shares no "
+                f"vocabulary at all with this project's goal, requirements "
+                f"or the task being decomposed -- and neither does any other "
+                f"subtask in the batch, which is what a plan copied from an "
+                f"example looks like"
+            )
 
         if offending is None:
-            return True
+            return True, off_topic
 
         print(f"REJECT (derived subtask) on {spawner_id}: {offending} -- "
               f"discarding all {len(descriptions)} subtask(s) in this batch "
@@ -1394,9 +1463,32 @@ class Orchestrator:
                 "role": spawner.role,
                 "parent_id": spawner.parent_id,
                 "result": rejection,
+                # No agent executed anything: handle_failure respawns this
+                # without spending one of the task's MAX_TASK_ATTEMPTS.
+                "derived_subtask_rejection": True,
             },
         )
-        return False
+        return False, []
+
+    def _drop_off_topic_subtasks(self, parent_id: str, dropped: list) -> None:
+        """Tell the decomposer which of its subtasks were left out as sharing
+        no vocabulary with the project, so its roll-up says what was not
+        covered instead of presenting a partial plan as the whole one.
+        Delivered and billed like _tell_parent_about_dropped_subtasks."""
+        for _ in dropped:
+            self.colony.record_verdict("derived_subtask_dropped")
+        names = "; ".join(f'"{d[:80]}"' for d in dropped)
+        print(f"  [derived subtask] {parent_id}: dropped {len(dropped)} subtask(s) "
+              f"sharing no vocabulary with this project; the rest of the batch "
+              f"proceeds: {names}")
+        live_parent = self.live_agents.get(parent_id)
+        if live_parent is None:
+            return
+        note = (f"\n[REVIEW] These subtasks were NOT started because they do "
+                f"not mention anything from this project: {names}. Your final "
+                f"REPORT must say they were not covered.\n")
+        live_parent.thought_process += note
+        self.colony.debit_energy(parent_id, max(1, len(note) // 100), category="injection")
 
     def _reject_spawn_from_non_decomposer(self, event: Event) -> bool:
         """
@@ -1562,6 +1654,7 @@ class Orchestrator:
                 )
 
             prepared = []
+            originals = []
             label_to_id = {}
             for i, sub in enumerate(subtasks):
                 # FIX (#1, crash-the-whole-run bug): a malformed subtask can
@@ -1578,6 +1671,7 @@ class Orchestrator:
                 if not description:
                     print("Warning: subtask entry missing 'task'/'description', skipping.")
                     continue
+                original_description = description
                 description = self._plain_subtask_description(description)
                 sub["role"] = self._enforce_child_role(sub.get("role", "worker"), parent_id)
                 task_id = self._generate_task_id()
@@ -1586,14 +1680,23 @@ class Orchestrator:
                 if label:
                     label_to_id[str(label)] = task_id
                 prepared.append((sub, description, task_id))
+                originals.append(original_description)
 
-            # Exemplar guard, run on the whole prepared batch BEFORE any
-            # child is created: one copied subtask invalidates the plan, not
-            # just itself (see _reject_derived_subtask_batch).
-            if not self._reject_derived_subtask_batch(
-                event, [description for _, description, _ in prepared]
-            ):
+            # Derived-subtask guard, run on the whole prepared batch BEFORE
+            # any child is created: one copied subtask invalidates the plan,
+            # not just itself; a subtask that merely shares no vocabulary
+            # with the project is left out on its own (see
+            # _screen_derived_subtask_batch).
+            proceed, off_topic = self._screen_derived_subtask_batch(
+                event, [description for _, description, _ in prepared], originals
+            )
+            if not proceed:
                 return False
+            if off_topic:
+                self._drop_off_topic_subtasks(
+                    parent_id, [prepared[i][1] for i in off_topic])
+                prepared = [entry for i, entry in enumerate(prepared)
+                            if i not in set(off_topic)]
 
             # Admission: the batch is cut to the largest k whose reservation
             # fits (queued overflow included -- it is reserved now, spawned
@@ -1661,11 +1764,12 @@ class Orchestrator:
                         if normalized_dep:
                             dep_id = label_to_id.get(normalized_dep)
                     if dep_id and dep_id not in admitted_ids:
-                        # Its target was dropped by admission and will never
-                        # exist; waiting on it would leave this task pending.
+                        # Its target was dropped (by admission, or as off-topic
+                        # by the derived-subtask guard) and will never exist;
+                        # waiting on it would leave this task pending.
                         print(
                             f"  [admission] subtask '{description[:60]}...' "
-                            f"depended on a subtask dropped for budget -- "
+                            f"depended on a subtask that was dropped -- "
                             f"dependency removed."
                         )
                     elif dep_id:
@@ -1708,8 +1812,14 @@ class Orchestrator:
             print("Warning: Spawn request ignored due to missing task description in payload.")
             return True
 
+        original_description = description
         description = self._plain_subtask_description(description)
-        if not self._reject_derived_subtask_batch(event, [description]):
+        # A lone subtask that fails the overlap check is the whole batch, so
+        # _screen_derived_subtask_batch rejects it outright; `dropped` is
+        # always empty here.
+        proceed, _ = self._screen_derived_subtask_batch(
+            event, [description], [original_description])
+        if not proceed:
             return False
 
         spawner = self.colony.get_agent(parent_id) if parent_id else None
@@ -2358,7 +2468,16 @@ class Orchestrator:
                   f"respawning as a decomposer for the same task instead of an executor.")
             role = "decomposer"
 
-        self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict)
+        count_attempt = True
+        if payload.get("derived_subtask_rejection") and task_id:
+            rejections = self.derived_rejection_counts.get(task_id, 0)
+            if rejections < self.MAX_DERIVED_REJECTIONS:
+                self.derived_rejection_counts[task_id] = rejections + 1
+                self.colony.record_verdict("derived_subtask_respawn_uncounted")
+                count_attempt = False
+
+        self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict,
+                               count_attempt=count_attempt)
 
     def _retire_agent(self, agent_id: str, task_id: Optional[str],
                       verdict: Optional[Dict[str, Any]] = None) -> dict:
@@ -2410,10 +2529,16 @@ class Orchestrator:
         return ghost_context
 
     def _kill_and_respawn(self, agent_id: str, task_id: Optional[str], role: str,
-                           parent_id: Optional[str], verdict: Optional[Dict[str, Any]] = None):
+                           parent_id: Optional[str], verdict: Optional[Dict[str, Any]] = None,
+                           count_attempt: bool = True):
         """
         Shared kill/ghost/respawn path used by both a self-reported DIE
         (handle_failure) and a judge-triggered EXECUTE (handle_completion).
+
+        count_attempt=False is a respawn after a derived-subtask batch
+        rejection (see MAX_DERIVED_REJECTIONS): no agent executed the task,
+        so it neither spends an attempt nor records a failed outcome for
+        the task in the success cache. The energy ceiling still applies.
         """
         ghost_context = self._retire_agent(agent_id, task_id, verdict)
 
@@ -2422,7 +2547,8 @@ class Orchestrator:
             return
 
         task_node = self.task_graph.tasks.get(task_id)
-        self._write_cache_outcome(task_node, task_id, None, self._cache_outcome(verdict))
+        if count_attempt:
+            self._write_cache_outcome(task_node, task_id, None, self._cache_outcome(verdict))
         if self.memory_store is not None and task_node is not None:
             lookup = self.memory_store.get_success_cache(task_node.description,
                                                          task_id=task_id)
@@ -2482,7 +2608,7 @@ class Orchestrator:
         # (a cache hit is a completion, not another attempt) and before the
         # respawn it would otherwise authorise.
         attempts = self.respawn_counts.get(task_id, 0)
-        if attempts >= self.MAX_TASK_ATTEMPTS:
+        if count_attempt and attempts >= self.MAX_TASK_ATTEMPTS:
             self._abandon_task(task_id, parent_id, agent_id, attempts)
             return
 
@@ -2505,9 +2631,15 @@ class Orchestrator:
             )
             return
 
-        print(f"Agent {agent_id} failed. Respawning {role} with ghost context "
-              f"(attempt {attempts + 2} of {self.MAX_TASK_ATTEMPTS + 1} for this task).")
-        self.respawn_counts[task_id] = attempts + 1
+        if count_attempt:
+            print(f"Agent {agent_id} failed. Respawning {role} with ghost context "
+                  f"(attempt {attempts + 2} of {self.MAX_TASK_ATTEMPTS + 1} for this task).")
+            self.respawn_counts[task_id] = attempts + 1
+        else:
+            print(f"Agent {agent_id}'s subtask batch was rejected. Respawning {role} "
+                  f"with ghost context (rejection "
+                  f"{self.derived_rejection_counts.get(task_id, 0)} of "
+                  f"{self.MAX_DERIVED_REJECTIONS}; not counted as a task attempt).")
         if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
                             ghost_context=ghost_context) is None:
             # No energy for the replacement. The old agent is already gone,

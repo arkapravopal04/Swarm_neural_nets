@@ -565,6 +565,153 @@ def strip_scaffolding_lines(text):
     return _SCAFFOLD_LINE_RE.sub("", text)
 
 
+# Action words the prompt has ever offered, plus the ones agents invent when
+# they imitate a menu (RESTART/EXIT/RETRY/ABORT appear nowhere in the real
+# prompt). Matched case-SENSITIVELY below: the shouted form is the protocol
+# register, so "you must report the result" in ordinary reasoning is left
+# alone while "You must RESTART to fix this violation" is not.
+_THOUGHT_ACTION_WORDS = r"(?:THINK|SPAWN|TOOL|REPORT|DIE|RESTART|EXIT|RETRY|ABORT)"
+# Scaffold-mimicking lines in stored reasoning, found anywhere on the line
+# rather than only at its start: a DIE DEBUG dump showed the agent reading
+# its own "Your only allowed action is DIE" and "Your next action: RESTART or
+# EXIT?" back as if the harness had said them, and obeying.
+_THOUGHT_SCAFFOLD_RES = (
+    # ACTION:/PAYLOAD: labels, including markdown-decorated ones
+    # ("**ACTION:** DIE", "- PAYLOAD: ...") that the anchored label pattern
+    # above does not see.
+    re.compile(r"^[ \t]*[*_#>`\-]*[ \t]*(?:ACTION|PAYLOAD)[*_`]*[ \t]*:", re.IGNORECASE | re.MULTILINE),
+    # Headings and sentences lifted from the agent prompt itself.
+    re.compile(
+        r"^.*(?:"
+        r"OUTPUT FORMAT INSTRUCTIONS"
+        r"|Your next action"
+        r"|Available actions"
+        r"|Real actions that exist"
+        r"|Your output must be"
+        r"|respond with EXACTLY ONE action block"
+        r"|Your Previous Thoughts"
+        r"|END OF PREVIOUS THOUGHTS"
+        r"|VERDICT FROM REVIEWER"
+        r"|END VERDICT"
+        r"|THINKING BUDGET EXHAUSTED"
+        r"|NO ENERGY FOR NEW SUBTASKS"
+        r"|You are an AI agent in a colony"
+        r").*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    # Claims about which actions exist or are allowed.
+    re.compile(
+        r"^.*\b(?:your|the|my)\s+(?:only\s+)?(?:allowed|available|permitted|valid|remaining|next)\s+actions?\b.*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    # Orders to take an action, in the protocol's shouted register.
+    re.compile(
+        r"^.*\b(?i:you|i)\s+(?i:must|should|can only|may only|have to|need to)"
+        r"(?:\s+(?i:now|only|immediately))?\s+" + _THOUGHT_ACTION_WORDS + r"\b.*$",
+        re.MULTILINE,
+    ),
+    # A menu: two or more shouted action words in a list ("THINK, REPORT,
+    # DIE", "RESTART or EXIT").
+    re.compile(
+        r"^.*\b" + _THOUGHT_ACTION_WORDS + r"\b\s*(?:,|/|\||\bor\b)\s*\b"
+        + _THOUGHT_ACTION_WORDS + r"\b.*$",
+        re.MULTILINE,
+    ),
+)
+# Lines the harness itself writes into thought_process. Never dropped: a
+# child's result or a budget note is exactly what the agent must see.
+_HARNESS_NOTE_RE = re.compile(
+    r"^[ \t]*\[(?:CHILD RESULT|TOOL RESULT|BUDGET\]|REVIEW\]|earlier choice)"
+)
+_EXTRA_BLANK_LINES_RE = re.compile(r"\n{3,}")
+
+
+def sanitize_thought_text(text):
+    """
+    Stored reasoning with every scaffold-mimicking line removed.
+
+    A superset of strip_scaffolding_lines for text that is fed back to the
+    agent as "Your Previous Thoughts": that section is rendered directly
+    above the real action menu, so a line the model wrote in the harness's
+    own voice -- a fake menu, an "only allowed action", an order to DIE --
+    reads as the harness talking. Such lines are dropped whole; the
+    reasoning around them is kept. Lines the harness wrote (child results,
+    tool results, budget notes) are never touched.
+    """
+    if not text:
+        return text
+    kept = []
+    for line in text.split("\n"):
+        if not _HARNESS_NOTE_RE.match(line) and (
+            _SCAFFOLD_LINE_RE.search(line)
+            or any(pattern.search(line) for pattern in _THOUGHT_SCAFFOLD_RES)
+        ):
+            continue
+        kept.append(line)
+    return _EXTRA_BLANK_LINES_RE.sub("\n\n", "\n".join(kept))
+
+
+_DECISION_ACTION_LINE_RE = re.compile(
+    r"^[ \t]*[*_#>`\-]*[ \t]*ACTION[*_`]*[ \t]*:[*_`]*[ \t]*([A-Za-z]+).*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_DECISION_PAYLOAD_LABEL_RE = re.compile(
+    r"^[ \t]*[*_#>`\-]*[ \t]*PAYLOAD[*_`]*[ \t]*:[*_`]*[ \t]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def record_decision_text(text):
+    """
+    decide()'s raw output as it is kept in thought_process.
+
+    decide() generates straight after the prompt's "Your next action:", so
+    its output is the most scaffold-shaped text an agent ever writes, and
+    it used to be stored raw -- last, so it filled most of the window the
+    next decide() reads back. The ACTION: label becomes a past-tense note
+    ("[earlier choice: TOOL]") and the PAYLOAD: label is dropped with its
+    content kept, so the agent still knows what it tried; everything else
+    goes through sanitize_thought_text.
+
+    The choice and its payload are kept on ONE line, capped, so that
+    without_decision_records can remove them whole: the cycle-cap
+    fallback builds a REPORT out of recent thought_process, and a record
+    of an earlier SPAWN payload is not an answer. Only the last ACTION
+    block is recorded -- the same block decide()'s parser acts on.
+    """
+    if not text:
+        return text
+    matches = list(_DECISION_ACTION_LINE_RE.finditer(text))
+    if not matches:
+        return sanitize_thought_text(text)
+    prose = sanitize_thought_text(text[:matches[0].start()]).strip()
+    last = matches[-1]
+    choice = last.group(1).upper()
+    payload = _DECISION_PAYLOAD_LABEL_RE.sub("", text[last.end():])
+    if choice == "THINK":
+        # A THINK payload IS reasoning: kept as prose, uncapped, so the
+        # cycle-cap fallback may still use it. Only the choice is a record.
+        payload = sanitize_thought_text(payload).strip()
+        return "\n".join(part for part in (prose, "[earlier choice: THINK]", payload) if part)
+    payload = " ".join(sanitize_thought_text(payload).split())
+    if len(payload) > _DECISION_RECORD_MAX_CHARS:
+        payload = payload[:_DECISION_RECORD_MAX_CHARS] + "..."
+    record = f"[earlier choice: {choice}] {payload}".rstrip()
+    return f"{prose}\n{record}" if prose else record
+
+
+_DECISION_RECORD_MAX_CHARS = 200
+_DECISION_RECORD_LINE_RE = re.compile(r"^[ \t]*\[earlier choice:.*(?:\n|$)", re.MULTILINE)
+
+
+def without_decision_records(text):
+    """thought_process with record_decision_text's one-line records removed,
+    for callers that treat recent thoughts as answer text."""
+    if not text:
+        return text
+    return _DECISION_RECORD_LINE_RE.sub("", text)
+
+
 def dedupe_list_exact(items):
     """
     Removes exact (case/whitespace-insensitive) duplicate entries from a
