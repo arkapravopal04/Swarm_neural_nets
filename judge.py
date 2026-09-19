@@ -77,8 +77,34 @@ class Judge:
     lives, not duplicated here).
     """
 
+    # deep_critique's prompt ends with this, so the ruling is the first word
+    # of the completion instead of whatever preamble the model opens with.
+    VERDICT_PREFILL = "VERDICT:"
+
+    # A line the model starts after its ruling that is not critique: an
+    # invented few-shot sample ("Example:", "Example 2:") or another
+    # VERDICT line. Markdown bullets/emphasis in front are allowed. The
+    # colon is required, so reasoning that merely opens with the word
+    # ("Example output lacks units") is kept.
+    _INVENTED_CONTINUATION_RE = re.compile(
+        r"^[\s*#>\-]*(?:example(?:\s*\d+)?\s*:|verdict\s*:)", re.IGNORECASE
+    )
+
     def __init__(self, llm_call_fn=None):
         self.llm_call_fn = llm_call_fn
+
+    @classmethod
+    def _cut_invented_continuation(cls, text: str) -> str:
+        """Keep the first line (the prefilled ruling) and the reasoning under
+        it, up to the first invented Example:/VERDICT: line. Everything from
+        there on is the model writing its own few-shot samples, and would
+        otherwise both decide the verdict and become the reasoning a
+        respawned agent is handed."""
+        lines = text.splitlines()
+        for i, line in enumerate(lines[1:], start=1):
+            if cls._INVENTED_CONTINUATION_RE.match(line):
+                return "\n".join(lines[:i]).rstrip()
+        return text
 
     # ------------------------------------------------------------------
     # Tier 1 -- fast check
@@ -252,78 +278,51 @@ class Judge:
             "your own critique, not a continuation of the agent's answer.\n"
             "Respond with exactly one verdict line: 'VERDICT: accept' or "
             "'VERDICT: reject', followed by a brief reasoning.\n"
+            # Prefilled: the completion's first word is the ruling. Left to
+            # open its own reply, the model wrote "Example:" and invented a
+            # few-shot pair (VERDICT: reject ... VERDICT: accept ...) --
+            # every tier-3 completion in a run had that shape, and the
+            # last-match parse read the invented accept as the verdict.
+            + self.VERDICT_PREFILL
         )
 
-        response = self.llm_call_fn(prompt)
+        completion = self.llm_call_fn(prompt)
+        response = self._cut_invented_continuation(
+            f"{self.VERDICT_PREFILL} {completion.lstrip()}"
+        )
 
-        # FIX: confirmed in testing -- this strict "line must start with
-        # 'verdict:'" parse was failing on every single attempt for a small,
-        # non-fine-tuned model that doesn't reliably follow single-line
-        # output conventions (the exact same class of brittleness already
-        # found and fixed in agent_node.py's decide() ACTION/PAYLOAD parsing).
-        # Combined with the fail-closed default, this meant deep_critique
-        # ALWAYS rejected, deterministically, every respawn -- burning the
-        # entire energy budget on identical repeated failures with no chance
-        # of success, since decoding is greedy/deterministic and nothing
-        # about the underlying miss changes between attempts.
+        # Escalating fallback, kept from the earlier fix (a strict per-line
+        # match failed on every attempt for a model that does not reliably
+        # follow single-line conventions, and the fail-closed default then
+        # rejected everything): the "verdict:" pattern, then a bare
+        # accept/reject, then the oddly-spaced spelling a strong repetition
+        # penalty produced ("ac ce pt").
         #
-        # Escalating fallback: try the original strict per-line match first
-        # (preserves exact behavior when the model DOES follow the format),
-        # then a substring search for "verdict:" anywhere in the response
-        # (not just at a line start), then a last-resort keyword search for
-        # a standalone accept/reject anywhere in the text. This can only ever
-        # improve on the previous behavior -- the previous behavior was
-        # "reject always"; a false-positive "accept" from the keyword search
-        # is no worse than that guaranteed failure, and a correctly detected
-        # "accept" is strictly better.
-        # FIX (confirmed via testing, second pass): the strict per-line loop
-        # used to `break` on the FIRST "verdict:" line it found. Confirmed
-        # in a real run: a small model's self-critique commonly narrates
-        # through a correction -- "VERDICt: reject - ...", then goes on to
-        # reconsider and write "VERDICt: accept - fixed the issue..." twice
-        # more. Breaking on the first line locked in the REJECTED first
-        # draft and threw away the model's own two corrections, causing an
-        # EXECUTE/respawn on work the model itself had already decided was
-        # fine. Now scans the full response and keeps the LAST verdict line
-        # found, honoring whatever the model concluded by the time it
-        # finished, not what it said first. Same reasoning applies to the
-        # regex fallbacks below -- findall/last-match instead of search's
-        # first-match.
+        # FIRST match at every tier, not last. The last-match rule was added
+        # for a model narrating through a self-correction, but the text after
+        # the ruling turned out to be invented exemplars, not corrections:
+        # "Example:\nVERDICT: reject ... VERDICT: accept ...", where the last
+        # line is a made-up sample. With the prompt prefilled, the first
+        # verdict is the one written straight after "VERDICT:", and
+        # _cut_invented_continuation has already dropped any later
+        # Example:/VERDICT: line.
         verdict = "reject"  # fail closed: still the default if nothing below matches
         matched = False
 
-        for line in response.splitlines():
-            if line.strip().lower().startswith("verdict:"):
-                value = line.split(":", 1)[1].strip().lower()
-                if value in ("accept", "reject"):
-                    verdict = value
-                    matched = True
-                # no break -- keep scanning so a later correction wins
+        # No trailing \b here, as before: "VERDICT: accepted" is an accept.
+        match = re.search(r"verdict\s*:\s*(accept|reject)", response, re.IGNORECASE)
+        if match is None:
+            match = re.search(r"\b(accept|reject)\b", response, re.IGNORECASE)
+        if match is not None:
+            verdict = match.group(1).lower()
+            matched = True
 
         if not matched:
-            matches = re.findall(r"verdict\s*:\s*(accept|reject)", response, re.IGNORECASE)
-            if matches:
-                verdict = matches[-1].lower()
-                matched = True
-
-        if not matched:
-            matches = re.findall(r"\b(accept|reject)\b", response, re.IGNORECASE)
-            if matches:
-                verdict = matches[-1].lower()
-                matched = True
-
-        if not matched:
-            # FIX: confirmed via a real run -- an aggressive repetition
-            # penalty (since reduced, see main.py's build_llm_call_fn) can
-            # push the model to spell "accept"/"reject" as oddly-spaced
-            # subword fragments ("ac ce pt") to avoid repeating an exact
-            # token sequence. None of the tiers above match text with
-            # internal spacing like that. This is a last-resort net: allow
-            # 0-2 whitespace characters between every letter of each word.
+            # Allow whitespace between every letter of each word.
             spaced_pattern = r"\b" + r"\s*".join("a c c e p t".split()) + r"\b|\b" + r"\s*".join("r e j e c t".split()) + r"\b"
-            matches = re.findall(spaced_pattern, response, re.IGNORECASE)
-            if matches:
-                cleaned = re.sub(r"\s+", "", matches[-1]).lower()
+            match = re.search(spaced_pattern, response, re.IGNORECASE)
+            if match is not None:
+                cleaned = re.sub(r"\s+", "", match.group(0)).lower()
                 if cleaned in ("accept", "reject"):
                     verdict = cleaned
                     matched = True

@@ -35,7 +35,7 @@ class _RecordingMemoryStore:
         self.writes.append((record_type, text, metadata))
         return len(self.writes)
 
-    def get_success_cache(self, description):
+    def get_success_cache(self, description, task_id=None):
         return None
 
 

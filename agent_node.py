@@ -391,6 +391,14 @@ class Agent:
         # Cycles so far that neither finished nor handed off, against
         # MAX_NON_TERMINAL_CYCLES.
         self.non_terminal_cycles = 0
+        # Set by the orchestrator when admission refuses this decomposer's
+        # SPAWN for lack of energy after its children have finished. Until
+        # then a refusal only left a "Do not SPAWN again" fail_reason, which
+        # think() never sees (it continues its KV cache) and decide() still
+        # offered SPAWN beside -- so the agent paid a full think()+decide()
+        # per refused batch until the cycle cap. Once set it is on the
+        # capped path immediately: no think(), REPORT/DIE only.
+        self.spawn_closed = False
         # Set by decide() when the cap forced a different action than the
         # model chose; the orchestrator reads it after run() to tally it.
         self.cap_coerced_last_run = False
@@ -421,12 +429,19 @@ class Agent:
         return self.non_terminal_cycles >= self.MAX_NON_TERMINAL_CYCLES
 
     @property
+    def final_only(self):
+        """Only final_actions are on the menu: the cycle cap is reached, or
+        SPAWN was closed for lack of energy (spawn_closed)."""
+        return self.cycles_capped or self.spawn_closed
+
+    @property
     def _decomposer_awaiting_first_spawn(self):
-        return self.role == "decomposer" and not getattr(self.node, "has_spawned", False)
+        return (self.role == "decomposer" and not self.spawn_closed
+                and not getattr(self.node, "has_spawned", False))
 
     @property
     def final_actions(self):
-        """The whole menu once cycles_capped. A decomposer that has not
+        """The whole menu once final_only. A decomposer that has not
         spawned yet finishes by SPAWNing -- a REPORT from it is either
         structurally rejected (root) or its own planning notes judged as a
         subtask's answer (non-root). Once its children exist the
@@ -983,7 +998,7 @@ class Agent:
         )
         think_format_line = "- If THINK: Provide your reasoning in plain text.\n"
         think_cap_str = ""
-        if self.cycles_capped:
+        if self.final_only:
             # Cycle budget spent: final_actions is the whole menu, and every
             # other line of the prompt has to agree with it -- the role rule
             # and the example included, not just the action list.
@@ -1008,12 +1023,20 @@ class Agent:
                         "not create new subtasks and do not solve anything "
                         "your children did not.\n"
                     )
-                think_cap_str = (
-                    f"[THINKING BUDGET EXHAUSTED -- you have already used "
-                    f"{self.non_terminal_cycles} cycles on this task. You must "
-                    f"finish now: REPORT your best result (state plainly anything "
-                    f"you could not work out), or DIE if you have nothing usable.]\n"
-                )
+                if self.spawn_closed and not self.cycles_capped:
+                    think_cap_str = (
+                        "[NO ENERGY FOR NEW SUBTASKS -- SPAWN is closed. You "
+                        "must finish now: REPORT what your finished children "
+                        "produced (state plainly what was not covered), or DIE "
+                        "if there is nothing usable.]\n"
+                    )
+                else:
+                    think_cap_str = (
+                        f"[THINKING BUDGET EXHAUSTED -- you have already used "
+                        f"{self.non_terminal_cycles} cycles on this task. You must "
+                        f"finish now: REPORT your best result (state plainly anything "
+                        f"you could not work out), or DIE if you have nothing usable.]\n"
+                    )
                 format_example_str = self._get_format_example(available_tools, final_only=True)
 
         prompt = f"""You are an AI agent in a colony of agents working together to solve problems.
@@ -1552,7 +1575,7 @@ Your next action:"""
                 payload = "[No content generated -- decide() produced an empty response.]"
 
         self.cap_coerced_last_run = False
-        if self.cycles_capped:
+        if self.final_only:
             final = self.final_actions
             if action not in final or (action == "SPAWN" and not self._is_spawn_payload(payload)):
                 action, payload = self._coerce_final_action(action, payload)
@@ -1622,6 +1645,8 @@ Your next action:"""
             reason = "without producing a usable SPAWN"
         else:
             reason = "with no usable result to report"
+        if self.spawn_closed and not self.cycles_capped:
+            return "DIE", f"No energy left for new subtasks, {reason}."
         return "DIE", (
             f"Cycle cap reached ({self.non_terminal_cycles} cycles) {reason}."
         )
@@ -2049,10 +2074,10 @@ Your next action:"""
         self._run_available_tools = available_tools
 
         self.cap_coerced_last_run = False
-        if self.cycles_capped:
-            # No think() once the cap is hit: its generation is the bulk of
-            # a tick's think_tick cost, and it can only feed a THINK that
-            # decide() is no longer allowed to return.
+        if self.final_only:
+            # No think() once the cap is hit (or SPAWN is closed): its
+            # generation is the bulk of a tick's think_tick cost, and it can
+            # only feed a THINK that decide() is no longer allowed to return.
             action, payload = self.decide(available_roles, available_tools, requirements)
         else:
             action = self.think(available_roles, available_tools, requirements)
