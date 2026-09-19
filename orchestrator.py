@@ -16,7 +16,7 @@ import uuid
 import time
 import re
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Dict, Any, List
 
 
@@ -39,6 +39,8 @@ from text_utils import (
     degeneracy_cut,
     drop_incomplete_tail,
     scrub_result,
+    cut_adjacent_repeat,
+    trim_degenerate_tails,
     asks_for_software,
     plain_register,
     software_artifact_reason,
@@ -72,6 +74,7 @@ class TaskReservation:
     sunk: int = 0            # task spend before its current attempt began
     conv_sunk: int = 0       # spend carried in by a TASK TOO LARGE conversion
     attempts: int = 0        # agents spawned for this task so far
+    k_peak: int = 0          # largest k any earlier attempt had admitted (ceiling only)
 
 
 class Orchestrator:
@@ -266,13 +269,38 @@ class Orchestrator:
         # Per-task energy ceiling: the runaway guard across ALL of a task's
         # agents. MAX_TASK_ATTEMPTS counts agents; this counts what they cost.
         #     ceiling = conv_sunk + TASK_CEILING_ATTEMPTS * own_cost
-        # i.e. about three attempts of what THIS task should cost. For an
-        # executor that is 3 * 27 = 81, the old flat figure -- which was right
-        # for executors only: a decomposer's attempt grows with k, the root's
-        # carries sigma, and a converted task carries the executor spend it
-        # arrived with (conv_sunk) instead of having it eat its decomposer
-        # share. A per-ATTEMPT ceiling was tested and dropped: the cycle cap
-        # (Agent.MAX_NON_TERMINAL_CYCLES) already stops one agent first.
+        # i.e. one p75 attempt of what THIS task should cost for every agent
+        # the attempt cap allows it. A decomposer's attempt grows with k, the
+        # root's carries sigma, and a converted task carries the executor
+        # spend it arrived with (conv_sunk) instead of having it eat its
+        # decomposer share. A per-ATTEMPT ceiling was tested and dropped: the
+        # cycle cap (Agent.MAX_NON_TERMINAL_CYCLES) already stops one agent
+        # first.
+        #
+        # TASK_CEILING_ATTEMPTS is MAX_TASK_ATTEMPTS + 1 -- the agents the
+        # attempt cap grants -- not a separate 3. At 3 the ceiling priced
+        # three attempts while the cap allowed four, so any task that used its
+        # fourth ran into the ceiling DURING it, even with every attempt under
+        # p75: task_4ae60b94 (executor, three tier-3 rejects at 4-5 energy
+        # each, 82 against 81) and task_4c62ea1f (decomposer, 85) were both
+        # four attempts of ~21. The ceiling was silently lowering the attempt
+        # cap. Tied, the cap decides how many tries a task gets and the
+        # ceiling only fires when those tries average over p75: executor 108.
+        #
+        # A decomposer's ceiling is priced at its fan-out cap (or its largest
+        # admitted batch, if bigger), not at the k=1 admission uses. At k=1 a
+        # decomposer stuck re-planning -- every attempt paying for THINK ticks
+        # and a SPAWN payload that fails validation -- was priced BELOW an
+        # executor. Priced at the cap it is 130 (root 195), and it does not
+        # drop back when a respawn re-plans from k=0. This is the role
+        # multiplier, at whichever role the task holds now: a TASK TOO LARGE
+        # conversion re-prices it as a decomposer from that point.
+        #
+        # No depth multiplier: each task is billed only its own spend, so
+        # depth adds nothing to a task's cost. Measured over every scenario in
+        # sims/reservation_formula (real tier-3 cost), the highest spend/
+        # ceiling is 0.37 at the root and 0.20 three levels down -- headroom
+        # grows with depth, the opposite of what a depth multiplier corrects.
         #
         # Checked on every cycle (_run_live_agents) as well as on the respawn
         # decision, because a task can cross the line mid-agent with no
@@ -280,7 +308,7 @@ class Orchestrator:
         # cycle, except on the cycle that produced a REPORT/DIE or handed off
         # a SPAWN/TOOL: that result is adjudicated first rather than
         # discarded, so the agent gets one more cycle before it can be stopped.
-        self.TASK_CEILING_ATTEMPTS = 3
+        self.TASK_CEILING_ATTEMPTS = self.MAX_TASK_ATTEMPTS + 1
 
         self.SHORT_ANSWER_WORD_THRESHOLD = 12
 
@@ -643,6 +671,10 @@ class Orchestrator:
         else:
             saved = (reservation.k, reservation.spawned, reservation.sunk)
             if role == "decomposer":
+                if reservation.spawned:
+                    # The ceiling keeps pricing the batch this task already
+                    # paid for; only admission re-plans from k=0.
+                    reservation.k_peak = max(reservation.k_peak, reservation.k)
                 reservation.k, reservation.spawned = 0, False  # it plans again
             reservation.sunk = self.colony.task_energy_spent.get(task_id, 0)
             if not self._admits():
@@ -867,7 +899,8 @@ class Orchestrator:
         """
         if not isinstance(result, str) or not result.strip() or self._looks_like_code(result):
             return result
-        kept, reasons = scrub_result(result, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS)
+        kept, reasons = scrub_result(result, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS,
+                                     grounding=self._grounding_for(task_id))
         if not reasons:
             return result
 
@@ -882,6 +915,30 @@ class Orchestrator:
         print(f"  [result-scrub:{where}] {label}: nothing survived -- replaced "
               f"with an explicit no-usable-output marker.")
         return self.DEGENERATE_RESULT_MARKER.format(reason=reasons[0])
+
+    def _grounding_for(self, ref: Optional[str]) -> str:
+        """What a task's result was allowed to draw on: the project goal, the
+        task's own description and requirements, and its prerequisites'
+        results. The status-report trim keeps a timestamp or metric found in
+        here and cuts one that is not. `ref` is a task_id, or an agent_id
+        (handle_parent_notification labels by child agent), resolved to its
+        task. Same text at promotion and at every injection of one task, so
+        the scrub stays idempotent across them."""
+        parts = []
+        if self.spec:
+            parts += [str(self.spec.get("raw_text") or ""), str(self.spec.get("goal") or "")]
+        task = self.task_graph.tasks.get(ref) if ref else None
+        if task is None and ref:
+            agent = self.colony.get_agent(ref)
+            task = self.task_graph.tasks.get(getattr(agent, "task_id", None)) if agent else None
+        if task is not None:
+            parts.append(str(task.description or ""))
+            parts += [str(r) for r in (task.requirements or [])]
+            for dep_id in task.dependencies or []:
+                dep = self.task_graph.tasks.get(dep_id)
+                if dep is not None and dep.result is not None:
+                    parts.append(str(dep.result))
+        return "\n".join(parts)
 
     def _build_dependency_context(self, dependencies: Optional[list]) -> str:
         if not dependencies:
@@ -943,6 +1000,13 @@ class Orchestrator:
                 print(f"Warning: failed to embed task description for '{task_id}': {e}")
         self.task_graph.add_task(child_node)
 
+        if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
+                            ghost_context=self._child_ghost_context(dependencies)) is None:
+            self._close_unstartable_child(task_id, parent_id)
+
+    def _child_ghost_context(self, dependencies: Optional[list]) -> Optional[str]:
+        """A child's starting ghost context: the project goal as background,
+        plus whatever its prerequisites have produced so far."""
         goal_text = (self.spec.get("goal") or self.spec.get("raw_text")) if self.spec else None
         if goal_text:
             goal_text = _dedupe_repeated_sentences(goal_text, max_chars=300)
@@ -952,11 +1016,43 @@ class Orchestrator:
             f"need to satisfy] {goal_text}\n"
         ) if goal_text else ""
         dep_context = self._build_dependency_context(dependencies)
-        combined_context = (goal_line + dep_context) or None
+        return (goal_line + dep_context) or None
 
-        if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
-                            ghost_context=combined_context) is None:
-            self._close_unstartable_child(task_id, parent_id)
+    def _thread_results_to_unblocked_dependents(self, task_node: Optional[TaskNode]):
+        """Hand a closed task's result to the dependents it just unblocked.
+
+        A dependent's context is built when it is spawned, which for a
+        sibling in the same SPAWN batch (the sequential default makes every
+        child after the first one) is BEFORE its prerequisite has a result.
+        Its agent then waits at status 0 and starts at status 1 with the
+        "Shared state" block that was empty when it was built. The block has
+        to be rebuilt when the prerequisite closes, and this is where the
+        prerequisite's result actually reaches the sibling's prompt.
+        _build_dependency_context scrubs and caps it here.
+
+        Called after the result is stored, from every path that closes a
+        task and releases its dependents: promotion, abandonment and a
+        success-cache hit. Only a dependent whose LAST prerequisite this
+        was (in_degree 0) and whose agent has not ticked yet is touched, so
+        a running agent's prompt never changes under it.
+        """
+        if task_node is None:
+            return
+        for dependent_id in task_node.dependents:
+            dep_task = self.task_graph.tasks.get(dependent_id)
+            if dep_task is None or dep_task.in_degree != 0 or dep_task.agent_id is None:
+                continue
+            live_agent = self.live_agents.get(dep_task.agent_id)
+            if (live_agent is None or getattr(live_agent, "thought_process", "")
+                    or getattr(live_agent, "non_terminal_cycles", 0)):
+                continue
+            context = self._child_ghost_context(dep_task.dependencies)
+            if context and context != getattr(live_agent, "ghost_context", None):
+                live_agent.ghost_context = context
+                self.colony.record_verdict("dependency_context_threaded")
+                print(f"  [dependency-context] {dep_task.agent_id}/{dependent_id} "
+                      f"unblocked by {task_node.task_id} -- prerequisite results "
+                      f"threaded into its context.")
 
     def _close_unstartable_child(self, task_id: str, parent_id: Optional[str]):
         """
@@ -988,12 +1084,14 @@ class Orchestrator:
             task_node.result = result
         self.colony.store_result(task_id, result)
         self._release_dependents(task_node)
+        self._thread_results_to_unblocked_dependents(task_node)
         self._drain_pending_overflow(parent_id)
         if parent_id:
             self.messenger.push_event(
                 "parent_notification",
                 "orchestrator",
-                {"parent_id": parent_id, "child_id": task_id, "result": result}
+                {"parent_id": parent_id, "child_id": task_id, "task_id": task_id,
+                 "result": result}
             )
 
     def _release_dependents(self, task_node: Optional[TaskNode]):
@@ -1629,8 +1727,13 @@ class Orchestrator:
         # promoted result is already clean. An abandoned task's salvaged
         # partial never passed through promotion, and this is where it would
         # otherwise enter the parent's prompt uncleaned.
+        # Grounded by the child's TASK, carried in the payload: on the
+        # success-cache and abandonment paths the child agent is already
+        # unregistered, and resolving through it fell back to the goal alone
+        # -- cutting a timestamp the task itself gave, which promotion kept.
         result_str = self._scrub_result(
-            str(result).strip(), "parent_injection", task_id=child_id
+            str(result).strip(), "parent_injection",
+            task_id=payload.get("task_id") or child_id,
         )
         if len(result_str) > 400:
             result_str = result_str[:400] + "..."
@@ -1726,6 +1829,23 @@ class Orchestrator:
                 print(f"  [report-trim] {agent_id} REPORT dropped an "
                       f"incomplete trailing sentence "
                       f"({len(str(result))} -> {len(completed)} chars).")
+            # Degenerate tails come off BEFORE the trim: closer runs,
+            # restating fragments and status-report/deploy-log tails
+            # ("Ready to deploy. Done. Go. Final state: COMPLETED."). The trim
+            # can cut such a tail partway ("A. B. Exactly five. Done. Five."
+            # -> "A. B. Exactly five."), and what is left no longer looks
+            # like a tail, so the promotion scrub below let it through. They
+            # only ever drop a tail, so the judge and the promoted result
+            # still see the same answer. A REPORT that is nothing BUT a
+            # status report is left whole for the judge to reject.
+            untailed, _ = trim_degenerate_tails(completed, self._grounding_for(task_id))
+            if not untailed.strip():
+                untailed = completed
+            if untailed != completed:
+                self.colony.record_verdict("report_tail_trimmed")
+                print(f"  [report-trim] {agent_id} REPORT dropped a degenerate "
+                      f"tail ({len(completed)} -> {len(untailed)} chars).")
+                completed = untailed
             trimmed = trim_to_sentences(completed, max_sentences=3,
                                         max_words=60, marker=False)
             if trimmed != str(result):
@@ -2068,6 +2188,7 @@ class Orchestrator:
         task_node = self.task_graph.tasks.get(task_id)
         if task_node:
             task_node.result = result
+        self._thread_results_to_unblocked_dependents(task_node)
 
         # Root completion check
         if task_id == self.root_task_id:
@@ -2107,7 +2228,8 @@ class Orchestrator:
             self.messenger.push_event(
                 "parent_notification",
                 "orchestrator",
-                {"parent_id": parent_id, "child_id": agent_id, "result": result}
+                {"parent_id": parent_id, "child_id": agent_id, "task_id": task_id,
+                 "result": result}
             )
 
         self.colony.update_status(agent_id, "completed")
@@ -2237,6 +2359,7 @@ class Orchestrator:
                 cached_result = cached.get("result")
                 self.colony.store_result(task_id, cached_result)
                 task_node.result = cached_result
+                self._thread_results_to_unblocked_dependents(task_node)
 
                 # FIX (#3, silent-stall bug): this branch previously marked
                 # the task complete and stored the result but never pushed
@@ -2255,7 +2378,8 @@ class Orchestrator:
                     self.messenger.push_event(
                         "parent_notification",
                         "orchestrator",
-                        {"parent_id": parent_id, "child_id": agent_id, "result": cached_result}
+                        {"parent_id": parent_id, "child_id": agent_id, "task_id": task_id,
+                         "result": cached_result}
                     )
                 return
 
@@ -2604,10 +2728,24 @@ class Orchestrator:
         decomposer's attempt grows with k and the root's carries sigma; one
         flat figure fitted only executors. With no task_id, the executor
         ceiling (the reference figure the ledger prints).
+
+        A decomposer is priced at _ceiling_k, never below its fan-out cap,
+        so its ceiling is always above an executor's. See __init__.
         """
         res = (self._reservation(task_id) if task_id
                else TaskReservation(kind="executor"))
+        if res.kind != "executor":
+            res = replace(res, k=self._ceiling_k(res), spawned=True)
         return int(res.conv_sunk + self.TASK_CEILING_ATTEMPTS * self._own_cost(res))
+
+    def _ceiling_k(self, res: TaskReservation) -> int:
+        """The batch size a decomposer's ceiling is priced at: its fan-out
+        cap, or the largest batch it has had admitted if that is bigger
+        (queued overflow counts). Never the k=1 admission prices an
+        unspawned decomposer at, and never lower after a respawn resets k."""
+        cap = (self.MAX_SUBTASKS_ROOT if res.kind == "root"
+               else self.MAX_SUBTASKS_NON_ROOT)
+        return max(cap, res.k_peak, res.k if res.spawned else 0)
 
     def _abandon_task(self, task_id: str, parent_id: Optional[str],
                        agent_id: Optional[str], attempts: int,
@@ -2670,6 +2808,7 @@ class Orchestrator:
         self.colony.store_result(task_id, abandoned_result)
 
         self._release_dependents(task_node)
+        self._thread_results_to_unblocked_dependents(task_node)
 
         # A freed fan-out slot is a freed slot whether the child succeeded or
         # was abandoned -- otherwise a decomposer's queued overflow never
@@ -2680,7 +2819,8 @@ class Orchestrator:
             self.messenger.push_event(
                 "parent_notification",
                 "orchestrator",
-                {"parent_id": parent_id, "child_id": agent_id, "result": abandoned_result}
+                {"parent_id": parent_id, "child_id": agent_id, "task_id": task_id,
+                 "result": abandoned_result}
             )
 
         if task_id == self.root_task_id:
@@ -3139,6 +3279,19 @@ class Orchestrator:
         except Exception:
             print(f"Warning: failed printing energy report:\n{traceback.format_exc()}")
 
+    def _final_answer_grounding(self) -> str:
+        """What the final answer was allowed to draw on: the problem and
+        every subtask's stored result. The root's own result and the final
+        answer itself are left out, or the text under check would ground
+        its own made-up figures."""
+        parts = []
+        if self.spec:
+            parts += [str(self.spec.get("raw_text") or ""), str(self.spec.get("goal") or "")]
+        for task_id, task in self.task_graph.tasks.items():
+            if task_id != self.root_task_id and task.result is not None:
+                parts.append(str(task.result))
+        return "\n".join(parts)
+
     def _guard_final_answer(self, best_result):
         """The last check between a collapsed decode and the user.
 
@@ -3164,14 +3317,23 @@ class Orchestrator:
         if not isinstance(best_result, str) or not best_result.strip():
             return best_result
 
-        kept, reason = degeneracy_cut(
-            best_result, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS
-        )
-        if reason is None:
+        # The same three cuts format_output makes, in the same order: a
+        # block repeated back to back, degeneracy_cut, then the status-report
+        # and closer/restating tails -- so a raw REPORT leaving by the
+        # fallback exits no dirtier than a synthesis would have.
+        kept, reason = cut_adjacent_repeat(best_result)
+        reasons = [reason] if reason else []
+        kept, reason = degeneracy_cut(kept, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS)
+        if reason:
+            reasons.append(reason)
+        if kept.strip():
+            kept, tail_reasons = trim_degenerate_tails(kept, self._final_answer_grounding())
+            reasons += tail_reasons
+        if not reasons:
             return best_result
 
         self.colony.record_verdict("final_answer_cut")
-        print(f"  [final-answer] cut at {reason} "
+        print(f"  [final-answer] cut at {', '.join(reasons)} "
               f"({len(best_result)} -> {len(kept)} chars) on the way out.")
         if kept.strip():
             return kept
@@ -3217,8 +3379,11 @@ class Orchestrator:
         trims = dict(getattr(self.synthesizer, "trim_counts", {}) or {})
         rows = (
             ("synthesis cut at a degenerate tail", trims.get("cut", 0)),
+            ("synthesis cut at a repeated block ", trims.get("repeat_cut", 0)),
+            ("synthesis cut at a status report  ", trims.get("status_tail", 0)),
             ("synthesis empty after its cut     ", trims.get("empty", 0)),
             ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
+            ("synthesis shipped made-up metrics ", trims.get("shipped_telemetry", 0)),
             ("returned answer cut on the way out", verdicts.get("final_answer_cut", 0)),
             ("returned answer empty after cut   ",
              verdicts.get("final_answer_empty_after_cut", 0)),

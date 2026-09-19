@@ -116,6 +116,12 @@ Differences from the sim prototype:
 - **A refused SPAWN is handled like an out-of-energy one.** A decomposer that already has finished children is released to REPORT them; one without goes down the DIE path.
 - **A refused root bootstrap closes the root immediately** (label `admission`), instead of letting the watchdog retry it.
 - `ADMISSION_CONTROL = False` restores the old unconstrained spawning; the per-task ceiling still applies.
+- **The kill ceiling prices a decomposer at its fan-out cap, not k=1.** Admission still reserves an unspawned decomposer at k=1. At k=1 the *ceiling* of a decomposer stuck re-planning was below an executor's (task_4c62ea1f). It is now `conv_sunk + A·own(max(cap, k, k_peak))`. `k_peak` stops a respawn's reset to k=0 from lowering the ceiling.
+- **A = MAX_TASK_ATTEMPTS + 1 (4), not 3.** At A=3 the ceiling priced three attempts while the attempt cap grants four agents, so a task using its fourth attempt hit the ceiling during it even with every attempt under p75. task_4ae60b94 (executor, three tier-3 rejects at the real 4–5 energy each, 82) and task_4c62ea1f (decomposer, 85) were both four attempts of ~21. Ceilings are now executor 108, decomposer 130, root 195.
+  - Anecdote replay (real tier-3 cost): an executor that passes on attempt 4 was killed at 86/81; at A=4 it completes at 107/108. A warn-loop runaway is still stopped.
+  - MC with a 4% leaf that needs attempt 4 and real tier-3 cost: false kills 0.13–0.20 per run at B ≥ 500 (A=3) → 0.00 everywhere (A=4); success and energy death identical; doomed spend +2–5 at large budgets.
+  - MC re-run on the live code (`full 200 1.0 implemented`): 89 / 94 / 93 / 96 / 100% success, ≤6% energy death, **0.00 false kills at every budget**; doomed spend 31.8 at B ≥ 800 (was 28.4).
+- **No depth multiplier.** Each task is billed only its own spend, so depth adds nothing to its cost. Over every deterministic scenario (real tier-3 cost), the highest spend/ceiling is 0.37 at the root and 0.20 three levels down: headroom grows with depth. Lineage pooling stays unneeded while false kills are zero; the energy trace's per-task `attempts`/`status` records are what would show otherwise.
 
 Re-run on the implementation (`montecarlo.py <model> 200 <f> implemented`, no `HIVE_SRC`):
 - **Full costs and 2× failure rates:** matches the prototype within noise. Full: 89 / 94 / 93 / 96 / 100% success at B = 100 / 150 / 200 / 300 / 500; energy death ≤ 6%; 0.00–0.01 false kills per run.
