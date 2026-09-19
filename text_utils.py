@@ -888,6 +888,25 @@ ECHO_MAX_WORDS = 2
 
 _ECHO_CONFIRM_STEMS = ("exact", "correct", "indeed")
 
+# A whole sentence that only says the answer is over: "Nothing else seems
+# necessary at this stage." It is too long to be a fragment, but it carries
+# nothing, so at the tail it joins the run and counts as its closer. A run
+# holding one is cut even when it is shorter than min_run, since the
+# report-trim can leave the sign-off as the last sentence on its own.
+# Whole-sentence matches only, so "Nothing else is needed for the pump to
+# start once the valve is open." is real content and stays. "No" needs a
+# "further/other/..." after it: "No permit is required." is an answer.
+_SIGNOFF_RE = re.compile(
+    r"^(?:"
+    r"(?:nothing\s+(?:else|more|further)|no\s+(?:further|other|additional|more))"
+    r"\s+(?:\w+\s+)?(?:is|are|seems?|appears?)\s+(?:to\s+be\s+)?"
+    r"(?:needed|necessary|required)"
+    r"|that(?:'s|\s+is)\s+(?:all|it)"
+    r"|this\s+(?:completes|concludes)\s+(?:the|this|my)\s+(?:task|answer|report)"
+    r")(?:\s+(?:at|for)\s+(?:this|the)\s+(?:stage|point|time|moment))?[.!]?$",
+    re.IGNORECASE,
+)
+
 _QUESTION_END_RE = re.compile(r"\?[\"'\)\]]*$")
 
 
@@ -901,8 +920,8 @@ def trim_echo_tail(text, min_run=ECHO_MIN_RUN, max_words=ECHO_MAX_WORDS):
 
     Returns a prefix of the input, like trim_closer_tail, so the layout of
     the kept part is unchanged. Returns the text unchanged when the run is
-    shorter than min_run, has no closer in it, follows a question, or is
-    the whole text.
+    shorter than min_run (and holds no sign-off sentence), has no closer in
+    it, follows a question, or is the whole text.
     """
     if not text:
         return text
@@ -919,8 +938,12 @@ def trim_echo_tail(text, min_run=ECHO_MIN_RUN, max_words=ECHO_MAX_WORDS):
             totals[w] = totals.get(w, 0) + 1
 
     cut = len(spans)
-    saw_closer = False
+    saw_closer = saw_signoff = False
     while cut > 0:
+        if _SIGNOFF_RE.match(sentences[cut - 1]):
+            saw_closer = saw_signoff = True
+            cut -= 1
+            continue
         words = per_sentence[cut - 1]
         content = [w for w in words if w not in _CLOSER_STOPWORDS]
         if not content or len(words) > max_words:
@@ -941,7 +964,7 @@ def trim_echo_tail(text, min_run=ECHO_MIN_RUN, max_words=ECHO_MAX_WORDS):
             saw_closer = True
         cut -= 1
 
-    if len(spans) - cut < min_run or cut == 0 or not saw_closer:
+    if cut == 0 or not saw_closer or (len(spans) - cut < min_run and not saw_signoff):
         return text
     if _QUESTION_END_RE.search(sentences[cut - 1]):
         return text
@@ -1081,6 +1104,31 @@ def normalize_words(text):
     return " ".join(re.findall(r"[a-z0-9]+", str(text or "").lower()))
 
 
+_PHRASE_LOOP_COPIES = 3
+_PHRASE_LOOP_MIN_WORDS = 3
+_PHRASE_LOOP_MAX_WORDS = 12
+_LOOP_WORD_RE = re.compile(r"[a-z0-9']+")
+
+
+def _has_phrase_loop(sentence, copies=_PHRASE_LOOP_COPIES,
+                     min_words=_PHRASE_LOOP_MIN_WORDS, max_words=_PHRASE_LOOP_MAX_WORDS):
+    """True when one sentence holds `copies` back-to-back copies of the same
+    run of min_words..max_words words: "Crews rotate hourly, crews rotate
+    hourly, crews rotate hourly." The sentence-level repeat counter sees one
+    sentence, so a loop that never reaches a full stop was promoted whole.
+    Three copies of three or more words, so "very, very, very" and a list
+    with a shared stem ("buy milk, buy eggs") are left alone."""
+    words = _LOOP_WORD_RE.findall(sentence.lower())
+    for size in range(min_words, max_words + 1):
+        if copies * size > len(words):
+            break
+        for i in range(len(words) - copies * size + 1):
+            block = words[i:i + size]
+            if all(words[i + k * size:i + (k + 1) * size] == block for k in range(1, copies)):
+                return True
+    return False
+
+
 def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
     """
     `text` cut at the first point where the generation stopped answering,
@@ -1100,9 +1148,11 @@ def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
     cutting it produces exactly that -- a plausible-looking answer assembled
     out of the model's collapse.
 
-    Four shapes, all of them "everything after this is noise":
+    Five shapes, all of them "everything after this is noise":
 
       * a sentence repeated up to _repeat_threshold (the loop itself),
+      * a phrase looped inside one sentence (_has_phrase_loop), the same
+        loop before the model reached a full stop,
       * a sentence that is mostly bracket/backtick noise,
       * an ACTION:/PAYLOAD:-style scaffolding line echoed back -- one real
         run ended its user-facing answer on "ACTION REQUESTED: RUN OR
@@ -1116,7 +1166,7 @@ def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
     trailing "ACTION REQUESTED:" line, which makes the whole answer one
     "sentence" -- cutting at its start threw the entire answer away to
     remove one line of scaffolding, which is a worse failure than the one
-    this guard exists to fix. The other three shapes have no sub-sentence
+    this guard exists to fix. The other four shapes have no sub-sentence
     position to speak of and cut at the sentence boundary.
 
     Closer-cycling is deliberately NOT cut here: it is a degeneracy signal
@@ -1150,6 +1200,9 @@ def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
             if counts[stripped] >= threshold:
                 cut, reason = sentence_start, "a sentence repeated"
 
+        if reason is None and _has_phrase_loop(stripped):
+            cut, reason = sentence_start, "a phrase looped within a sentence"
+
         if reason is None:
             noise = sum(1 for c in stripped if c in _DEGENERATE_NOISE_CHARS)
             if (noise >= _NOISE_SENTENCE_FLOOR
@@ -1182,7 +1235,264 @@ def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
     return text, None
 
 
-def scrub_result(text, exemplars=()):
+# ---------------------------------------------------------------------------
+# Status-report tails.
+#
+# Observed ending a synthesized FINAL ANSWER (twice), and single REPORTs
+# (agent_83dcb89a, agent_d496677d):
+#
+#   "...Ready to deploy. Done. Go. Deployment timestamp: 2023-11-03T14:23:10Z.
+#    Metrics report: accuracy=1.000000, consistency=1.000000... Final state:
+#    COMPLETED... Report end."
+#
+# The answer is over and the model has switched register into a deploy log:
+# a sign-off loop, a timestamp nobody gave it, metrics it made up, a status
+# line and an end marker. No sentence repeats, "Go." breaks the closer run,
+# and the log lines are too long to be closers, so every trimmer above let
+# it through, and the synthesizer's global dedupe then collapsed a repeated
+# "Ready to deploy. Done. Go." into a single copy that looked clean.
+#
+# Cut as a trailing run, like the closer and echo tails. The run is walked
+# over SEGMENTS (sentences, and lines, since log lines often have no
+# terminator). A segment belongs to it when it is:
+#   * a closer, a sign-off or a go-word ("Go.", "Proceed."),
+#   * an end marker ("Report end.", "End of report."),
+#   * a status line: "<label with a log word>: <SHOUTED STATE>"
+#     ("Final state: COMPLETED"),
+#   * telemetry: "<label with a log word>: ..." carrying a clock timestamp or
+#     key=number metrics, or a bare key=number list, whose figures the
+#     grounding text does not contain.
+# It is cut only when it holds an end marker, a status line or telemetry, or
+# a go-word next to at least one other closer (the "ready/done/go" loop). A
+# run of plain closers stays trim_closer_tail's call, with its own min_run.
+# Never cut right after a question.
+#
+# Labels need a log word and states must be SHOUTED, so "Decision: APPROVED"
+# and "Status: approved" stay: those are answers. Grounding keeps a
+# timestamp or metric the problem or the results actually gave.
+# ---------------------------------------------------------------------------
+
+_SEGMENT_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+|\s*\n\s*")
+
+# No "result", "outcome", "verdict" or "score" among the labels, and no PASS,
+# APPROVED or VERIFIED among the states: a verifier's "Result: PASS." is its
+# answer, not a log line.
+_LOG_LABEL_WORDS = (
+    r"state|status|build|deploy(?:ment|ed)?|run|job|pipeline|system|report|"
+    r"exit|timestamp|time|generated|completed|finished|metrics?|log|checksum|"
+    r"hash|version|uptime|latency"
+)
+_LOG_LABEL_RE = re.compile(
+    r"^[-*•>\s]*(?P<label>[A-Za-z][A-Za-z _/-]{0,40}?)\s*:\s*(?P<value>.+)$"
+)
+_LOG_WORD_RE = re.compile(rf"\b(?:{_LOG_LABEL_WORDS})\b", re.IGNORECASE)
+_SHOUTED_STATE_RE = re.compile(
+    r"^(?:COMPLETED?|SUCCESS(?:FUL)?|SUCCEEDED|DONE|READY|OK|"
+    r"FINISHED|FINALI[SZ]ED|DEPLOYED|CLOSED|TERMINATED|GO)"
+    r"[\W_]*$"
+)
+_END_MARKER_RE = re.compile(
+    r"^[-*•>\s]*(?:"
+    r"(?:report|log|output|transmission|message|session|response)\s+"
+    r"(?:end|ends|ended|complete|completed|closed)"
+    r"|end\s+of\s+(?:report|log|output|transmission|message|session|response)"
+    r"|eof|over\s+and\s+out"
+    r")[\W_]*$",
+    re.IGNORECASE,
+)
+_GO_WORD_RE = re.compile(
+    r"^[-*•>\s]*(?:go|go\s+go(?:\s+go)?|proceed|ready\s+to\s+go|good\s+to\s+go)[\W_]*$",
+    re.IGNORECASE,
+)
+# A clock timestamp, date AND time: a bare date is usually content ("the
+# first meeting is 2024-03-05"), a date with a time of day in a log line is
+# a log stamp.
+_CLOCK_TIMESTAMP_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"
+)
+_METRIC_ASSIGN_RE = re.compile(r"\b[A-Za-z_][\w ]{0,30}?\s*=\s*(\d+(?:\.\d+)?%?)")
+_BARE_METRIC_LIST_RE = re.compile(
+    r"^[-*•>\s]*(?:[A-Za-z_][\w ]{0,30}?\s*=\s*\d+(?:\.\d+)?%?[,;\s]*)+[\W_]*$"
+)
+
+
+def _segment_spans(text):
+    """(start, end) of each sentence OR line. _sentence_spans keeps a run of
+    unterminated lines together, which is exactly the shape of a log block."""
+    spans = []
+    start = 0
+    for boundary in _SEGMENT_BOUNDARY_RE.finditer(text):
+        if text[start:boundary.start()].strip():
+            spans.append((start, boundary.start()))
+        start = boundary.end()
+    if text[start:].strip():
+        spans.append((start, len(text)))
+    return spans
+
+
+def _figures(segment):
+    """The timestamps and metric values a log segment asserts."""
+    return (_CLOCK_TIMESTAMP_RE.findall(segment)
+            + [m.group(1) for m in _METRIC_ASSIGN_RE.finditer(segment)])
+
+
+def _ungrounded(figures, grounding):
+    """True when any figure is absent from the grounding text, matched as a
+    whole number ("1" is not grounded by a "10" somewhere in the results)."""
+    if not figures:
+        return False
+    if grounding is None:
+        return True
+    return any(
+        re.search(rf"(?<![\d.]){re.escape(f)}(?![\d])", grounding) is None
+        for f in figures
+    )
+
+
+def is_telemetry_segment(segment, grounding=None):
+    """A log line asserting a clock timestamp or key=number metrics that the
+    grounding text does not contain."""
+    segment = segment.strip()
+    if _BARE_METRIC_LIST_RE.match(segment):
+        return _ungrounded(_figures(segment), grounding)
+    match = _LOG_LABEL_RE.match(segment)
+    if match is None or not _LOG_WORD_RE.search(match.group("label")):
+        return False
+    return _ungrounded(_figures(match.group("value")), grounding)
+
+
+def ungrounded_telemetry(text, grounding=None):
+    """Every log-line segment in `text` asserting a timestamp or metric the
+    grounding does not contain. For reporting: a line mid-answer has real
+    content after it, so it is flagged rather than cut."""
+    if not text or not str(text).strip():
+        return []
+    text = str(text)
+    return [text[s:e].strip() for s, e in _segment_spans(text)
+            if is_telemetry_segment(text[s:e], grounding)]
+
+
+def _status_segment_kind(segment, grounding):
+    """"signal" for a segment that marks the log register on its own, "go"
+    for a go-word, "closer" for a closer or sign-off, None otherwise."""
+    segment = segment.strip()
+    if _END_MARKER_RE.match(segment):
+        return "signal"
+    match = _LOG_LABEL_RE.match(segment)
+    if (match is not None and _LOG_WORD_RE.search(match.group("label"))
+            and _SHOUTED_STATE_RE.match(match.group("value").strip())):
+        return "signal"
+    if is_telemetry_segment(segment, grounding):
+        return "signal"
+    if _GO_WORD_RE.match(segment):
+        return "go"
+    if _is_closer_sentence(segment) or _SIGNOFF_RE.match(segment):
+        return "closer"
+    return None
+
+
+def trim_status_tail(text, grounding=None):
+    """Cut a trailing status-report/deploy-log run, as (kept, reason).
+
+    (text, None) when there is none. ("", reason) when the WHOLE text is one,
+    the degeneracy_cut contract: what an all-log answer means is the
+    caller's decision. `grounding` is the text the answer was allowed to
+    draw on (the problem, the subtask results); None treats every timestamp
+    or metric in a log line as made up.
+    """
+    if not text or not str(text).strip():
+        return text, None
+    text = str(text)
+    spans = _segment_spans(text)
+    if not spans:
+        return text, None
+
+    cut = len(spans)
+    kinds = []
+    while cut > 0:
+        kind = _status_segment_kind(text[spans[cut - 1][0]:spans[cut - 1][1]], grounding)
+        if kind is None:
+            break
+        kinds.append(kind)
+        cut -= 1
+
+    fires = "signal" in kinds or ("go" in kinds and len(kinds) >= 2)
+    if not fires:
+        return text, None
+    if cut > 0 and _QUESTION_END_RE.search(text[spans[cut - 1][0]:spans[cut - 1][1]].strip()):
+        return text, None
+    return text[:spans[cut - 1][1]].rstrip() if cut > 0 else "", "status-report tail"
+
+
+def cut_adjacent_repeat(text, max_block=4, min_chars=_REPEAT_MIN_SENTENCE_CHARS):
+    """Cut at the second copy of a block repeated back to back, as
+    (kept, reason). (text, None) when there is none.
+
+    A block of 1..max_block segments followed immediately by itself is the
+    decode looping. degeneracy_cut counts a short sentence three times
+    before calling it a loop, which is right across a long answer, but a
+    back-to-back copy is the loop with nothing in between to excuse it. A
+    global dedupe afterwards only collapses the copies, keeping one and
+    everything after it, and what comes after a loop is more of the
+    collapse ("...Done. Go. Done. Go. Deployment timestamp: ...").
+    """
+    if not text or not str(text).strip():
+        return text, None
+    text = str(text)
+    spans = _segment_spans(text)
+    norms = [re.sub(r"\s+", " ", text[s:e]).strip().rstrip(".!?… ").casefold()
+             for s, e in spans]
+    best = None
+    for size in range(1, max_block + 1):
+        for i in range(len(spans) - 2 * size + 1):
+            block = norms[i:i + size]
+            if block != norms[i + size:i + 2 * size]:
+                continue
+            if sum(len(n) for n in block) < min_chars:
+                continue
+            if best is None or i + size < best:
+                best = i + size
+            break
+    if best is None:
+        return text, None
+    return text[:spans[best][0]].rstrip(), "a block repeated back to back"
+
+
+def trim_degenerate_tails(text, grounding=None):
+    """The three tail trimmers (status report, closer run, restating
+    fragments), repeated until none applies, as (kept, reasons).
+
+    Repeated because one can expose another: "A. Final state: COMPLETED.
+    Exactly five. Done." loses its echo tail first, which leaves a status
+    tail. Every step cuts a prefix, so the fixed point is what makes a
+    second call a no-op. Returns "" only when the whole text is a status
+    report (see trim_status_tail).
+    """
+    if not text or not str(text).strip():
+        return text, []
+    text = str(text)
+    reasons = []
+    while True:
+        before = text
+        kept, reason = trim_status_tail(text, grounding)
+        if reason is not None:
+            reasons.append(reason)
+            text = kept
+            if not text.strip():
+                return "", reasons
+        kept = trim_closer_tail(text)
+        if kept != text:
+            reasons.append("closer-cycling tail")
+            text = kept
+        kept = trim_echo_tail(text)
+        if kept != text:
+            reasons.append("restating tail")
+            text = kept
+        if text == before:
+            return text, reasons
+
+
+def scrub_result(text, exemplars=(), grounding=None):
     """
     One subtask result with its degenerate parts removed, as
     (kept_text, reasons). reasons is empty when nothing was removed.
@@ -1194,21 +1504,24 @@ def scrub_result(text, exemplars=()):
     small model tends to continue it. This is run once, where the result
     is stored, and again at the points it is injected into a prompt.
 
-    Three steps, in order:
+    Two steps, in order:
       1. degeneracy_cut with repeat_threshold=2. The result has already been
          trimmed to about three sentences, so a sentence appearing twice is
          the loop starting. Everything from its second copy is cut.
-      2. trim_closer_tail, for closer runs from REPORT paths that did not
-         trim them at the source.
-      3. trim_echo_tail, for the restating tail step 2 does not catch.
+      2. trim_degenerate_tails: a status-report/deploy-log tail ("Final
+         state: COMPLETED. Report end.", checked against `grounding` for
+         made-up timestamps and metrics), a closer run from REPORT paths
+         that did not trim it at the source, and the restating fragments
+         the closer trimmer does not catch.
 
     Every step cuts a prefix and never rewrites what it keeps, so the
     function is idempotent. That is what makes the second run at injection
     free on text that was already scrubbed.
 
     Can return "" when the text is degenerate from its first sentence (an
-    echoed exemplar, say). What an empty result means is the caller's
-    decision, the same contract as degeneracy_cut.
+    echoed exemplar, say, or nothing but a status report). What an empty
+    result means is the caller's decision, the same contract as
+    degeneracy_cut.
 
     Prose only. Callers exempt source code, since sentence boundaries mean
     nothing there.
@@ -1225,17 +1538,8 @@ def scrub_result(text, exemplars=()):
         if not text.strip():
             return "", reasons
 
-    kept = trim_closer_tail(text)
-    if kept != text:
-        reasons.append("closer-cycling tail")
-        text = kept
-
-    kept = trim_echo_tail(text)
-    if kept != text:
-        reasons.append("restating tail")
-        text = kept
-
-    return text, reasons
+    kept, tail_reasons = trim_degenerate_tails(text, grounding)
+    return kept, reasons + tail_reasons
 
 
 # ---------------------------------------------------------------------------

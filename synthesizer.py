@@ -21,11 +21,13 @@ already wraps the shared model.
 """
 
 from text_utils import (
+    cut_adjacent_repeat as _cut_adjacent_repeat,
     dedupe_global_and_cap as _dedupe_and_cap,
     degeneracy_cut as _degeneracy_cut,
     drop_incomplete_tail as _drop_incomplete_tail,
     looks_degenerate as _looks_degenerate,
-    trim_closer_tail as _trim_closer_tail,
+    trim_degenerate_tails as _trim_degenerate_tails,
+    ungrounded_telemetry as _ungrounded_telemetry,
 )
 # The prompt's own SPAWN examples, read from the one place they are defined
 # rather than restated here -- same reason Orchestrator._matching_exemplar
@@ -247,14 +249,49 @@ class Synthesizer:
         # rest is the collapse. Keeping the good prefix and dropping the
         # rest is honest; deduping the tail and pasting the survivors back
         # together builds something that reads finished out of the failure.
+        #
+        # FIX (a deploy-log tail reached the user, twice): a final answer
+        # ended "...Ready to deploy. Done. Go. Deployment timestamp:
+        # 2023-11-03T14:23:10Z. Metrics report: accuracy=1.000000,
+        # consistency=1.000000... Final state: COMPLETED... Report end." --
+        # the loop seen in single REPORTs earlier in the same run, plus a
+        # made-up timestamp and metrics. None of the passes here caught it:
+        # nothing in it repeats three times, "Go." breaks the closer run, and
+        # the global dedupe collapsed the repeated "Ready to deploy. Done.
+        # Go." into one copy that read as clean. Upstream scrubbing now cuts
+        # it from each REPORT, but this decode can write it fresh, so it is
+        # guarded here as well:
+        #   * cut_adjacent_repeat cuts at the second copy of a block repeated
+        #     back to back, taking everything after it,
+        #   * trim_degenerate_tails cuts the status-report tail (timestamps
+        #     and metrics checked against the problem and the results the
+        #     answer had to stay inside), then the closer and restating tails.
+        # Tails are trimmed after degeneracy_cut, since its cut can leave one
+        # exposed.
         raw = self.llm_call_fn(prompt)
-        cleaned = _trim_closer_tail(_drop_incomplete_tail(raw))
+        grounding = "\n".join([str(problem_spec or "")]
+                              + [str(r.get("result", "")) for r in results])
+        cleaned = _drop_incomplete_tail(raw)
+
+        uncut = cleaned
+        cleaned, reason = _cut_adjacent_repeat(cleaned)
+        if reason is not None:
+            self._record_trim("repeat_cut")
+            print(f"  [synthesis-trim] final answer cut at {reason} "
+                  f"({len(uncut)} -> {len(cleaned)} chars).")
 
         kept, reason = _degeneracy_cut(cleaned, exemplars=EXEMPLAR_SUBTASK_DESCRIPTIONS)
         if reason is not None:
             self._record_trim("cut")
             print(f"  [synthesis-trim] final answer cut at {reason} "
                   f"({len(cleaned)} -> {len(kept)} chars).")
+
+        untrimmed = kept
+        kept, tail_reasons = _trim_degenerate_tails(kept, grounding)
+        if "status-report tail" in tail_reasons:
+            self._record_trim("status_tail")
+            print(f"  [synthesis-trim] final answer cut at a status-report tail "
+                  f"({len(untrimmed)} -> {len(kept)} chars).")
         if not kept.strip():
             self._record_trim("empty")
             print("  [synthesis-trim] nothing survived the cut -- the final "
@@ -281,6 +318,15 @@ class Synthesizer:
             print("  [synthesis-trim] WARNING: the final answer still reads "
                   "as degenerate after trimming -- shipping it, but the last "
                   "decode of this run did not go cleanly.")
+
+        # Same stance for a made-up log line that is not at the tail, where
+        # cutting it would take real content with it.
+        made_up = _ungrounded_telemetry(answer, grounding)
+        if made_up:
+            self._record_trim("shipped_telemetry")
+            print(f"  [synthesis-trim] WARNING: the final answer states "
+                  f"{len(made_up)} timestamp/metric line(s) no subtask result "
+                  f"contains -- shipping it: {made_up[0][:80]!r}")
         return answer
 
     # ------------------------------------------------------------------
