@@ -448,6 +448,11 @@ class Orchestrator:
             agent_node = self.colony.get_agent(agent_id)
             prev_len = len(live_agent.thought_process)
             was_capped = getattr(live_agent, "cycles_capped", False)
+            # SPAWN closed for lack of energy runs the same reduced-menu
+            # decide() as the cap, and its overrides land in
+            # cycle_cap_coerced -- so it has to count as a decision too, or
+            # "forced" can exceed "decisions" in the ledger.
+            was_final = getattr(live_agent, "final_only", was_capped)
             try:
                 action = live_agent.run(available_roles, available_tools, requirements=None)
                 # Tallied so the final report shows whether the cycle cap
@@ -461,7 +466,7 @@ class Orchestrator:
                 # below counts only the decisions where the model ignored the
                 # reduced menu anyway, so it reads 0 exactly when the strip
                 # does its job.
-                if was_capped:
+                if was_final:
                     self.colony.record_verdict("cycle_cap_decisions")
                 if getattr(live_agent, "cap_coerced_last_run", False):
                     self.colony.record_verdict("cycle_cap_coerced")
@@ -682,9 +687,17 @@ class Orchestrator:
                 reservation.k, reservation.spawned = 0, False  # it plans again
             reservation.sunk = self.colony.task_energy_spent.get(task_id, 0)
             if not self._admits():
+                # Enough numbers to tell real exhaustion (spent + attempt
+                # alone over the limit) from other open work's reservations.
+                attempt = self._remaining_reservation(task_id)
+                committed = self.committed_energy()
+                spent = self.colony.starting_budget - self.colony.budget_remaining
                 reservation.k, reservation.spawned, reservation.sunk = saved
                 print(f"  [admission] respawn on {task_id} refused: another "
-                      f"attempt does not fit the uncommitted budget.")
+                      f"attempt does not fit the uncommitted budget (attempt "
+                      f"{attempt:.0f}, spent {spent}, committed with it "
+                      f"{committed:.0f}, limit "
+                      f"{self.colony.starting_budget - self.ADMISSION_FLOOR}).")
                 self.colony.record_verdict("admission_respawn_refused")
                 return None
 
@@ -1491,12 +1504,20 @@ class Orchestrator:
         if out_of_energy:
             # Asking for a corrected batch would only be refused again. Only
             # reached with finished children, so REPORT is on its menu.
+            # Closed structurally, not just in the fail_reason: think() never
+            # sees that text (it continues its KV cache) and decide() still
+            # offered SPAWN, so the same batch came back at full think cost
+            # every cycle until the cap. spawn_closed puts it on the capped
+            # path now -- decide() only, REPORT/DIE.
             live_parent.fail_reason = (
                 "SPAWN Action Failed: none of your requested subtasks were "
                 "started because the colony is out of energy to start new "
                 "agents. Do not SPAWN again. REPORT what your finished "
                 "children produced, or DIE if there is nothing."
             )
+            if hasattr(live_parent, "spawn_closed"):
+                live_parent.spawn_closed = True
+                self.colony.record_verdict("spawn_closed_no_energy")
         else:
             live_parent.fail_reason = (
                 "SPAWN Action Failed: none of your requested subtasks were "
@@ -2350,6 +2371,18 @@ class Orchestrator:
         """
         live_agent = self.live_agents.pop(agent_id, None)
 
+        # Overflow queued under this agent dies with it. It is keyed by
+        # agent_id, so nothing else ever consumes it: a respawn on the same
+        # task re-plans from k=0 under a new id, yet committed_energy kept
+        # reserving every entry for the rest of the run, and a child of the
+        # old agent completing would still drain one under a dead parent.
+        dropped = self.pending_overflow.pop(agent_id, None)
+        if dropped:
+            print(f"  [admission] {agent_id} retired with {len(dropped)} queued "
+                  f"overflow subtask(s) -- dropped, releasing their reservation.")
+            for _ in dropped:
+                self.colony.record_verdict("overflow_dropped_parent_retired")
+
         if self.memory_store is not None:
             try:
                 ghost_source = live_agent if live_agent is not None else self.colony.get_agent(agent_id)
@@ -2391,9 +2424,15 @@ class Orchestrator:
         task_node = self.task_graph.tasks.get(task_id)
         self._write_cache_outcome(task_node, task_id, None, self._cache_outcome(verdict))
         if self.memory_store is not None and task_node is not None:
-            lookup = self.memory_store.get_success_cache(task_node.description)
+            lookup = self.memory_store.get_success_cache(task_node.description,
+                                                         task_id=task_id)
             cached = getattr(lookup, "hit", None)
             negatives = getattr(lookup, "negative_count", 0)
+            blocked = getattr(lookup, "cross_task_below_threshold", 0)
+            if blocked:
+                print(f"  [success-cache] {task_id}: {blocked} accepted entry(ies) "
+                      f"from other tasks below the cross-task threshold -- not served.")
+                self.colony.record_verdict("cache_cross_task_below_threshold")
             if negatives:
                 print(f"  [success-cache] {task_id}: {negatives} failed outcome(s) on "
                       f"record for this subtask or a near match "
@@ -2662,7 +2701,9 @@ class Orchestrator:
         is spent on the task)."""
         print(f"  [admission] {parent_id}'s SPAWN refused: not one subtask fits "
               f"the uncommitted budget (committed "
-              f"{self.committed_energy():.0f} of {self.colony.starting_budget}).")
+              f"{self.committed_energy():.0f} against a limit of "
+              f"{self.colony.starting_budget - self.ADMISSION_FLOOR}: budget "
+              f"{self.colony.starting_budget} minus the {self.ADMISSION_FLOOR} floor).")
         self.colony.record_verdict("admission_spawn_refused")
         if self.live_agents.get(parent_id) is not None:
             self._release_spawner_if_nothing_started(parent_id, out_of_energy=True)
@@ -3211,6 +3252,7 @@ class Orchestrator:
             print(f"    servable hits               : {verdicts.get('cache_hit_served', 0)}")
             print(f"      of which cross-task donor : {verdicts.get('cache_hit_served_cross_task', 0)}")
             print(f"    misses on a negative match  : {verdicts.get('cache_miss_negative_match', 0)}")
+            print(f"    cross-task below threshold  : {verdicts.get('cache_cross_task_below_threshold', 0)}")
 
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
             # Read these three together. "decisions at the cap" is the number
@@ -3220,6 +3262,8 @@ class Orchestrator:
             # with decisions > 0 is the strip WORKING, not failing. Reached
             # with 0 decisions means every capped agent was respawned before
             # it made one (the WARN-at-cap path), so the menu never came up.
+            # Decisions by a decomposer whose SPAWN was closed for lack of
+            # energy (spawn_closed) run the same reduced menu and count here.
             decisions = verdicts.get('cycle_cap_decisions', 0)
             coerced = verdicts.get('cycle_cap_coerced', 0)
             print(f"    agents that reached it   : {verdicts.get('cycle_cap_reached', 0)}")
@@ -3329,12 +3373,15 @@ class Orchestrator:
             # What admission turned away. All zero on a run whose budget
             # covered everything it planned.
             print(f"\n  ADMISSION (committed at end: {self.committed_energy():.0f} "
-                  f"of {self.colony.starting_budget}, floor {self.ADMISSION_FLOOR})")
+                  f"against a limit of {self.colony.starting_budget - self.ADMISSION_FLOOR}: "
+                  f"budget {self.colony.starting_budget}, floor {self.ADMISSION_FLOOR})")
             for label, key in (("subtasks dropped from a batch", "admission_subtasks_dropped"),
                                ("SPAWN batches refused outright", "admission_spawn_refused"),
                                ("TASK TOO LARGE conversions refused", "admission_conversion_refused"),
                                ("respawns refused", "admission_respawn_refused"),
-                               ("root refused at bootstrap", "admission_root_refused")):
+                               ("root refused at bootstrap", "admission_root_refused"),
+                               ("SPAWN closed (no energy)", "spawn_closed_no_energy"),
+                               ("overflow dropped, parent retired", "overflow_dropped_parent_retired")):
                 print(f"    {label:<35}: {verdicts.get(key, 0)}")
 
             live_count = getattr(self, "_live_agents_at_terminate", len(self.live_agents))

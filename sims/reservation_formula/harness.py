@@ -301,7 +301,7 @@ class _NullMemory:
     def write(self, *a, **k):
         return 1
 
-    def get_success_cache(self, description):
+    def get_success_cache(self, description, task_id=None):
         return None
 
 

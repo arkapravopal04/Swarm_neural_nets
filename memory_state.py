@@ -25,6 +25,12 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIM = 384
 
 SUCCESS_CACHE_THRESHOLD = 0.45
+# An accepted entry written by a DIFFERENT task must clear this instead.
+# Serving one completes this task with another task's answer, and at 0.45
+# (0.65-0.67 in practice) that was a related topic, not the same subtask.
+# Same-task entries keep SUCCESS_CACHE_THRESHOLD: their description is the
+# query itself.
+CROSS_TASK_SUCCESS_CACHE_THRESHOLD = 0.85
 
 # Judging outcome recorded on every success-cache entry. Only ACCEPTED is
 # servable; anything else -- including an entry with no outcome at all --
@@ -38,6 +44,7 @@ class SuccessLookup:
     hit_score: float = 0.0
     negative_count: int = 0         # non-servable entries at/above threshold
     negative_outcomes: dict = field(default_factory=dict)  # outcome -> count
+    cross_task_below_threshold: int = 0  # accepted, other task, under the cross-task bar
 
 
 class MemoryStore:
@@ -118,17 +125,26 @@ class MemoryStore:
         return results
 
     def get_success_cache(self, task_description: str,
-                          threshold: float = SUCCESS_CACHE_THRESHOLD) -> SuccessLookup:
+                          threshold: float = SUCCESS_CACHE_THRESHOLD,
+                          task_id: Optional[str] = None,
+                          cross_task_threshold: float = CROSS_TASK_SUCCESS_CACHE_THRESHOLD,
+                          ) -> SuccessLookup:
         # Every neighbour at/above the threshold is read, not just the top
         # one: a task's own failure scores ~1.0 against itself and would
         # otherwise shadow an accepted entry behind it. Same embedding, same
         # score, same threshold -- only how many neighbours are read.
+        # With task_id given, an accepted entry from another task is only
+        # servable at/above cross_task_threshold (see its constant).
         lookup = SuccessLookup()
         for h in self.query(task_description, "success", top_k=self.success_index.ntotal):
             if h["score"] < threshold:
                 break
             meta = h["metadata"]
             if meta.get("outcome") == OUTCOME_ACCEPTED:
+                cross_task = task_id is not None and meta.get("task_id") != task_id
+                if cross_task and h["score"] < cross_task_threshold:
+                    lookup.cross_task_below_threshold += 1
+                    continue
                 if lookup.hit is None:
                     lookup.hit, lookup.hit_score = meta, h["score"]
             else:

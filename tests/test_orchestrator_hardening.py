@@ -42,7 +42,7 @@ class _NullMemoryStore:
     def write(self, record_type, text, metadata):
         return 1
 
-    def get_success_cache(self, description):
+    def get_success_cache(self, description, task_id=None):
         return None
 
 
