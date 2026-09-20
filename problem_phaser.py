@@ -5,6 +5,7 @@ from sentence_transformers import SentenceTransformer
 from text_utils import (
     asks_for_software,
     cut_at_code_block,
+    cut_instruction_tail,
     dedupe_global_and_cap,
     dedupe_list_exact,
     final_derived_constraint,
@@ -198,6 +199,36 @@ class Problem_Phaser:
             return 0.0
         return np.dot(vec_a, vec_b) / (norm_a * norm_b)
 
+    # Generation-time stop strings for every phaser call.
+    #
+    # THIS IS THE UPSTREAM FIX; cut_instruction_tail is the band-aid behind
+    # it. Run 6's goal came back as 254 characters of which the last 123
+    # were "---THESE THREE QUESTIONS NEED TO BE ANSWERED IN ORDER--END OF
+    # OUTPUT-- -- -- --", and that string became goal_vector.
+    #
+    # WHY IT HAPPENS. The adapter is a ChatML LoRA on Qwen3-4B: its
+    # tokenizer_config declares eos_token "<|im_end|>" and it ships the
+    # stock Qwen3 chat_template.jinja. Nothing in this codebase calls
+    # apply_chat_template -- every prompt here is raw text -- so
+    # "<|im_end|>" never appears in the prompt and is never a natural
+    # continuation. The model therefore has no in-distribution way to stop
+    # and runs to max_new_tokens every time, padding the tail with the
+    # boundary marker it DOES know: all 200 records in fine_tune/train3.json
+    # wrap their instruction in a bare "---" line, then the prompt body,
+    # then "Your next action:", then a closing "---" line immediately
+    # before the completion -- so "---"
+    # is the document boundary it learned. (Serving through the chat
+    # template is the better fix and is deliberately NOT done here: it moves
+    # the distribution every tuning decision in this file was made against,
+    # and that belongs in its own run.)
+    #
+    # The matched stop string is still INCLUDED in the generated text --
+    # generate() stops after emitting it, not before -- so the cleanup
+    # downstream is what actually removes it. The win is that generation
+    # ends there instead of spending the remaining budget on 60 more tokens
+    # of dashes.
+    STOP_STRINGS = ["---", "END OF OUTPUT"]
+
     # Extra goal samples drawn when a sample is still source code after
     # fence stripping, before falling back to the user's own text.
     GOAL_CODE_RESAMPLES = 2
@@ -217,7 +248,25 @@ class Problem_Phaser:
         # matched pair. Strip before dedupe/encode: the fence would
         # otherwise be printed as the root task description and embedded
         # into goal_vector, the tier-2 similarity target.
-        return strip_code_fences(goal_sentence)
+        goal_sentence = strip_code_fences(goal_sentence)
+
+        # Same-line scaffold, LAST: run 6 ended the goal with
+        # "...disliked selections.---THESE THREE QUESTIONS NEED TO BE
+        # ANSWERED IN ORDER--END OF OUTPUT-- -- -- --", 116 characters of
+        # delimiter on a 130-character goal. _sanitize_generation above
+        # cannot reach it -- every stop marker it knows begins with a
+        # newline or is a conversational opener, and this arrives glued to
+        # the final full stop. It matters more here than anywhere else the
+        # cleanup runs: this string is embedded into goal_vector, which is
+        # the reference direction PATCH 12's drift gate scores every
+        # subtask against, and a reference that is half delimiter separates
+        # subtasks by how much delimiter they share, not by how close to
+        # the project they are.
+        goal_sentence, cut_reasons = cut_instruction_tail(goal_sentence)
+        if cut_reasons:
+            print(f"[Problem_Phaser] goal: cut same-line scaffold "
+                  f"({', '.join(cut_reasons)}): {goal_sentence[:120]!r}")
+        return goal_sentence
 
     def _pick_goal(self, sample, raw_text):
         """
@@ -239,7 +288,16 @@ class Problem_Phaser:
                 f"[Problem_Phaser] WARNING: goal sample {attempt + 1} is source "
                 f"code, not a sentence -- re-sampling: {goal_sentence[:120]!r}"
             )
+        # The same cut on the fallback path. raw_text is the user's own
+        # input so it does not normally carry a model-emitted delimiter --
+        # but this branch is reached precisely when generation has already
+        # misbehaved, and a dataset question that ends in its own
+        # "END OF OUTPUT" would otherwise land in goal_vector untouched.
         fallback = strip_code_fences(" ".join(raw_text.split()))
+        fallback, fallback_reasons = cut_instruction_tail(fallback)
+        if fallback_reasons:
+            print(f"[Problem_Phaser] goal fallback: cut same-line scaffold "
+                  f"({', '.join(fallback_reasons)})")
         print(
             f"[Problem_Phaser] WARNING: every goal sample was source code; "
             f"using the user's input as the goal: {fallback[:120]!r}"
@@ -301,6 +359,7 @@ Output:"""
                     **inputs, max_new_tokens=100, min_new_tokens=5,
                     do_sample=True, temperature=0.7, top_p=0.9,
                     pad_token_id=self.tokeniser.eos_token_id,
+                    stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
                     repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
                 )
                 return self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
@@ -365,6 +424,7 @@ Output:"""
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=100, min_new_tokens=2, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
+                stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
                 repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
             )
             context_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
@@ -428,6 +488,7 @@ Output:
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=120, min_new_tokens=2, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
+                stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
                 repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
             )
             req_output = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
@@ -474,6 +535,7 @@ Output:"""
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=60, min_new_tokens=5, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
+                stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
                 repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
             )
             domain_str = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()

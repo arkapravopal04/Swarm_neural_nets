@@ -1936,6 +1936,103 @@ def scrub_result(text, exemplars=(), grounding=None):
 
 
 # ---------------------------------------------------------------------------
+# Same-line instruction/delimiter tails on a SHORT extracted string.
+#
+# trim_artifact_tail above handles the end of a long free-text answer and
+# scans backwards from it, so it only ever removes a run that is already the
+# LAST thing in the text. Run 6's goal was
+#
+#   "...disliked selections.---THESE THREE QUESTIONS NEED TO BE ANSWERED IN
+#    ORDER--END OF OUTPUT-- -- -- -- ..."
+#
+# where the backwards scan stops at "OUTPUT--" and leaves 116 characters of
+# scaffold glued to a 130-character goal. _sanitize_generation cannot help
+# either: every one of its stop markers begins with a newline or is a
+# conversational opener, and this arrives on the SAME LINE as the sentence.
+# That string became goal_vector -- the reference the drift gate scores every
+# subtask against -- so half the gate's reference direction was delimiter.
+#
+# This cuts FORWARDS from the first marker instead, and is meant for the
+# short extracted strings (goal, context, a one-line constraint) rather than
+# for answers.
+#
+#   * a run of 3+ ASCII hyphens, or 2+ en/em dashes. THREE, not two: this
+#     codebase and the model both write "--" for an em dash mid-sentence,
+#     and "-" is in every hyphenated phrase. A single "—" is prose.
+#   * "END OF OUTPUT" and its siblings, anywhere on the line.
+#   * an all-caps instruction block APPENDED AFTER A SENTENCE TERMINATOR:
+#     three or more consecutive all-caps words, at least one of them 4+
+#     characters, starting right after a '.', '!' or '?'. The terminator
+#     requirement is what keeps a mid-sentence acronym run ("the NASA, ESA
+#     and JAXA proposals") out of it, and the 4+ rule is a second guard on
+#     an appended acronym list.
+#
+# NEVER RETURNS EMPTY. A marker at offset 0 means the extraction itself
+# failed, not that the string is scaffold; the caller gets the original text
+# back and an empty reason list, so a degenerate parse stays visible to the
+# checks downstream instead of being silently blanked here.
+# ---------------------------------------------------------------------------
+
+_SAME_LINE_DASH_RUN_RE = re.compile(r"-{3,}|[–—]{2,}")
+_END_OF_OUTPUT_RE = re.compile(
+    r"\bEND[ \t]+OF[ \t]+(?:OUTPUT|TEXT|ANSWER|RESPONSE|PROMPT)\b", re.IGNORECASE
+)
+_CAPS_WORD = r"[A-Z][A-Z0-9'’]+"
+_APPENDED_CAPS_BLOCK_RE = re.compile(
+    rf"(?<=[.!?])[ \t]*(?P<block>{_CAPS_WORD}(?:[ \t]+{_CAPS_WORD}){{2,}})"
+)
+# One word in an appended caps run must be this long before the run counts as
+# an instruction rather than an acronym list ("FBI CIA NSA" stays).
+CAPS_BLOCK_MIN_LONG_WORD = 4
+
+
+def _appended_caps_block_start(text):
+    """Offset of an all-caps instruction block appended after a sentence
+    terminator, or None."""
+    for match in _APPENDED_CAPS_BLOCK_RE.finditer(text):
+        words = match.group("block").split()
+        if any(len(w) >= CAPS_BLOCK_MIN_LONG_WORD for w in words):
+            return match.start("block")
+    return None
+
+
+def cut_instruction_tail(text):
+    """`text` cut at the first same-line scaffold marker, as (kept, reasons).
+
+    reasons names each marker that was the cut point, at most one per kind:
+    "dash run", "end-of-output marker", "appended caps block". Returns the
+    text unchanged with no reasons when nothing matches, and -- deliberately
+    -- when the earliest marker sits at the start (see the note above).
+    """
+    if not text or not str(text).strip():
+        return text, []
+    text = str(text)
+
+    # (offset, rank, reason). The rank only breaks ties between two markers
+    # that start at the same offset -- "totals. END OF OUTPUT" is both an
+    # end marker and an appended caps block -- so the reason the ledger
+    # prints names the more specific finding rather than whichever string
+    # sorts first.
+    candidates = []
+    end_marker = _END_OF_OUTPUT_RE.search(text)
+    if end_marker is not None:
+        candidates.append((end_marker.start(), 0, "end-of-output marker"))
+    dash = _SAME_LINE_DASH_RUN_RE.search(text)
+    if dash is not None:
+        candidates.append((dash.start(), 1, "dash run"))
+    caps = _appended_caps_block_start(text)
+    if caps is not None:
+        candidates.append((caps, 2, "appended caps block"))
+    if not candidates:
+        return text, []
+
+    cut, _rank, reason = min(candidates)
+    kept = text[:cut].rstrip()
+    if not kept.strip():
+        return text, []
+    return kept, [reason]
+
+# ---------------------------------------------------------------------------
 # Software framing on projects that are not about software.
 #
 # A 4B instruction-tuned model reads "implement", "logic", "algorithm" and
@@ -2176,6 +2273,76 @@ FIGURE_DIVERGENCE_MIN = 2
 FIGURE_DIVERGENCE_MAX_OVERLAP = 1.0 / 3.0
 
 
+# An ENUMERATOR, not a quantity: a bare small integer that opens a list item.
+#
+# Run 6's largest "figure divergence" was task_6cc287e9 at 62.1x --
+# ['181.7', '186.3'] against ['1', '2', '3'] -- where the second attempt was
+# "three tiers of resolution logic: 1) tiebreaker score threshold ... 2)
+# fallback consensus rule ... 3) conflict arbitration ...". Those are list
+# markers. Comparing them against measured values is not a contradiction
+# between two attempts, it is the detector reading prose structure as data,
+# and it is the noisiest thing PATCH 16 does.
+#
+# Deliberately narrow, because the cost of over-excluding is a real
+# fabricated quantity going unseen:
+#   * 1..20 only. A list does not enumerate to 152, and "152" is the kind of
+#     number this check exists to catch.
+#   * integer only -- no decimal point, no thousands separator, no percent.
+#   * immediately followed by ')' or '.', no space in between.
+#   * at a CLAUSE START: string start, or after a newline, bullet, or one of
+#     . ! ? : ; ) -- optionally with whitespace. "3." mid-sentence, as in
+#     "raise it to 3.", is not at a clause start and is kept.
+# "2)" in "(see 2)" is preceded by a space after "see", not by a clause
+# terminator, so it survives -- accepted: the alternative is dropping real
+# figures written in parentheses.
+# Two forms, scoped differently, because they carry different risk.
+#
+# "N)" -- a digit followed by a close paren. Almost never a quantity: the
+# only common way one appears in real prose is inside a parenthesis that
+# opened earlier ("(see 2)"), so an unmatched "(" anywhere before it on the
+# line is the guard, and position is otherwise free. It has to be free: run
+# 6's actual text enumerated after a colon, after a comma, and after "and"
+#   "...three tiers of resolution logic: 1) tiebreaker score threshold ...,
+#    2) fallback consensus rule ..., and 3) conflict arbitration ..."
+# and a clause-start rule tight enough to be safe for "N." would have caught
+# only the first of the three.
+#
+# "N." -- a digit followed by a full stop. Genuinely ambiguous ("raise the
+# quorum to 3." is a figure at the end of a sentence), so this form must sit
+# at a LINE start, optionally behind a bullet character. Run 5's
+# "Resolved vote counts: Book X - 35, Book Y - 47, Book Z - 19. Unresolved
+# votes: ..." is why the bullet cannot be accepted mid-line: a dash used as
+# a separator in prose is not a list marker, and "19" there is exactly the
+# kind of figure this check exists to compare.
+_ENUMERATOR_PAREN_RE = re.compile(
+    r"(?P<n>\d{1,2})\)(?=[ \t]|$)", re.MULTILINE
+)
+_ENUMERATOR_DOT_RE = re.compile(
+    r"(?:^|(?<=[\n\r]))[ \t]*(?:[-*\u2022][ \t]*)?(?P<n>\d{1,2})\.(?=[ \t])",
+    re.MULTILINE,
+)
+ENUMERATOR_MAX = 20
+
+
+def _enumerator_spans(text):
+    """Character spans of list markers like "1)" or "3." -- the numerals
+    figures() must not read as quantities."""
+    spans = []
+    for match in _ENUMERATOR_DOT_RE.finditer(text):
+        if int(match.group("n")) <= ENUMERATOR_MAX:
+            spans.append(match.span("n"))
+    for match in _ENUMERATOR_PAREN_RE.finditer(text):
+        if int(match.group("n")) > ENUMERATOR_MAX:
+            continue
+        # An unmatched "(" before it means this paren is closing something,
+        # so the digit is content: "(see 2)", "(rule 3)".
+        before = text[:match.start("n")]
+        if before.count("(") > before.count(")"):
+            continue
+        spans.append(match.span("n"))
+    return spans
+
+
 def figures(text):
     """Every standalone numeral `text` asserts, canonicalised.
 
@@ -2187,11 +2354,19 @@ def figures(text):
     Standalone only. "resolved1 + resolved2" is an identifier suffix, not a
     quantity, and the lookbehind rules it out along with version numbers and
     decimals already counted.
+
+    List markers are not figures. A bare small integer opening a clause and
+    followed by ')' or '.' is dropped -- see _ENUMERATOR_RE for why and for
+    how narrowly that is scoped.
     """
     if not text:
         return []
+    text = str(text)
+    skip = set(_enumerator_spans(text))
     out = []
-    for match in _FIGURE_RE.finditer(str(text)):
+    for match in _FIGURE_RE.finditer(text):
+        if match.span() in skip:
+            continue
         token = match.group(0).replace(",", "")
         out.append(token)
     return out

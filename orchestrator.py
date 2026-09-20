@@ -107,6 +107,37 @@ GOAL_DRIFT_GATE_FRACTION = 0.58
 # costs nothing there.
 GOAL_DRIFT_GATE_MIN_SAMPLES = 6
 
+# MEASURE-ONLY AS OF RUN 7. Scoring, the ledger and the [GATED] marking all
+# stay on; the DROP does not happen.
+#
+# Run 6 is the reason. Its goal_vector was built from a 246-character string
+# whose last 116 characters were "---THESE THREE QUESTIONS NEED TO BE
+# ANSWERED IN ORDER--END OF OUTPUT-- -- -- --" (fixed upstream now, in
+# _clean_goal_text). Five subtasks were dropped, four of them conflict
+# resolution -- which is the goal's OWN third clause -- while task_d4aace3c,
+# "Design conflict-resolution protocols for unresolved preferences", scored
+# 0.242, LOWER than three of the five, escaped the gate only because it
+# spawned before the run reached GOAL_DRIFT_GATE_MIN_SAMPLES, and then
+# COMPLETED and was promoted. That is a direct counterexample: the gate's
+# own ordering put a task that produced accepted work below tasks it refused
+# to start.
+#
+# Replaying the 19 scores against the CLEANED goal does not rescue them --
+# it makes the picture worse (4 of the 5 stay under threshold, and 3 more
+# join them, task_d4aace3c included). The clause-level numbers say why: the
+# goal is a three-clause conjunction, its embedding sits in the average of
+# the three, and a subtask that nails exactly ONE clause is far from that
+# average by construction. task_24766b16 scores 0.202 against the whole goal
+# and 0.259 against the clause it actually serves; task_3d7a8019 scores
+# 0.296 and 0.466. The run's max, 0.658, belongs to a subtask that straddles
+# two clauses. So the threshold is a multi-clause ceiling applied to
+# single-clause children, and goal sanitation alone does not fix it.
+#
+# Re-arm (with a per-clause reference, most likely) only after a run shows a
+# clean goal string AND a distribution where the gate's ordering and the
+# run's own outcomes agree.
+GOAL_DRIFT_GATE_ACTS = False
+
 
 def _cosine(a, b) -> Optional[float]:
     """
@@ -200,6 +231,12 @@ class Orchestrator:
         # once per run rather than twice. A dropped subtask's entry is popped
         # by the gate itself -- nothing else ever looks it up.
         self._gate_description_embeddings: Dict[str, Any] = {}
+
+        # PATCH 12, measure-only mode. task_ids the gate scored below
+        # threshold while GOAL_DRIFT_GATE_ACTS is False. Read once, by
+        # _measure_spawn_drift, to mark the ledger entry the spawn itself
+        # files -- see the note in _screen_goal_drift_batch.
+        self._gate_would_drop: set = set()
 
         # PATCH 16. The last REPORT each task produced, as
         # {task_id: (agent_id, untrimmed result)}. One entry per task,
@@ -1323,7 +1360,7 @@ class Orchestrator:
             "description": child_node.description,
             "goal_drift": goal_drift,
             "parent_drift": parent_drift,
-            "gated": False,
+            "gated": child_node.task_id in self._gate_would_drop,
         })
 
         # Why a number is missing matters as much as the number. A zero-norm
@@ -1339,8 +1376,10 @@ class Orchestrator:
         def _fmt(value):
             return f"{value:.3f}" if value is not None else "n/a"
 
+        kept = ("kept, GATE WOULD HAVE DROPPED"
+                if child_node.task_id in self._gate_would_drop else "kept")
         print(f"  [spawn-drift] {child_node.task_id} goal={_fmt(goal_drift)} "
-              f"parent={_fmt(parent_drift)} (kept): "
+              f"parent={_fmt(parent_drift)} ({kept}): "
               f"{str(child_node.description)[:70]!r}")
 
     def _flag_software_shaped_task(self, child_node: TaskNode):
@@ -1900,7 +1939,9 @@ class Orchestrator:
 
         for i in tripped:
             self.colony.record_verdict("goal_drift_gate_dropped")
-            print(f"  [goal-drift gate] DROP {prepared[i][2]} "
+            print(f"  [goal-drift gate] "
+                  f"{'DROP' if GOAL_DRIFT_GATE_ACTS else 'WOULD DROP'} "
+                  f"{prepared[i][2]} "
                   f"goal={scores[i]:.3f} < {threshold:.3f} "
                   f"(={GOAL_DRIFT_GATE_FRACTION:g} x observed max): "
                   f"{str(prepared[i][1])[:70]!r}")
@@ -1913,14 +1954,31 @@ class Orchestrator:
             # computing it would mean resolving a parent task for a node that
             # is never going to exist.
             self._flag_artifact_shaped_task(
-                prepared[i][2], prepared[i][1], drift_dropped=True)
-            self.goal_drift_samples.append({
-                "task_id": prepared[i][2],
-                "description": prepared[i][1],
-                "goal_drift": scores[i],
-                "parent_drift": None,
-                "gated": True,
-            })
+                prepared[i][2], prepared[i][1],
+                drift_dropped=GOAL_DRIFT_GATE_ACTS)
+            if GOAL_DRIFT_GATE_ACTS:
+                self.goal_drift_samples.append({
+                    "task_id": prepared[i][2],
+                    "description": prepared[i][1],
+                    "goal_drift": scores[i],
+                    "parent_drift": None,
+                    "gated": True,
+                })
+            else:
+                # Measure-only: this subtask IS going to spawn, so
+                # _measure_spawn_drift will file its ledger entry in a
+                # moment -- with a real parent_drift, which this path
+                # cannot compute. Appending here too would double-count it
+                # and break the run's own n. The task_id is remembered
+                # instead, and _measure_spawn_drift marks that entry
+                # "gated", so the ledger still shows exactly which subtasks
+                # the gate would have refused.
+                self._gate_would_drop.add(prepared[i][2])
+        if not GOAL_DRIFT_GATE_ACTS:
+            print(f"  [goal-drift gate] measure-only "
+                  f"(GOAL_DRIFT_GATE_ACTS=False): {len(tripped)} subtask(s) "
+                  f"scored below threshold and were started anyway.")
+            return []
         return tripped
 
     def _drop_drifted_subtasks(self, parent_id: str, dropped: list) -> None:
@@ -4311,7 +4369,8 @@ class Orchestrator:
                       "went live in the same run, and two new gates firing at "
                       "once leaves no way to attribute what changed)")
 
-            print(chr(10) + "  GOAL DRIFT AT SPAWN (PATCH 7 measures, PATCH 12 gates the extreme)")
+            print(chr(10) + "  GOAL DRIFT AT SPAWN (PATCH 7 measures; PATCH 12's gate "
+                  + ("ACTING" if GOAL_DRIFT_GATE_ACTS else "MEASURE-ONLY") + ")")
             samples = getattr(self, "goal_drift_samples", []) or []
             if not samples:
                 print("    (no subtasks spawned this run)")
@@ -4319,15 +4378,16 @@ class Orchestrator:
                 goal_vals = [s["goal_drift"] for s in samples if s["goal_drift"] is not None]
                 parent_vals = [s["parent_drift"] for s in samples if s["parent_drift"] is not None]
                 gated = [s for s in samples if s.get("gated")]
+                verb = "dropped by the gate" if GOAL_DRIFT_GATE_ACTS                     else "below threshold, started anyway"
+                spawned = len(samples) - (len(gated) if GOAL_DRIFT_GATE_ACTS else 0)
                 print(f"    subtasks measured : {len(goal_vals)} of {len(samples)} "
-                      f"scored ({len(samples) - len(gated)} spawned, "
-                      f"{len(gated)} dropped by the gate)")
+                      f"scored ({spawned} spawned, {len(gated)} {verb})")
                 print(f"    gate : below {GOAL_DRIFT_GATE_FRACTION:g} x the run's "
                       f"observed max goal-cosine"
                       + (f" (= {GOAL_DRIFT_GATE_FRACTION * max(goal_vals):.3f} "
                          f"against a max of {max(goal_vals):.3f})" if goal_vals else "")
                       + f", once {GOAL_DRIFT_GATE_MIN_SAMPLES} scores exist")
-                print(f"      subtasks dropped        : "
+                print(f"      subtasks {'dropped        ' if GOAL_DRIFT_GATE_ACTS else 'that WOULD drop'} : "
                       f"{verdicts.get('goal_drift_gate_dropped', 0)}")
                 print(f"      whole batches spared    : "
                       f"{verdicts.get('goal_drift_gate_whole_batch_spared', 0)}"
