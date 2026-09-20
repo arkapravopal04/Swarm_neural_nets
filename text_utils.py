@@ -1382,6 +1382,97 @@ def degeneracy_cut(text, exemplars=(), repeat_threshold=None):
     return text, None
 
 
+# ---------------------------------------------------------------------------
+# PATCH 14 -- scaffold echo, second form.
+#
+# Run 5's root REPORT (agent_6ab689f1) ended:
+#
+#   "...Ready to send to your parent. Your turn. Your role: executor Your
+#    task: run member voting on book selections from a list of Available"
+#
+# That is the agent's own PROMPT HEADER read back out, not the worked-REPORT
+# exemplar, so PATCH 11's is_exemplar_echo (which counts copies of the
+# exemplar text) never looked at it and the counter read 0 while it happened.
+# degeneracy_cut missed it too: its _SCAFFOLD_PHRASE_RE covers "Your next
+# action:", "Available actions:" and "Your output must be", but not the
+# "Your Role:" / "Your Task:" pair that opens every agent prompt -- and the
+# generation budget cut this one mid-word ("...a list of Available"), so even
+# the "Available actions:" it was walking into never completed.
+#
+# WHY THIS IS NOT JUST ADDED TO _SCAFFOLD_PHRASE_PATTERN. That pattern is
+# IGNORECASE and degeneracy_cut TRUNCATES on it. "Your task: pick three books
+# by Friday." is an ordinary sentence in a finished plan, and a bare
+# case-insensitive "Your task:" would throw away everything after it -- the
+# exact failure the note on _SCAFFOLD_LABEL_PATTERN describes for
+# "Action:"/"Payload:". So the header echo is its own check, and it demands
+# corroboration before it fires:
+#
+#   * "Your Role:" whose VALUE is one of the colony's own role names
+#     ("Your role: executor") -- the harness talking, unmistakably, since no
+#     answer to a book-club question assigns somebody the role "executor"; or
+#   * TWO OR MORE distinct headers in the text -- one header is a sentence,
+#     a run of them is the prompt.
+#
+# ACTION:/PAYLOAD: stay case-SENSITIVE inside the pattern, for the reason
+# _PROTOCOL_SHOUT_RE is: shouted is the protocol register, "Action: book the
+# venue" is English.
+_PROMPT_HEADER_RE = re.compile(
+    r"(?i:Your\s+next\s+action\s*:)"
+    r"|(?i:Available\s+actions\s*:)"
+    r"|(?i:Your\s+role\s*:)"
+    r"|(?i:Your\s+task\s*:)"
+    r"|(?:ACTION|PAYLOAD)\s*:"
+)
+# The colony's own role vocabulary as the value of an echoed "Your Role:".
+_PROMPT_ROLE_HEADER_RE = re.compile(
+    r"Your\s+role\s*:\s*(?:decomposer|executor|verifier|worker)\b",
+    re.IGNORECASE,
+)
+
+
+def prompt_header_echo(text):
+    """Where the prompt's structural headers start being read back, as
+    (offset, header) -- or None when they are not.
+
+    Fires on a "Your Role:" carrying a colony role name, or on two or more
+    distinct headers anywhere in the text. See the note above for why one
+    bare header is not enough.
+
+    The offset is the FIRST header's, not the corroborating one's: in
+    "...Your turn. Your role: executor Your task: run member voting", the
+    answer stopped at "Your role:", and keeping that line because the proof
+    arrived a clause later would leave the prompt header in the result.
+    """
+    if not text or not str(text).strip():
+        return None
+    text = str(text)
+    matches = list(_PROMPT_HEADER_RE.finditer(text))
+    if not matches:
+        return None
+    distinct = {re.sub(r"\s+", " ", m.group(0)).strip().casefold() for m in matches}
+    if len(distinct) < 2 and _PROMPT_ROLE_HEADER_RE.search(text) is None:
+        return None
+    return matches[0].start(), matches[0].group(0)
+
+
+def cut_prompt_header_echo(text):
+    """`text` cut where prompt_header_echo says the prompt starts, as
+    (kept, reason). (text, None) when there is none.
+
+    Cut, not rejected. In run 5 the echo was only ever in the tail the
+    3-sentence report-trim was going to drop anyway -- so rejecting on it
+    would have killed the root REPORT of the run's first honest success over
+    text no consumer ever saw. Returns "" when the echo begins at offset 0,
+    the degeneracy_cut contract: a REPORT that is nothing but prompt header
+    is the caller's call, not this function's.
+    """
+    found = prompt_header_echo(text)
+    if found is None:
+        return text, None
+    offset, header = found
+    return str(text)[:offset].rstrip(), f"the prompt header echoed back ({header!r})"
+
+
 # A REPORT that is one of the prompt's exemplars plus at most this many words
 # of its own -- "Final answer:", the "end" of a "---END--" tail -- is the
 # exemplar, not an answer.
@@ -1791,7 +1882,11 @@ def scrub_result(text, exemplars=(), grounding=None):
     small model tends to continue it. This is run once, where the result
     is stored, and again at the points it is injected into a prompt.
 
-    Two steps, in order:
+    Three steps, in order:
+      0. cut_prompt_header_echo: the agent's own prompt header read back
+         out ("Your role: executor Your task: ..."), which the report-trim
+         cuts at the source but an abandoned task's salvaged partial never
+         passes through.
       1. degeneracy_cut with repeat_threshold=2. The result has already been
          trimmed to about three sentences, so a sentence appearing twice is
          the loop starting. Everything from its second copy is cut.
@@ -1817,6 +1912,17 @@ def scrub_result(text, exemplars=(), grounding=None):
         return text, []
     text = str(text)
     reasons = []
+
+    # PATCH 14. The prompt header first: a salvaged partial from an abandoned
+    # task never passed through the report-trim that cuts it at the source,
+    # and this is the one place such a result is cleaned before it reaches a
+    # parent prompt, a sibling or the cache.
+    kept, reason = cut_prompt_header_echo(text)
+    if reason is not None:
+        reasons.append(reason)
+        text = kept
+        if not text.strip():
+            return "", reasons
 
     kept, reason = degeneracy_cut(text, exemplars=exemplars, repeat_threshold=2)
     if reason is not None:
@@ -1922,6 +2028,219 @@ def software_request_words(text):
         return []
     found = [m.group(0).lower() for m in _SOFTWARE_REQUEST_RE.finditer(str(text))]
     return list(dict.fromkeys(found))
+
+
+# ---------------------------------------------------------------------------
+# PATCH 15 -- artifact manufacturing on projects that never asked for a
+# document.
+#
+# Run 5's three lowest-drift subtasks were one SPAWN batch from one
+# decomposer: "Generate a summary of all book selections and author credits"
+# (goal 0.369), "Write a formatted letter proposing book selections to
+# stakeholders" (0.452), "Design a presentation slide deck summarizing
+# selected books" (0.341), joined later by "Compose a formal proposal letter
+# outlining selected books and their authors" (0.365). The user asked for a
+# book-club decision. Nobody asked for a deck, a letter or a proposal.
+#
+# This is run 4's ISBN drift in a different costume, and it is the SAME
+# failure the software-framing guard already handles one family over: a 4B
+# instruction-tuned model, handed an open-ended task, reaches for a
+# deliverable to produce. "Write a script that processes raw input rows" and
+# "Design a presentation slide deck" are the same reflex pointed at different
+# vocabulary, which is why this is built on asks_for_software's architecture
+# rather than beside it -- armed only when the USER'S OWN request names no
+# artifact, read from raw_text and never from the phaser's goal, because the
+# goal is model output and can itself be where "Prepare a summary deck..."
+# came from.
+#
+# WHY THIS EXISTS ALONGSIDE PATCH 12's DRIFT GATE, rather than instead of it.
+# The two signals are complementary, and run 5 shows exactly where each one
+# is blind:
+#
+#     goal   drift gate   artifact   subtask
+#     0.341  DROP         HIT        Design a presentation slide deck...
+#     0.365  DROP         HIT        Compose a formal proposal letter...
+#     0.369  DROP         --         Generate a summary of all book selections...
+#     0.452  --           HIT        Write a formatted letter proposing...
+#
+# The 0.452 letter is the same failure as the 0.365 letter and sits above any
+# drift threshold that spares task_91dcc48e at 0.448 -- they are 0.004 apart,
+# and no cosine separates them. Conversely the bare "summary" at 0.369 names
+# no artifact noun and only drift catches it. Neither covers the subtree
+# alone; together they cover all four.
+#
+# WHAT IS DELIBERATELY NOT IN THE LIST. Every word here has to be a thing you
+# PRODUCE, not a thing you write about:
+#   * "summary", "report", "list", "plan", "notes", "questions", "prompts" --
+#     ordinary words for ordinary work. "Write discussion prompts for the
+#     skipped book chapters" IS the project. A bare "summary" would fire on
+#     "a summary paragraph listing the reasons for rejection", which is an
+#     answer, not a deliverable. "executive summary" is in, as the compound.
+#   * "brief" -- an adjective and a verb long before it is a document.
+#   * "deck" on its own -- a deck of cards, a deck of slides. Only "slide
+#     deck" and the unambiguous "slides"/"slideshow" are listed; the run-5
+#     case is caught on "presentation" regardless.
+#   * "agenda", "minutes" -- both are ordinary meeting vocabulary for a book
+#     club, which is precisely the domain this has to stay quiet in.
+_ARTIFACT_REQUEST_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"slide ?decks?|slide ?shows?|slides?|presentations?|"
+    r"letters?|memos?|memorandums?|newsletters?|"
+    r"brochures?|posters?|flyers?|leaflets?|pamphlets?|handouts?|"
+    r"one[- ]pagers?|templates?|"
+    r"proposals?|press releases?|white ?papers?|infographics?|"
+    r"e-?mails?|invoices?|certificates?|"
+    r"executive summar(?:y|ies)|deliverables?"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def asks_for_artifact(text):
+    """True when a user's request itself names a document or deliverable to
+    produce. Empty text counts as True, so the guard below fails open --
+    exactly asks_for_software's contract, for exactly its reason: a guard
+    that cannot see the request must not act on it."""
+    if not text or not str(text).strip():
+        return True
+    return bool(_ARTIFACT_REQUEST_RE.search(str(text)))
+
+
+def artifact_request_words(text):
+    """PATCH 15 (measure-only). The document/deliverable vocabulary this text
+    uses, deduplicated and lowercased, or [].
+
+    The subtask-level question, the same way software_request_words is the
+    subtask-level question asks_for_software asks of the user. Run 5's ledger
+    read "subtasks that ASK for software : 0" while four subtasks in a row
+    asked for a slide deck, a stakeholder letter and a formal proposal --
+    a different family entirely, invisible to _SOFTWARE_REQUEST_RE.
+    """
+    if not text:
+        return []
+    found = [m.group(0).lower() for m in _ARTIFACT_REQUEST_RE.finditer(str(text))]
+    return list(dict.fromkeys(found))
+
+
+# ---------------------------------------------------------------------------
+# PATCH 16 -- figures that do not survive a retry.
+#
+# agent_ce16fd80 answered "Count current voting totals for each book
+# candidate including unresolved votes" three times in run 5:
+#
+#     attempt 1   Book X 35, Book Y 47, Book Z 19, total 104, 2.9% undecided
+#     attempt 2   37 resolved yes, 19 resolved no, 4 unresolved, ratio 1.95
+#     attempt 3   book_a 9761, book_b 8847, book_c 6951, 226 unresolved
+#
+# Same task, same inputs, nothing new supplied between them, and the answers
+# differ by two orders of magnitude. The third was promoted, carried into the
+# root REPORT as "over 9K votes each" and reached the user as "Book A
+# received the highest number of resolved votes (9,761)".
+#
+# This needs NO grounding corpus, which is the whole point of it. The
+# numeral-grounding check the scan proposed needs to know what the user
+# supplied; this only needs the previous attempt, which _kill_and_respawn and
+# the warn cycle both already have in hand. On a run whose user request
+# contains zero numerals -- run 5 -- a grounding check flags 18 of 30 REPORTs
+# and cannot tell fabricated from derived. This one is silent on every
+# first attempt and speaks only when an agent contradicts itself.
+_FIGURE_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?%?(?!\.?\d)(?!\w)")
+# The trailing guard is (?!\.?\d)(?!\w), not (?![\w.]): a figure at the end
+# of a sentence is followed by a full stop constantly, and excluding '.'
+# outright made '19.0%.' backtrack to '19.0' and silently drop the percent
+# sign, so '19.0' and '19.0%' stopped comparing equal. What actually needs
+# ruling out is a further digit ('1.2.3', a version, not three figures).
+
+# Both attempts must assert at least this many figures before they are
+# compared. One number moving is ordinary: an agent told it is drifting and
+# asked to recount may legitimately revise a single count. A whole SET of
+# figures regenerating is not a revision.
+FIGURE_DIVERGENCE_MIN = 2
+
+# Fire when fewer than this fraction of the two attempts' figures are shared
+# (Jaccard over the canonical figure sets).
+#
+# WHY OVERLAP AND NOT MAGNITUDE. The obvious alternative -- "the largest
+# figure moved by an order of magnitude" -- catches run 5's 37 -> 9761 (264x)
+# and reads 104 -> 37 (2.8x) as an ordinary correction, which it is not: not
+# one of that attempt's eleven figures survived except a coincidental 19.
+# CARRY-OVER is the right question, because it is the thing a genuine
+# revision does and a fresh fabrication cannot fake. Correct one of four
+# numbers and overlap is 0.60; add two numbers of detail to three and it is
+# 0.60; correct two of four and it is 0.33. Below a third means the attempt
+# kept almost nothing, and run 5's five firing pairs all land at 0.09 or
+# below -- an order of magnitude clear of the line, so the exact threshold is
+# not doing delicate work. The magnitude ratio is logged next to it as a
+# diagnostic (it separates "recounted" from "invented a new scale") but it is
+# deliberately not the trigger.
+FIGURE_DIVERGENCE_MAX_OVERLAP = 1.0 / 3.0
+
+
+def figures(text):
+    """Every standalone numeral `text` asserts, canonicalised.
+
+    Thousands separators are removed ("9,761" -> "9761") so the same quantity
+    written two ways compares equal -- the run-5 chain wrote 9761 in a REPORT
+    and 9,761 in the final answer. A trailing % is kept: 19 and 19.0% are
+    different claims.
+
+    Standalone only. "resolved1 + resolved2" is an identifier suffix, not a
+    quantity, and the lookbehind rules it out along with version numbers and
+    decimals already counted.
+    """
+    if not text:
+        return []
+    out = []
+    for match in _FIGURE_RE.finditer(str(text)):
+        token = match.group(0).replace(",", "")
+        out.append(token)
+    return out
+
+
+def figure_divergence(previous, current,
+                      min_figures=FIGURE_DIVERGENCE_MIN,
+                      max_overlap=FIGURE_DIVERGENCE_MAX_OVERLAP):
+    """Two attempts at one task whose figures do not agree, as a dict, or
+    None when there is nothing to say.
+
+    None when either attempt asserts fewer than `min_figures` figures -- a
+    first attempt that gave no numbers is vague, not contradictory, and the
+    difference matters. Run 5's task_91dcc48e opened with a figure-free
+    attempt from agent_0dc570e9 for exactly this reason, so the task fires
+    twice, not three times, and pretending otherwise would be the measurement
+    lying to make the count rounder.
+
+    The returned dict carries both numbers so the log can show the overlap
+    that triggered it and the magnitude ratio that did not:
+      {overlap, shared, previous, current, ratio}
+    `ratio` is largest-figure-to-largest-figure, or None when neither side
+    has a plain number (percentages only).
+    """
+    before, after = set(figures(previous)), set(figures(current))
+    if len(before) < min_figures or len(after) < min_figures:
+        return None
+    union = before | after
+    if not union:
+        return None
+    overlap = len(before & after) / len(union)
+    if overlap >= max_overlap:
+        return None
+
+    def _largest(values):
+        plain = [float(v) for v in values if not v.endswith("%")]
+        return max(plain) if plain else None
+
+    prev_max, cur_max = _largest(before), _largest(after)
+    ratio = None
+    if prev_max and cur_max:
+        ratio = max(prev_max, cur_max) / min(prev_max, cur_max)
+    return {
+        "overlap": overlap,
+        "shared": sorted(before & after),
+        "previous": sorted(before),
+        "current": sorted(after),
+        "ratio": ratio,
+    }
 
 
 def software_artifact_reason(text):

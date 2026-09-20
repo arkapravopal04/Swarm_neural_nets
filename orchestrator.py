@@ -49,7 +49,13 @@ from text_utils import (
     trim_degenerate_tails,
     trim_artifact_tail,
     is_exemplar_echo,
+    cut_prompt_header_echo,
     asks_for_software,
+    asks_for_artifact,
+    FIGURE_DIVERGENCE_MIN,
+    FIGURE_DIVERGENCE_MAX_OVERLAP,
+    artifact_request_words,
+    figure_divergence,
     plain_register,
     software_artifact_reason,
     software_request_words,
@@ -66,6 +72,40 @@ FRAMING_LEVERS = ("reword", "block")
 # memory_state.OUTCOME_ACCEPTED -- repeated rather than imported because
 # memory_state pulls in faiss/sentence_transformers at import time.
 CACHE_OUTCOME_ACCEPTED = "accepted"
+
+
+# --- PATCH 12: the goal-drift gate ------------------------------------------
+# PATCH 7 measured; this acts, at the extreme only.
+#
+# RELATIVE, not absolute. Run 5's whole distribution sat under 0.702 -- that
+# was the MAXIMUM, on "Run the voting method over the available books", which
+# is almost a restatement of the goal. A fixed cutoff written against that
+# corpus is a cutoff against MiniLM's ceiling for this one phrasing, and the
+# next problem's ceiling will sit somewhere else entirely. So the threshold is
+# a fraction of the highest goal-cosine the run has actually seen.
+#
+# WHERE THE FRACTION COMES FROM. Run 5's 18 goal-cosines, sorted:
+#   0.341 0.365 0.369 | 0.439 0.448 0.452 0.503 0.523 0.628 0.639 0.653
+#   0.666 0.666 0.666 0.667 0.702 0.702 0.702
+# The largest gap in the low tail is 0.369 -> 0.439 (0.070); every other
+# neighbouring gap below 0.5 is under 0.015. That gap is the cluster boundary:
+# below it are the three deliverable-manufacturing subtasks (slide deck,
+# stakeholder letter, formatted summary) that nobody asked for; above it is
+# task_91dcc48e at 0.448, which completed and contributed. Threshold placed in
+# the middle of the gap, 0.404, which is 0.575 of 0.702. 0.58 rounds it with
+# the margin still on both sides: 0.58 * 0.702 = 0.407, which is 0.038 clear
+# of the cluster's top and 0.032 clear of the nearest keeper.
+GOAL_DRIFT_GATE_FRACTION = 0.58
+
+# No gate until the run has this many measured goal-cosines, the current
+# batch's own included. The threshold is a fraction of the observed MAX, and
+# a max taken from two samples is not an observation -- one low-scoring first
+# batch would set a ceiling low enough to gate nothing for the rest of the
+# run, or a first batch of genuinely peripheral tasks would set one high
+# enough to gate its own siblings. Run 5 reached 6 samples inside the first
+# three spawns and the low cluster did not appear until the twelfth, so this
+# costs nothing there.
+GOAL_DRIFT_GATE_MIN_SAMPLES = 6
 
 
 def _cosine(a, b) -> Optional[float]:
@@ -153,6 +193,20 @@ class Orchestrator:
         # later be picked from. Appended even when a drift is None, so the
         # "not measurable" cases are visible rather than silently absent.
         self.goal_drift_samples: List[Dict[str, Any]] = []
+
+        # PATCH 12. Description embeddings computed by the goal-drift gate at
+        # batch-screen time, keyed by the task_id the batch already allocated,
+        # and consumed (popped) by _spawn_child_task so a survivor is embedded
+        # once per run rather than twice. A dropped subtask's entry is popped
+        # by the gate itself -- nothing else ever looks it up.
+        self._gate_description_embeddings: Dict[str, Any] = {}
+
+        # PATCH 16. The last REPORT each task produced, as
+        # {task_id: (agent_id, untrimmed result)}. One entry per task,
+        # overwritten at every REPORT, so the comparison is always against
+        # the immediately preceding attempt at the SAME task -- a warn
+        # retry by the same agent as much as a respawn by a new one.
+        self._task_last_report: Dict[str, Any] = {}
 
         # Injected shared components -- NONE of these were wired in previously.
         # phaser: Problem_Phaser instance (turns raw text into a spec + budget)
@@ -1193,16 +1247,19 @@ class Orchestrator:
         # judge.decide's tier-2 check has a target that actually matches
         # what this task's agent was asked to do -- not the colony's overall
         # goal, which is what every child was being scored against before.
-        if self.embed_model is not None:
-            try:
-                child_node.description_embedding = self.embed_model.encode(
-                    description, convert_to_numpy=True
-                )
-            except Exception as e:
-                print(f"Warning: failed to embed task description for '{task_id}': {e}")
+        # PATCH 12: when this task came through a SPAWN batch the goal-drift
+        # gate has already encoded it. Popped rather than read, so the cache
+        # cannot grow across a run; anything the gate never saw (the
+        # bootstrap root, an overflow drain re-entering here) still falls
+        # through to encoding it now.
+        if task_id in self._gate_description_embeddings:
+            child_node.description_embedding = self._gate_description_embeddings.pop(task_id)
+        elif self.embed_model is not None:
+            child_node.description_embedding = self._embed_description(description)
 
         self._measure_spawn_drift(child_node, parent_task_id=child_node.parent_task_id)
         self._flag_software_shaped_task(child_node)
+        self._flag_artifact_shaped_task(child_node.task_id, child_node.description)
         self.task_graph.add_task(child_node)
 
         if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
@@ -1227,9 +1284,14 @@ class Orchestrator:
         against its own parent task, store both on the TaskNode, and log them
         unconditionally.
 
-        MEASURE-ONLY. Nothing is rejected, warned or re-planned on these
-        numbers this round. The point is the distribution: run 4's ISBN
-        subtree walked from "Count total number of distinct books available"
+        Runs on tasks that are ALREADY going to exist. PATCH 12's gate acts
+        earlier, on the prepared SPAWN batch, so anything reaching here was
+        kept -- and the gate records its own dropped subtasks straight into
+        goal_drift_samples so the distribution below stays complete.
+        parent_drift remains measure-only and nothing is gated on it: run 5
+        showed it both misses the gradual cases and false-alarms on good ones
+        (see _screen_goal_drift_batch). The point of the distribution is
+        unchanged: run 4's ISBN subtree walked from "Count total number of distinct books available"
         to "Remove duplicate entries where titles and authors exactly match
         case-insensitively" one plausible hop at a time, and until there are
         real numbers for both kinds of distance there is no defensible place
@@ -1261,6 +1323,7 @@ class Orchestrator:
             "description": child_node.description,
             "goal_drift": goal_drift,
             "parent_drift": parent_drift,
+            "gated": False,
         })
 
         # Why a number is missing matters as much as the number. A zero-norm
@@ -1277,7 +1340,7 @@ class Orchestrator:
             return f"{value:.3f}" if value is not None else "n/a"
 
         print(f"  [spawn-drift] {child_node.task_id} goal={_fmt(goal_drift)} "
-              f"parent={_fmt(parent_drift)} (measure-only, nothing gated): "
+              f"parent={_fmt(parent_drift)} (kept): "
               f"{str(child_node.description)[:70]!r}")
 
     def _flag_software_shaped_task(self, child_node: TaskNode):
@@ -1745,6 +1808,236 @@ class Orchestrator:
         live_parent.thought_process += note
         self.colony.debit_energy(parent_id, max(1, len(note) // 100), category="injection")
 
+    # ------------------------------------------------------------------
+    # PATCH 12 -- the goal-drift gate
+    # ------------------------------------------------------------------
+
+    def _embed_description(self, description: str):
+        """This task description as a vector, or None. The one place a
+        subtask description is embedded: the gate calls it at batch-screen
+        time and caches the result for _spawn_child_task, so a subtask that
+        survives the gate is not encoded a second time."""
+        if self.embed_model is None:
+            return None
+        try:
+            return self.embed_model.encode(description, convert_to_numpy=True)
+        except Exception as e:
+            print(f"Warning: failed to embed task description: {e}")
+            return None
+
+    def _goal_drift_gate_threshold(self, batch_scores) -> Optional[float]:
+        """The cutoff this batch is judged against, or None when the run has
+        not seen enough measured goal-cosines to have a meaningful maximum.
+
+        The run's observed max INCLUDES this batch's own scores. A batch that
+        is itself the highest-scoring thing the run has produced must not be
+        gated against a ceiling it just raised -- computing the max first and
+        comparing after is what makes the gate scale-free rather than
+        retroactive.
+        """
+        observed = [s["goal_drift"] for s in self.goal_drift_samples
+                    if s.get("goal_drift") is not None]
+        observed += [d for d in batch_scores if d is not None]
+        if len(observed) < GOAL_DRIFT_GATE_MIN_SAMPLES:
+            return None
+        ceiling = max(observed)
+        if ceiling <= 0.0:
+            return None
+        return GOAL_DRIFT_GATE_FRACTION * ceiling
+
+    def _screen_goal_drift_batch(self, prepared) -> list:
+        """PATCH 12. Score every subtask in a prepared SPAWN batch against the
+        colony goal and return the indices of the ones too far from it to
+        start. Nothing is embedded twice: the vectors computed here are handed
+        to _spawn_child_task through _gate_description_embeddings.
+
+        `prepared` is handle_spawn's list of (sub, description, task_id).
+
+        CUMULATIVE distance only. Run 5 settled the per-hop question: the
+        gradual cases are invisible to it (task_2239fb25 sat at goal 0.439
+        behind a perfectly ordinary parent hop of 0.638) and it false-alarms
+        on fine ones (task_aeab53e4, goal 0.503, arrived on a 0.256 hop and
+        was a legitimate piece of the project). parent_drift stays measured
+        and reported; nothing is gated on it.
+
+        PER-SUBTASK DROP, never a batch reject. Same shape as the
+        derived-subtask guard's off-topic drop, for the same reason: one
+        subtask that wandered is not evidence the plan was copied, and the
+        siblings around it were fine. The decomposer is told what was left
+        out so its roll-up does not present a partial plan as the whole one.
+
+        A batch where EVERY subtask trips is left ALONE and counted. Dropping
+        all of them starves the spawner of children, which is the DIE path,
+        not a drop -- and a whole batch under the threshold is far more likely
+        to mean the ceiling is wrong for this corpus than that a decomposer
+        produced nothing usable. That case is the one worth looking at in the
+        ledger before acting on it, which is what the counter is for. It also
+        means a lone subtask is never gated, since a batch of one is always
+        all-or-nothing.
+        """
+        scores = []
+        for _, description, task_id in prepared:
+            embedding = self._embed_description(description)
+            self._gate_description_embeddings[task_id] = embedding
+            scores.append(_cosine(embedding, self.colony.goal_embedding))
+
+        threshold = self._goal_drift_gate_threshold(scores)
+        if threshold is None:
+            return []
+
+        tripped = [i for i, drift in enumerate(scores)
+                   if drift is not None and drift < threshold]
+        if not tripped:
+            return []
+        if len(tripped) == len(prepared):
+            self.colony.record_verdict("goal_drift_gate_whole_batch_spared")
+            print(f"  [goal-drift gate] every subtask in this batch of "
+                  f"{len(prepared)} scores below {threshold:.3f} "
+                  f"(={GOAL_DRIFT_GATE_FRACTION:g} x the run's observed max) -- "
+                  f"spared and counted rather than dropped, since dropping all "
+                  f"of them leaves the decomposer with no children at all.")
+            return []
+
+        for i in tripped:
+            self.colony.record_verdict("goal_drift_gate_dropped")
+            print(f"  [goal-drift gate] DROP {prepared[i][2]} "
+                  f"goal={scores[i]:.3f} < {threshold:.3f} "
+                  f"(={GOAL_DRIFT_GATE_FRACTION:g} x observed max): "
+                  f"{str(prepared[i][1])[:70]!r}")
+            # The distribution is the ledger's, gated or not. A dropped
+            # subtask never reaches _measure_spawn_drift, so its score is
+            # recorded here or nowhere -- and a ledger that silently omits
+            # exactly the tasks the gate acted on is a ledger that cannot be
+            # used to check whether the threshold was right. parent_drift is
+            # None rather than measured: the gate does not read it, and
+            # computing it would mean resolving a parent task for a node that
+            # is never going to exist.
+            self._flag_artifact_shaped_task(
+                prepared[i][2], prepared[i][1], drift_dropped=True)
+            self.goal_drift_samples.append({
+                "task_id": prepared[i][2],
+                "description": prepared[i][1],
+                "goal_drift": scores[i],
+                "parent_drift": None,
+                "gated": True,
+            })
+        return tripped
+
+    def _drop_drifted_subtasks(self, parent_id: str, dropped: list) -> None:
+        """Tell the decomposer which of its subtasks were left out as too far
+        from the project goal. Delivered and billed like
+        _drop_off_topic_subtasks, whose wording this deliberately does not
+        reuse: "shares no vocabulary with this project" and "is too far from
+        what this project is for" are different findings, and a decomposer
+        handed the wrong one rewrites the wrong thing."""
+        names = "; ".join(f'"{d[:80]}"' for d in dropped)
+        print(f"  [goal-drift gate] {parent_id}: dropped {len(dropped)} subtask(s) "
+              f"too far from the project goal; the rest of the batch proceeds: "
+              f"{names}")
+        live_parent = self.live_agents.get(parent_id)
+        if live_parent is None:
+            return
+        note = (f"\n[REVIEW] These subtasks were NOT started because they are "
+                f"too far from what this project is actually for: {names}. Do "
+                f"not re-spawn them or invent deliverables nobody asked for. "
+                f"Your final REPORT must say they were not covered.\n")
+        live_parent.thought_process += note
+        self.colony.debit_energy(parent_id, max(1, len(note) // 100), category="injection")
+
+    # ------------------------------------------------------------------
+    # PATCH 15 -- artifact manufacturing (measure-only)
+    # ------------------------------------------------------------------
+
+    @property
+    def _artifact_guard_active(self) -> bool:
+        """True when the user's own request never named a document or
+        deliverable, so a subtask asking for one is the model reaching for
+        something to produce rather than the job.
+
+        Read from raw_text only, never the phaser's goal -- the same rule and
+        the same reason as _software_framing_guard_active: the goal is model
+        output and can itself be where "Prepare a summary deck..." came from.
+        No spec (or no raw text) leaves the guard off.
+        """
+        raw_text = (self.spec or {}).get("raw_text")
+        return bool(raw_text) and not asks_for_artifact(raw_text)
+
+    def _flag_artifact_shaped_task(self, task_id, description,
+                                   drift_dropped: bool = False):
+        """
+        PATCH 15 (measure-only). Ask the artifact question of a SUBTASK.
+
+        Counted and logged only. Nothing is dropped, reworded or respawned on
+        it. PATCH 12's drift gate went live in the same run, and two new gates
+        firing at once leaves no way to attribute what changed -- so this one
+        watches while that one acts.
+
+        `drift_dropped` records whether PATCH 12 already dropped this subtask,
+        which is the number worth reading: the two signals are meant to be
+        complementary, and the ledger shows the overlap directly instead of
+        making it something to reconstruct from the log by hand. Called from
+        the drift gate for the subtasks it drops and from _spawn_child_task
+        for everything else, so the two sets are disjoint and nothing is
+        counted twice.
+        """
+        if not self._artifact_guard_active:
+            return
+        hits = artifact_request_words(description)
+        if not hits:
+            return
+        self.colony.record_verdict("artifact_shaped_task_detected")
+        if drift_dropped:
+            self.colony.record_verdict("artifact_shaped_task_also_drift_dropped")
+        print(f"  [artifact-shaped task] {task_id} asks for {hits} on a project "
+              f"that never did (measure-only, not blocked"
+              f"{'; already dropped by the drift gate' if drift_dropped else ''}): "
+              f"{str(description)[:70]!r}")
+
+    # ------------------------------------------------------------------
+    # PATCH 16 -- figures that do not survive a retry (measure-only)
+    # ------------------------------------------------------------------
+
+    def _check_figure_divergence(self, task_id, agent_id, result):
+        """
+        PATCH 16 (measure-only). Compare this REPORT's figures against the
+        last REPORT recorded for the SAME TASK, and log when almost none of
+        them carried over.
+
+        Keyed on the task, not the agent, and run at every REPORT rather than
+        only at respawn -- which is what makes it see run 5's case at all.
+        agent_ce16fd80 was not respawned between its three contradictory
+        tallies for task_91dcc48e; it was WARNed twice by tier 2 and answered
+        again as the same agent. A respawn-only check would have watched the
+        agent that mattered and missed every comparison it made.
+
+        Reads the UNTRIMMED payload, like the exemplar-echo and
+        software-framing checks beside it: the 3-sentence report-trim keeps
+        the answer and drops the tail, and run 5 put half of attempt 1's
+        figures in the tail.
+
+        Never fails a task, never respawns, never rejects. The point of this
+        round is the count.
+        """
+        if not isinstance(result, str) or not task_id:
+            return
+        previous = self._task_last_report.get(task_id)
+        self._task_last_report[task_id] = (agent_id, result)
+        if previous is None:
+            return
+        divergence = figure_divergence(previous[1], result)
+        if divergence is None:
+            return
+        self.colony.record_verdict("figure_divergence_detected")
+        ratio = divergence["ratio"]
+        print(f"  [figure divergence] {task_id}: this attempt ({agent_id}) "
+              f"shares {divergence['overlap']:.0%} of its figures with the "
+              f"previous one ({previous[0]}) -- same task, same inputs "
+              f"(measure-only, nothing failed).")
+        print(f"      was : {divergence['previous']}")
+        print(f"      now : {divergence['current']}")
+        print(f"      shared={divergence['shared'] or 'none'}"
+              + (f"  largest-figure ratio={ratio:.1f}x" if ratio else ""))
+
     def _reject_spawn_from_non_decomposer(self, event: Event) -> bool:
         """
         Returns True if this SPAWN may proceed, False if it was rejected and
@@ -1972,6 +2265,22 @@ class Orchestrator:
                 prepared = [entry for i, entry in enumerate(prepared)
                             if i not in set(off_topic)]
 
+            # PATCH 12. Goal-drift gate, run on what is left of the batch and
+            # BEFORE admission and the fan-out cap -- so a dropped subtask
+            # never reserves budget, never becomes a queued overflow item,
+            # and never becomes a dependency target that the loop below has
+            # to unwire later. This is also the only point where an overflow
+            # item can be gated at all: by the time it drains it has siblings
+            # already depending on it.
+            drifted = self._screen_goal_drift_batch(prepared)
+            if drifted:
+                self._drop_drifted_subtasks(
+                    parent_id, [prepared[i][1] for i in drifted])
+                for i in drifted:
+                    self._gate_description_embeddings.pop(prepared[i][2], None)
+                prepared = [entry for i, entry in enumerate(prepared)
+                            if i not in set(drifted)]
+
             # Admission: the batch is cut to the largest k whose reservation
             # fits (queued overflow included -- it is reserved now, spawned
             # later). The rest is dropped, not bundled, and the decomposer is
@@ -1986,6 +2295,8 @@ class Orchestrator:
                 if admitted < len(prepared):
                     self._tell_parent_about_dropped_subtasks(
                         parent_id, [d for _, d, _ in prepared[admitted:]])
+                    for _, _, dropped_id in prepared[admitted:]:
+                        self._gate_description_embeddings.pop(dropped_id, None)
                     prepared = prepared[:admitted]
             admitted_ids = {task_id for _, _, task_id in prepared}
 
@@ -2331,6 +2642,43 @@ class Orchestrator:
                 print(f"  [report-trim] {agent_id} REPORT dropped an "
                       f"incomplete trailing sentence "
                       f"({len(str(result))} -> {len(completed)} chars).")
+            # PATCH 14. The prompt header read back out, cut before anything
+            # else measures this REPORT. Run 5 ended agent_6ab689f1's root
+            # REPORT on "Your turn. Your role: executor Your task: run member
+            # voting...", which is the agent's own prompt, not the worked-
+            # REPORT exemplar -- so is_exemplar_echo never saw it and the
+            # structural-reject counter read 0 while it happened.
+            #
+            # CUT, NOT REJECTED, and this is the whole finding: in run 5 the
+            # echo was only ever in the tail, behind a complete answer that
+            # the 3-sentence trim below was going to keep and the echo to
+            # drop. A reject here would have killed the root REPORT of the
+            # run's first honest success over text that never reached a
+            # single consumer. What was actually missing was the counter.
+            #
+            # Cut first, so the tail trimmers and the sentence trim below
+            # work on the answer rather than on the prompt: "Your task: run
+            # member voting on book selections" reads as an ordinary
+            # sentence to both of them and can be kept as one of the three.
+            unheaded, header_reason = cut_prompt_header_echo(completed)
+            if header_reason is not None:
+                self.colony.record_verdict("report_prompt_header_echo_detected")
+                if unheaded.strip():
+                    self.colony.record_verdict("report_prompt_header_echo_cut")
+                    print(f"  [report-trim] {agent_id} REPORT cut at "
+                          f"{header_reason} ({len(completed)} -> "
+                          f"{len(unheaded)} chars).")
+                    completed = unheaded
+                else:
+                    # The REPORT is prompt header from its first character.
+                    # Left whole for the judge to reject, the same stance the
+                    # status-report tail takes two comments down: blanking it
+                    # here would hand the parent an empty answer instead of a
+                    # rejected one.
+                    self.colony.record_verdict("report_prompt_header_echo_whole")
+                    print(f"  [report-trim] {agent_id} REPORT is {header_reason} "
+                          f"from its first character -- left whole for the judge.")
+
             # Degenerate tails come off BEFORE the trim: closer runs,
             # restating fragments and status-report/deploy-log tails
             # ("Ready to deploy. Done. Go. Final state: COMPLETED."). The trim
@@ -2354,6 +2702,12 @@ class Orchestrator:
                 print(f"  [report-trim] {agent_id} REPORT trimmed "
                       f"{len(str(result))} -> {len(trimmed)} chars before judging.")
                 result = trimmed
+
+        # PATCH 16 (measure-only). Recorded for EVERY REPORT, before the
+        # structural rejects below: a rejected attempt is still an attempt,
+        # and the figures it asserted are what the next one has to agree
+        # with. Reads the untrimmed payload, like the checks below it.
+        self._check_figure_divergence(task_id, agent_id, payload.get("result"))
 
         # PATCH 11. decide() returning nothing is not an answer, and the
         # string it substitutes is a constant this process wrote -- so an
@@ -3943,14 +4297,41 @@ class Orchestrator:
             # PATCH 7. The distribution, so a threshold can be chosen from
             # data rather than guessed. Nothing in this run was gated on any
             # of these numbers.
-            print(chr(10) + "  GOAL DRIFT AT SPAWN (PATCH 7, measure-only -- nothing rejected on this)")
+            print(chr(10) + "  ARTIFACT MANUFACTURING (PATCH 15, measure-only)")
+            if not self._artifact_guard_active:
+                print("    (guard off -- the request named a document or deliverable, or there was none)")
+            else:
+                artifact_hits = verdicts.get("artifact_shaped_task_detected", 0)
+                both = verdicts.get("artifact_shaped_task_also_drift_dropped", 0)
+                print(f"      subtasks that ASK for a document : {artifact_hits}")
+                print(f"      of those, also dropped by the drift gate : {both}")
+                print(f"      caught ONLY by this check : {artifact_hits - both}"
+                      f"  (the cases PATCH 12 cannot see)")
+                print("      (counted, never blocked this round -- PATCH 12's gate "
+                      "went live in the same run, and two new gates firing at "
+                      "once leaves no way to attribute what changed)")
+
+            print(chr(10) + "  GOAL DRIFT AT SPAWN (PATCH 7 measures, PATCH 12 gates the extreme)")
             samples = getattr(self, "goal_drift_samples", []) or []
             if not samples:
                 print("    (no subtasks spawned this run)")
             else:
                 goal_vals = [s["goal_drift"] for s in samples if s["goal_drift"] is not None]
                 parent_vals = [s["parent_drift"] for s in samples if s["parent_drift"] is not None]
-                print(f"    subtasks measured : {len(goal_vals)} of {len(samples)} spawned")
+                gated = [s for s in samples if s.get("gated")]
+                print(f"    subtasks measured : {len(goal_vals)} of {len(samples)} "
+                      f"scored ({len(samples) - len(gated)} spawned, "
+                      f"{len(gated)} dropped by the gate)")
+                print(f"    gate : below {GOAL_DRIFT_GATE_FRACTION:g} x the run's "
+                      f"observed max goal-cosine"
+                      + (f" (= {GOAL_DRIFT_GATE_FRACTION * max(goal_vals):.3f} "
+                         f"against a max of {max(goal_vals):.3f})" if goal_vals else "")
+                      + f", once {GOAL_DRIFT_GATE_MIN_SAMPLES} scores exist")
+                print(f"      subtasks dropped        : "
+                      f"{verdicts.get('goal_drift_gate_dropped', 0)}")
+                print(f"      whole batches spared    : "
+                      f"{verdicts.get('goal_drift_gate_whole_batch_spared', 0)}"
+                      f"  (every subtask under threshold -- counted, not dropped)")
                 unmeasurable = verdicts.get("spawn_drift_goal_unmeasurable", 0)
                 if unmeasurable:
                     # All-or-nothing in practice: a zero-norm goal vector is
@@ -3983,14 +4364,29 @@ class Orchestrator:
                         # cosine next to a HIGH parent cosine is the
                         # gradual-drift signature (every hop looked fine),
                         # and is a different problem from a low pair.
+                        mark = "  [GATED]" if s.get("gated") else ""
                         print(f"      goal={s['goal_drift']:.3f}  parent={parent}  "
-                              f"{s['task_id']}  {description}")
+                              f"{s['task_id']}  {description}{mark}")
+
+            print(chr(10) + "  FIGURE DIVERGENCE ACROSS ATTEMPTS (PATCH 16, measure-only)")
+            print(f"    same task, consecutive attempts, figures that did "
+                  f"not carry over : {verdicts.get('figure_divergence_detected', 0)}")
+            print("      (both attempts must assert at least "
+                  f"{FIGURE_DIVERGENCE_MIN} figures and share under "
+                  f"{FIGURE_DIVERGENCE_MAX_OVERLAP:.0%} of them; a figure-free "
+                  "attempt is vague, not contradictory, and is not compared)")
 
             print(chr(10) + "  STRUCTURAL REJECTS (caught before the judge)")
             print(f"    decomposer REPORT, no completed subtask : "
                   f"{verdicts.get('decomposer_report_no_completed_child', 0)}")
             print(f"    REPORT was the prompt's worked example  : "
                   f"{verdicts.get('report_exemplar_echo_rejected', 0)}")
+            print(f"    REPORT echoed the prompt header (PATCH 14) : "
+                  f"{verdicts.get('report_prompt_header_echo_detected', 0)}")
+            print(f"      cut from the REPORT, answer kept      : "
+                  f"{verdicts.get('report_prompt_header_echo_cut', 0)}")
+            print(f"      REPORT was header from char 0, judged : "
+                  f"{verdicts.get('report_prompt_header_echo_whole', 0)}")
             print(f"    REPORT was the empty-generation placeholder : "
                   f"{verdicts.get('report_empty_generation_rejected', 0)}")
             print(f"    zero-requirement tasks given the goal referent : "
