@@ -222,7 +222,7 @@ class Judge:
     # Tier 3 -- deep critique
     # ------------------------------------------------------------------
 
-    def deep_critique(self, output, subtask_spec) -> dict:
+    def deep_critique(self, output, subtask_spec, project_goal=None) -> dict:
         """
         Full LLM call. Only invoked when an agent is attempting to promote
         its result to its parent -- the most expensive tier, reserved for
@@ -268,8 +268,25 @@ class Judge:
             "- is its confidence calibrated -- does how sure it sounds match "
             "how accurate it actually is?\n"
             "- is the output on-topic for the subtask, not a tangent or a "
-            "restatement of the question?\n\n"
-            f"SUBTASK: {subtask_spec}\n\n"
+            "restatement of the question?\n"
+            # PATCH 8: the fourth question, and the only one that can see
+            # outside the subtask. Every run-4 drift verdict was an accept
+            # because the critique's whole frame of reference was
+            # subtask_spec -- an ISBN deduplication answer to an ISBN
+            # deduplication subtask is perfectly on-topic for itself. The
+            # goal is shown as context, not as a rival task: a subtask is
+            # SUPPOSED to be narrower than the project, so only a subtask
+            # that could not plausibly belong to it at all is a problem.
+            + ("- given the PROJECT GOAL below, is this subtask's output "
+               "plausibly a piece of that project? A subtask is meant to be "
+               "much narrower than the goal, so narrowness alone is fine -- "
+               "flag it only if the output belongs to a different problem "
+               "than the one the goal describes.\n" if project_goal else "")
+            + "\n"
+            + (f"PROJECT GOAL (context for the question above -- the agent "
+               f"was NOT asked to do all of this): {project_goal}\n\n"
+               if project_goal else "")
+            + f"SUBTASK: {subtask_spec}\n\n"
             "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
             f"{output}\n"
             "=== END OUTPUT ===\n\n"
@@ -370,6 +387,8 @@ class Judge:
         output_embedding=None,
         target_embedding=None,
         needs_deep_check: bool = False,
+        goal_embedding=None,
+        project_goal=None,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
@@ -422,6 +441,22 @@ class Judge:
         # is meaningful against it. Exempting by role, ahead of the
         # embedding-presence check below, so this holds even on a call that
         # happens to have both embeddings available.
+        # PATCH 8 (measure-only, like PATCH 7). A second, project-level score
+        # for the same output: cosine against the colony goal. NOTHING is
+        # gated on it this round -- it only annotates a tier-2 verdict that
+        # the task-level score already produced, so a WARN now tells the
+        # agent (and the log) whether it drifted from its own task, from the
+        # project, or from both. Thresholding waits for the spawn-time
+        # distribution PATCH 7 is collecting; picking a cutoff now would
+        # re-create exactly the N2b failure the own-task target was
+        # introduced to fix, where deep subtasks were executed for not
+        # resembling the whole project.
+        goal_similarity = None
+        if output_embedding is not None and goal_embedding is not None:
+            goal_similarity = self.semantic_check(output_embedding, goal_embedding)
+        goal_note = (f" [project-goal similarity={goal_similarity:.3f}, "
+                     f"not gated]" if goal_similarity is not None else "")
+
         if agent.role == "decomposer":
             similarity = None
         elif output_embedding is None or target_embedding is None:
@@ -444,7 +479,8 @@ class Judge:
             if similarity <= SEMANTIC_EXECUTE_THRESHOLD:
                 return {
                     "verdict": "execute",
-                    "reason": f"semantic drift too severe (similarity={similarity:.3f})",
+                    "reason": (f"semantic drift too severe "
+                               f"(similarity={similarity:.3f}){goal_note}"),
                     "tier": 2,
                 }
 
@@ -461,6 +497,7 @@ class Judge:
                     f"to your assigned task (similarity={similarity:.3f}). You "
                     f"are drifting from it. Refocus on: "
                     f"{getattr(agent, 'task', '<task unavailable>')}"
+                    f"{goal_note}"
                 )
                 agent.fail_reason = correction
                 return {"verdict": "warn", "reason": correction, "tier": 2}
@@ -476,7 +513,8 @@ class Judge:
                 "tier": 2,
             }
 
-        critique = self.deep_critique(output, getattr(agent, "task", None))
+        critique = self.deep_critique(output, getattr(agent, "task", None),
+                                      project_goal=project_goal)
         if critique["verdict"] == "reject":
             return {"verdict": "execute", "reason": critique["reasoning"], "tier": 3}
 

@@ -26,6 +26,13 @@ class AgentNode:
     generation: int = 0
     crash_count: int = 0
     has_spawned: bool = False
+    # PATCH 8. The project goal text, threaded from TaskNode.goal_referent at
+    # spawn, and ONLY when the requirements filter left this task with none.
+    # Rendered in the prompt as background, never as a constraint -- an agent
+    # with an empty constraints list previously had no project-level referent
+    # anywhere in its context, which is the state every drifted run-4 subtask
+    # in the ISBN subtree was run in.
+    goal_referent: str | None = None
 
 
 class ColonyState:

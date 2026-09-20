@@ -184,6 +184,18 @@ _EX_WORKED_REPORT = ("Both options meet every constraint, and the second costs "
                      "less, so choose the second.")
 EXEMPLAR_REPORT_TEXTS = (_EX_WORKED_REPORT,)
 
+# PATCH 11. What decide() substitutes when generation came back empty and no
+# action could be recovered from it. Hoisted out of decide()'s body into a
+# module constant so orchestrator.handle_completion can identity-compare
+# against the exact string rather than pattern-match it.
+#
+# It is not a REPORT and must never be treated as one. In run 4 it reached
+# tier 3 and cost 5 energy: judge.fast_check clears it on every gate (not
+# empty, no trailing colon, not a heading, 52 alphanumeric characters), and
+# _PLACEHOLDER_REPORTS misses it because that lookup strips " \t\n.-_*#" --
+# not the square brackets this string is wrapped in.
+EMPTY_DECISION_PLACEHOLDER = "[No content generated -- decide() produced an empty response.]"
+
 # Every piece of example CONTENT the prompt shows: what degeneracy_cut's
 # exemplar pass cuts at. The whole-REPORT reject in
 # orchestrator.handle_completion matches EXEMPLAR_REPORT_TEXTS only, and
@@ -587,6 +599,13 @@ class Agent:
         return self.node.requirements
 
     @property
+    def goal_referent(self):
+        """PATCH 8. The project goal, present only on a task the requirements
+        filter left with nothing. None on every task that inherited at least
+        one constraint -- those already have a project-level referent."""
+        return getattr(self.node, "goal_referent", None)
+
+    @property
     def parent_id(self):
         return self.node.parent_id
 
@@ -796,12 +815,22 @@ class Agent:
             f"{tool_arg_reference}"
         )
 
-    def _get_role_constraint_str(self, available_tools=None):
+    def _get_role_constraint_str(self, available_tools=None, has_requirements=None):
         # Same gate as the prompt builders, taking the caller's
         # effective tool set rather than re-deriving one from
         # _run_available_tools, which a direct decide()/think() call
         # that skipped run() would never have set.
         tools_blocked = self._tools_blocked(available_tools)
+        # PATCH 8. Both branches below used to open by referring the agent to
+        # "the constraints listed below" unconditionally. When
+        # _filter_requirements_for_task returned [] there was no list below --
+        # the prompt pointed at nothing, and several run-4 subtasks
+        # (agent_9ebe196a among them) ran against a dangling reference. The
+        # callers resolve the effective list first and pass the answer here,
+        # since they may have been handed an override that differs from
+        # self.requirements.
+        if has_requirements is None:
+            has_requirements = bool(self.requirements)
         if self.role == "decomposer":
             base_rule = (
                 "CRITICAL RULE: You are FORBIDDEN from solving the problem "
@@ -812,16 +841,22 @@ class Agent:
                 "subject (decide, choose, list, agree on, calculate, write). "
                 "Only describe a subtask as building a program if the "
                 "original request asked for a program.\n"
-                "IMPORTANT: any constraints listed below apply to the "
-                "PROJECT as a whole, not to you individually -- they will "
-                "be satisfied collectively by the different sub-agents you "
-                "spawn (e.g. a cost constraint goes to one child, a "
-                "timing constraint goes to another). Seeing "
-                "constraints that look incompatible with EACH OTHER is "
-                "normal and expected -- that is a reason to split the work "
-                "across multiple specialized children, not a reason to "
-                "DIE. Only DIE if the task itself is impossible regardless "
-                "of how it's decomposed.\n"
+                + ("IMPORTANT: any constraints listed below apply to the "
+                   "PROJECT as a whole, not to you individually -- they will "
+                   "be satisfied collectively by the different sub-agents you "
+                   "spawn (e.g. a cost constraint goes to one child, a "
+                   "timing constraint goes to another). Seeing "
+                   "constraints that look incompatible with EACH OTHER is "
+                   "normal and expected -- that is a reason to split the work "
+                   "across multiple specialized children, not a reason to "
+                   "DIE. Only DIE if the task itself is impossible regardless "
+                   "of how it's decomposed.\n" if has_requirements else
+                   "IMPORTANT: no explicit project constraints were recorded "
+                   "for this task, so there is no constraint list in this "
+                   "prompt. Decompose the task as written. A missing "
+                   "constraint list is not a reason to DIE, and not licence "
+                   "to widen the task -- every subtask you spawn must be a "
+                   "piece of THIS task.\n") +
                 "IMPORTANT: if you can already identify SEVERAL independent "
                 "pieces of work up front (parts of the task that can each "
                 "be worked out without waiting for another's result), "
@@ -903,14 +938,20 @@ class Agent:
             "task is genuinely several tasks wearing one description.\n"
         ) if self.role == "executor" else ""
         return (
-            "IMPORTANT: the constraints listed below apply to the PROJECT "
-            "as a whole -- not every constraint necessarily applies to "
-            "YOUR specific task. If a constraint is clearly outside what "
-            "you were asked to do (e.g. a budget constraint on a task that "
-            "only asks for a schedule), it belongs to a different specialized "
-            "agent. Do your best on what's relevant to your task, and note "
-            "any out-of-scope constraints as open items in your REPORT "
-            "rather than treating them as a reason to DIE.\n"
+            ("IMPORTANT: the constraints listed below apply to the PROJECT "
+             "as a whole -- not every constraint necessarily applies to "
+             "YOUR specific task. If a constraint is clearly outside what "
+             "you were asked to do (e.g. a budget constraint on a task that "
+             "only asks for a schedule), it belongs to a different specialized "
+             "agent. Do your best on what's relevant to your task, and note "
+             "any out-of-scope constraints as open items in your REPORT "
+             "rather than treating them as a reason to DIE.\n"
+             if has_requirements else
+             "IMPORTANT: no project constraints were recorded for this task, "
+             "so this prompt contains no constraint list. Answer the task "
+             "exactly as written and no wider. Having no constraints is not "
+             "a reason to DIE, and not permission to redefine, generalise or "
+             "expand what you were asked for.\n")
             + too_large_rule +
             "IMPORTANT: give your answer in the form the task asks for. If "
             "the task did not ask for a program, answer in plain sentences "
@@ -926,15 +967,46 @@ class Agent:
             "your role, not for 'I don't have an exact measured number.'\n"
         )
 
+    def _goal_referent_str(self):
+        """
+        PATCH 8. What stands in the constraints slot when this task inherited
+        no constraints: the project goal, labelled as background.
+
+        A task that reached the tier-3 floor of the requirements filter had
+        no project-level referent anywhere -- not in its prompt, not at tier
+        2 (scored against its own description embedding), not at tier 3
+        (critiqued against agent.task alone). All three of run 4's
+        zero-requirement subtasks were in the ISBN subtree, and each one was
+        judged entirely self-consistent because nothing it was measured
+        against knew what the project was.
+
+        Deliberately NOT worded as a constraint. The inverted-fallback bug
+        this whole filter exists to fix was caused by handing subtasks
+        obligations that were not theirs; re-attaching the goal as something
+        to satisfy would walk straight back into it. This says "here is what
+        the project is, stay inside your own task" and nothing more.
+        """
+        goal = self.goal_referent
+        if not goal:
+            return ""
+        return (
+            "Project context (background only -- NOT a constraint to "
+            "satisfy, and NOT your scope): this task is one piece of the "
+            f"project \"{goal}\". Your task above is the only thing you "
+            "answer. Do not widen it to cover the project, and do not "
+            "answer something the project never asked for.\n"
+        )
+
     def _build_thinking_seed(self, requirements=None, available_tools=None):
         if requirements is None:
             requirements = self.requirements or []
         if available_tools is None:
             available_tools = self._default_available_tools()
-        role_constraint_str = self._get_role_constraint_str(available_tools)
+        role_constraint_str = self._get_role_constraint_str(
+            available_tools, has_requirements=bool(requirements))
         requirements_str = (
             "Constraints you must satisfy:\n" + "\n".join(f"- {r}" for r in requirements) + "\n"
-            if requirements else ""
+            if requirements else self._goal_referent_str()
         )
         tools_blocked = self._tools_blocked(available_tools)
         tools_str = (
@@ -1054,10 +1126,11 @@ class Agent:
         )
         requirements_str = (
             "Constraints you must satisfy:\n" + "\n".join(f"- {r}" for r in requirements) + "\n"
-            if requirements else ""
+            if requirements else self._goal_referent_str()
         )
         format_example_str = self._get_format_example(available_tools)
-        role_constraint_str = self._get_role_constraint_str(available_tools)
+        role_constraint_str = self._get_role_constraint_str(
+            available_tools, has_requirements=bool(requirements))
         # What the colony recorded about this decomposer's direct subtasks,
         # fetched once so the role rule, the menu and the YOUR SUBTASKS block
         # below all state the same thing. None without a colony view.
@@ -1720,7 +1793,7 @@ Your next action:"""
                         )
                         action = "THINK"
             else:
-                payload = "[No content generated -- decide() produced an empty response.]"
+                payload = EMPTY_DECISION_PLACEHOLDER
 
         self.cap_coerced_last_run = False
         if self.final_only:

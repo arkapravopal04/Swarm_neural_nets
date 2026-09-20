@@ -65,6 +65,27 @@ class TaskNode:
                                          # None on the root.
     label : str | None = None  # the "label" its SPAWN batch gave it, if any -- how the
                                # decomposer that wrote the batch refers to it
+    # --- PATCH 7: spawn-time drift, measured and stored, nothing gated on it yet ---
+    goal_drift : float | None = None    # cosine(this task's description, colony goal).
+                                         # CUMULATIVE distance from the project: how far
+                                         # the whole chain has walked by the time this
+                                         # task exists. None when either vector is
+                                         # missing or all-zero (problem_phaser's
+                                         # np.zeros fallbacks at :601/:636).
+    parent_drift : float | None = None  # cosine(this task's description, its PARENT
+                                         # task's description). PER-HOP distance: how far
+                                         # this one spawn moved. Read together with
+                                         # goal_drift these separate "one bad hop" from
+                                         # "a hundred reasonable-looking hops that sum to
+                                         # an ISBN catalogue pipeline". None on the root's
+                                         # own children (no parent description embedded)
+                                         # and whenever a vector is missing.
+    # --- PATCH 8: the project referent a zero-requirement task falls back to ---
+    goal_referent : str | None = None   # the project goal text, attached ONLY when
+                                         # _filter_requirements_for_task returned [] so
+                                         # this task would otherwise carry no
+                                         # project-level referent at all. Background
+                                         # context, never a constraint to satisfy.
 
 
 class TaskGraph:

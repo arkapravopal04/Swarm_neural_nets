@@ -15,7 +15,10 @@ import difflib
 import uuid
 import time
 import re
+import statistics
 import traceback
+
+import numpy as np
 from dataclasses import dataclass, replace
 from typing import Optional, Dict, Any, List
 
@@ -29,6 +32,7 @@ from agent_node import (
     _dedupe_repeated_sentences,
     EXEMPLAR_SUBTASK_DESCRIPTIONS,
     EXEMPLAR_REPORT_TEXTS,
+    EMPTY_DECISION_PLACEHOLDER,
     PROMPT_EXEMPLARS,
     role_may_use_tools,
 )
@@ -48,6 +52,7 @@ from text_utils import (
     asks_for_software,
     plain_register,
     software_artifact_reason,
+    software_request_words,
 )
 # For DEGENERATE_ANSWER_MESSAGE only -- the synthesizer instance is injected,
 # not constructed here. Imported so a run that produced nothing usable says so
@@ -61,6 +66,38 @@ FRAMING_LEVERS = ("reword", "block")
 # memory_state.OUTCOME_ACCEPTED -- repeated rather than imported because
 # memory_state pulls in faiss/sentence_transformers at import time.
 CACHE_OUTCOME_ACCEPTED = "accepted"
+
+
+def _cosine(a, b) -> Optional[float]:
+    """
+    PATCH 7. Cosine between two embeddings, or None when the answer would be
+    meaningless.
+
+    None -- not 0.0 -- on a missing or zero-norm vector. Problem_Phaser falls
+    back to np.zeros(embed_dim) for goal_vector on a degenerate parse
+    (problem_phaser.py:601) and on an exception (:636), and a zero vector has
+    no direction: scoring against it would report every subtask as maximally
+    drifted and bury the real distribution in fabricated zeros. The caller
+    counts these separately instead.
+
+    Mirrors judge.semantic_check's arithmetic deliberately, so a drift number
+    in the spawn log and a similarity number in a tier-2 verdict are the same
+    measurement and can be compared directly.
+    """
+    if a is None or b is None:
+        return None
+    try:
+        x = np.asarray(a, dtype="float32").ravel()
+        y = np.asarray(b, dtype="float32").ravel()
+        if x.size == 0 or y.size == 0 or x.shape != y.shape:
+            return None
+        nx = float(np.linalg.norm(x))
+        ny = float(np.linalg.norm(y))
+        if nx == 0.0 or ny == 0.0:
+            return None
+        return float(np.dot(x, y) / (nx * ny))
+    except Exception:
+        return None
 
 
 def _without_quoted_example(reason: str) -> str:
@@ -109,6 +146,13 @@ class Orchestrator:
         self.root_task_id: Optional[str] = None
         self.running = True
         self.run_trace: Optional[Dict[str, Any]] = None
+        # PATCH 7. One record per spawned subtask:
+        # {task_id, description, goal_drift, parent_drift}. Measure-only this
+        # round -- nothing reads it except the GOAL DRIFT AT SPAWN ledger
+        # section, which exists to produce the distribution a threshold can
+        # later be picked from. Appended even when a drift is None, so the
+        # "not measurable" cases are visible rather than silently absent.
+        self.goal_drift_samples: List[Dict[str, Any]] = []
 
         # Injected shared components -- NONE of these were wired in previously.
         # phaser: Problem_Phaser instance (turns raw text into a spec + budget)
@@ -740,6 +784,13 @@ class Orchestrator:
             ghost_context=ghost_context,
             requirements=requirements,
             generation=generation,
+            # PATCH 8. Set only on a task the requirements filter emptied, so
+            # every agent that runs it -- first attempt, respawn, or a TASK
+            # TOO LARGE conversion, all of which come through here -- gets the
+            # project referent. Read off the TaskNode rather than recomputed,
+            # so a conversion cannot lose it the way the ghost-context path
+            # loses the project goal line on attempt 2.
+            goal_referent=getattr(task_node, "goal_referent", None),
         )
         
         self.colony.register_agent(new_agent)
@@ -800,7 +851,37 @@ class Orchestrator:
         "be", "by", "that", "this", "it", "its", "into", "than", "not",
         "specify", "design", "estimate", "under", "since", "base", "cannot",
         "survive", "remain", "via", "show", "just", "but", "final",
+        # PATCH 9. Words that carry no domain meaning in a requirement
+        # sentence, so an overlap on one of them is noise, not relevance.
+        # Measured: task_b029d4e5 ("Group records by their normalized
+        # title-author pairings...") qualified for tier 1 -- the strongest
+        # tier -- on "per" and "one" alone, against "Answers must remain
+        # within one paragraph per question."
+        #
+        # Three groups, all of them structural rather than topical:
+        #   quantifiers and determiners,
+        #   obligation verbs (every requirement is phrased as one, so they
+        #     match everything and distinguish nothing),
+        #   and the meta-vocabulary the phaser uses to talk ABOUT answers
+        #     rather than about the domain.
+        # Deliberately NOT added: "books", "titles", "votes", "members",
+        # "readings" -- those are this project's actual subject matter and
+        # an overlap on them is real signal.
+        "per", "one", "two", "three", "each", "any", "all",
+        "need", "needs", "needed", "required", "require", "requires",
+        "may", "can", "will", "shall",
+        "answer", "answers", "question", "questions", "response",
+        "responses", "output", "outputs", "result", "results",
+        "solution", "solutions", "within", "prior", "set",
     })
+    # PATCH 9. Tier 1 kept every requirement sharing >=1 exact significant
+    # word, with no cap -- a strictly weaker test than tier 2 below it,
+    # which requires a stem match AND returns at most two. A single shared
+    # token is noise at this corpus size. Tier 1 now needs two shared words
+    # and is capped like tier 2; a requirement that reaches only one word
+    # falls through to the stem path rather than being promoted on it.
+    REQ_EXACT_MIN_WORDS = 2
+    REQ_MAX_INHERITED = 2
 
     @classmethod
     def _significant_words(cls, text: str) -> set:
@@ -891,6 +972,20 @@ class Orchestrator:
         returns at most the two best-scoring requirements -- enough to keep a
         genuinely-related constraint from being dropped over a suffix, not
         enough to reinstate the dump-everything behaviour.
+
+        PATCH 9 (tier 1). The exact pass used to keep every requirement
+        sharing ONE word, unbounded -- weaker than the stem tier beneath it,
+        which demands a match and caps the result at two. So the "strongest"
+        tier was the one most easily satisfied by noise, and run 4's
+        task_b029d4e5 inherited a constraint on the strength of "per" and
+        "one". It now takes REQ_EXACT_MIN_WORDS shared words, returns the
+        REQ_MAX_INHERITED best, and falls through to the stem pass when no
+        requirement reaches the bar instead of settling for a one-word hit.
+
+        PATCH 9 (logging). Every tier logs now, tier 1 included. It was the
+        only silent one, so a run's log showed the two degraded tiers and
+        said nothing about the 6 tasks on the nominally-good path -- the
+        tier distribution could not be read off a log at all.
         """
         if not requirements:
             return []
@@ -900,8 +995,21 @@ class Orchestrator:
                   "inheriting no requirements.")
             return []
 
-        kept = [r for r in requirements if task_words & self._significant_words(r)]
-        if kept:
+        scored_exact = []
+        for r in requirements:
+            shared = task_words & self._significant_words(r)
+            if len(shared) >= self.REQ_EXACT_MIN_WORDS:
+                scored_exact.append((len(shared), r, shared))
+        if scored_exact:
+            scored_exact.sort(key=lambda triple: -triple[0])
+            kept = [r for _, r, _ in scored_exact[:self.REQ_MAX_INHERITED]]
+            shared_words = sorted(set().union(*[s for _, _, s in scored_exact[:self.REQ_MAX_INHERITED]]))
+            print(f"  [requirements] tier 1 (exact) for '{description[:60]}' -- "
+                  f"inheriting {len(kept)} of {len(requirements)} requirement(s) "
+                  f"on shared words {shared_words}"
+                  + (f"; {len(scored_exact) - len(kept)} more qualified and were "
+                     f"capped at {self.REQ_MAX_INHERITED}"
+                     if len(scored_exact) > len(kept) else ""))
             return kept
 
         task_stems = self._stems(task_words)
@@ -912,16 +1020,18 @@ class Orchestrator:
                 scored.append((overlap, r))
         if scored:
             scored.sort(key=lambda pair: -pair[0])
-            partial = [r for _, r in scored[:2]]
-            print(f"  [requirements] no exact keyword overlap for "
+            partial = [r for _, r in scored[:self.REQ_MAX_INHERITED]]
+            print(f"  [requirements] tier 2 (stem) -- no requirement reached "
+                  f"{self.REQ_EXACT_MIN_WORDS} exact shared words for "
                   f"'{description[:60]}' -- inheriting the {len(partial)} "
                   f"closest requirement(s) by stem overlap only.")
             return partial
 
-        print(f"  [requirements] no keyword overlap at all for "
+        print(f"  [requirements] tier 3 -- no keyword overlap at all for "
               f"'{description[:60]}' -- inheriting NO requirements (previously "
               f"this inherited all of them, which is what forced unrelated "
-              f"constraints onto narrow subtasks).")
+              f"constraints onto narrow subtasks). PATCH 8 attaches the "
+              f"project goal as this task's referent instead.")
         return []
 
     _VALID_ROLES = ("decomposer", "executor", "verifier")
@@ -1045,8 +1155,28 @@ class Orchestrator:
         else:
             requirements = self._filter_requirements_for_task(description, full_requirements)
 
+        # PATCH 8. The filter/guard band, closed. _filter_requirements_for_task
+        # compares a task against each requirement individually;
+        # _has_no_requirement_overlap (the derived-subtask guard) compares it
+        # against the UNION of requirements, goal, raw_text and parent task.
+        # The guard's corpus is a strict superset, so a task can be stripped
+        # to zero requirements by the filter and still sail past the guard on
+        # a word it shares with the goal -- which is exactly where run 4's
+        # drift lived. A task landing there now carries the goal text as a
+        # referent so it is not left with no project-level anchor anywhere.
+        # Background only: it is NOT appended to `requirements`, so nothing
+        # asks this agent to satisfy the project, and the inverted-fallback
+        # bug the filter exists to prevent stays fixed.
+        goal_referent = None
+        if role != "decomposer" and not requirements:
+            goal_referent = (self.spec.get("goal") or self.spec.get("raw_text")) if self.spec else None
+            if goal_referent:
+                goal_referent = _dedupe_repeated_sentences(str(goal_referent), max_chars=300)
+                self.colony.record_verdict("goal_referent_attached")
+
         parent_node = self.colony.get_agent(parent_id) if parent_id else None
         child_node = TaskNode(
+            goal_referent=goal_referent,
             task_id=task_id,
             description=description,
             dependencies=dependencies or [],
@@ -1070,11 +1200,119 @@ class Orchestrator:
                 )
             except Exception as e:
                 print(f"Warning: failed to embed task description for '{task_id}': {e}")
+
+        self._measure_spawn_drift(child_node, parent_task_id=child_node.parent_task_id)
+        self._flag_software_shaped_task(child_node)
         self.task_graph.add_task(child_node)
 
         if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
                             ghost_context=self._child_ghost_context(dependencies)) is None:
             self._close_unstartable_child(task_id, parent_id)
+
+    def _project_goal_text(self) -> Optional[str]:
+        """PATCH 8. The goal as one short line, for the tier-3 prompt and the
+        zero-requirement referent. Deduped and capped the same way
+        _child_ghost_context caps it, so a phaser goal that looped on itself
+        cannot inflate every critique prompt for the rest of the run."""
+        if not self.spec:
+            return None
+        goal_text = self.spec.get("goal") or self.spec.get("raw_text")
+        if not goal_text:
+            return None
+        return _dedupe_repeated_sentences(str(goal_text), max_chars=300)
+
+    def _measure_spawn_drift(self, child_node: TaskNode, parent_task_id: Optional[str]):
+        """
+        PATCH 7. Score every spawned subtask against the colony goal and
+        against its own parent task, store both on the TaskNode, and log them
+        unconditionally.
+
+        MEASURE-ONLY. Nothing is rejected, warned or re-planned on these
+        numbers this round. The point is the distribution: run 4's ISBN
+        subtree walked from "Count total number of distinct books available"
+        to "Remove duplicate entries where titles and authors exactly match
+        case-insensitively" one plausible hop at a time, and until there are
+        real numbers for both kinds of distance there is no defensible place
+        to put a threshold.
+
+        The two are different questions and are reported separately:
+          goal_drift   -- CUMULATIVE. How far from the project this task sits,
+                          however many hops it took to get there.
+          parent_drift -- PER-HOP. How far this one SPAWN moved.
+        If per-hop stays high while goal drift decays, no single decomposer
+        did anything obviously wrong and only the sum is bad -- which is a
+        different fix (a cumulative budget) from one bad hop (a spawn gate).
+
+        Both vectors already existed and were never multiplied: goal_vector
+        is computed at problem_phaser.py:332 and read only by the phaser's own
+        budget multiplier, and description_embedding has been set at spawn
+        since the N2b fix purely as a tier-2 target.
+        """
+        goal_drift = _cosine(child_node.description_embedding, self.colony.goal_embedding)
+        parent_task = self.task_graph.tasks.get(parent_task_id) if parent_task_id else None
+        parent_drift = _cosine(
+            child_node.description_embedding,
+            getattr(parent_task, "description_embedding", None),
+        )
+        child_node.goal_drift = goal_drift
+        child_node.parent_drift = parent_drift
+        self.goal_drift_samples.append({
+            "task_id": child_node.task_id,
+            "description": child_node.description,
+            "goal_drift": goal_drift,
+            "parent_drift": parent_drift,
+        })
+
+        # Why a number is missing matters as much as the number. A zero-norm
+        # goal vector means the phaser fell back (problem_phaser.py:601/:636)
+        # and EVERY drift figure this run is absent for the same reason; a
+        # missing parent embedding is routine on a root child, which has no
+        # embedded parent description.
+        if goal_drift is None:
+            self.colony.record_verdict("spawn_drift_goal_unmeasurable")
+        if parent_drift is None:
+            self.colony.record_verdict("spawn_drift_parent_unmeasurable")
+
+        def _fmt(value):
+            return f"{value:.3f}" if value is not None else "n/a"
+
+        print(f"  [spawn-drift] {child_node.task_id} goal={_fmt(goal_drift)} "
+              f"parent={_fmt(parent_drift)} (measure-only, nothing gated): "
+              f"{str(child_node.description)[:70]!r}")
+
+    def _flag_software_shaped_task(self, child_node: TaskNode):
+        """
+        PATCH 10 (measure-only). Ask the software-request question of a
+        SUBTASK, not just of the user's original request.
+
+        _SOFTWARE_REQUEST_RE already lists "database", "script", "sql",
+        "dataset", "regex", "json" and "csv", but asks_for_software runs it on
+        spec["raw_text"] alone, to decide whether the framing guard is on at
+        all. Nothing asked it of a subtask, so run 4 spawned "Query the
+        catalog database to extract records" and "Write a script that
+        processes raw input rows" untouched -- and the first became the single
+        most expensive task of the run at 85/108, then promoted.
+
+        This is a different question from the two checks that already run on a
+        subtask. software_artifact_reason asks "is this text written as code"
+        (syntax); plain_register asks "does this text use a code-coded word"
+        (vocabulary, and it rewords rather than judges). This asks "is this
+        task ASKING for software" (substance) -- the question the scan found
+        nothing was asking.
+
+        Counted and logged only. No reject, no reword, no respawn: the whole
+        point of this round is to find out how many subtasks it would fire on
+        before it is allowed to cost anything.
+        """
+        if not self._software_framing_guard_active:
+            return
+        hits = software_request_words(child_node.description)
+        if not hits:
+            return
+        self.colony.record_verdict("software_shaped_task_detected")
+        print(f"  [software-shaped task] {child_node.task_id} asks for software "
+              f"{hits} on a project that never did (measure-only, not blocked): "
+              f"{str(child_node.description)[:70]!r}")
 
     def _child_ghost_context(self, dependencies: Optional[list]) -> Optional[str]:
         """A child's starting ghost context: the project goal as background,
@@ -2117,6 +2355,40 @@ class Orchestrator:
                       f"{len(str(result))} -> {len(trimmed)} chars before judging.")
                 result = trimmed
 
+        # PATCH 11. decide() returning nothing is not an answer, and the
+        # string it substitutes is a constant this process wrote -- so an
+        # identity comparison is exact and free, and no judge call is needed
+        # to establish it. In run 4 it went the whole way: tier 1 passed it
+        # (not empty, no trailing colon, not a heading, 52 alphanumeric
+        # characters, and judge._PLACEHOLDER_REPORTS misses it because that
+        # lookup strips " \t\n.-_*#" but not the square brackets), tier 2 was
+        # skipped twice over (9 words, decomposer role), and tier 3 spent a
+        # full deep_critique writing ~500 characters about a placeholder, for
+        # 5 energy.
+        #
+        # Placed here with the other two pre-judge structural rejects, and
+        # deliberately ABOVE last_partial_result: recorded below, this text
+        # would become the salvaged "partial result" handed to the parent if
+        # the task were later abandoned. Reads the raw payload, like the
+        # checks around it -- report-trim rewrites the local `result`, not
+        # payload["result"].
+        empty_agent = self.colony.get_agent(agent_id)
+        if empty_agent is not None and payload.get("result") == EMPTY_DECISION_PLACEHOLDER:
+            self.colony.record_verdict("report_empty_generation_rejected")
+            print(f"REJECT (structural) on {agent_id}/{task_id}: the REPORT is the "
+                  f"empty-generation placeholder, not an answer -- rejected before "
+                  f"the judge.")
+            empty_agent.fail_reason = (
+                "Previous attempt was REJECTED: your last response produced no "
+                "content at all, so nothing was submitted. Write the answer to "
+                "your task as plain sentences after 'PAYLOAD:'."
+            )
+            self._kill_and_respawn(
+                agent_id, task_id, empty_agent.role, empty_agent.parent_id,
+                verdict={"verdict": "execute", "reason": empty_agent.fail_reason},
+            )
+            return
+
         # The prompt's own worked example handed back as the answer. It is
         # domain-free by design, so it answers nothing: run 3 got it back as
         # agent_8d992982's whole REPORT, which was stopped only because tier 2
@@ -2125,8 +2397,9 @@ class Orchestrator:
         # Rejected here whatever the length or role, before the judge and
         # before last_partial_result, so it is never salvaged for a parent
         # either. Reads the untrimmed payload, like the check below. A REPORT
-        # that quotes the example and then gives its own answer is not
+        # that quotes the example ONCE and then gives its own answer is not
         # rejected: the promotion scrub cuts the quoted sentence out of it.
+        # Two or more copies IS rejected (PATCH 11, is_exemplar_echo).
         # The worked REPORT only: an echoed SPAWN placeholder still goes to
         # the judge, and the promotion scrub marks it if it gets that far.
         echo_agent = self.colony.get_agent(agent_id)
@@ -2299,6 +2572,17 @@ class Orchestrator:
                 # blocking subtask completion, the tier3_accept/tier3_reject
                 # counters below will now actually populate and show it.
                 needs_deep_check=True,
+                # PATCH 8. Tier 3 judged against agent.task and nothing else,
+                # so an ISBN-deduplication answer to an ISBN-deduplication
+                # subtask was correctly scored as fully on-topic -- the
+                # critique had no way to see that the subtask itself did not
+                # belong to this project. The goal goes in as context for one
+                # added question; the other three stay about agent.task.
+                # goal_embedding is measure-only (see judge.decide): it
+                # annotates a tier-2 verdict the task-level score already
+                # reached, and gates nothing.
+                project_goal=self._project_goal_text(),
+                goal_embedding=self.colony.goal_embedding,
             )
 
             if verdict.get("tier") == 3:
@@ -3649,11 +3933,68 @@ class Orchestrator:
                 print(f"      REPORTs rejected       : {verdicts.get('software_framing_report_rejected', 0)}")
                 print(f"      DIE reasons withheld   : {verdicts.get('software_framing_die_scrubbed', 0)}")
 
+                print("    software-shaped TASKS (PATCH 10, measure-only):")
+                print(f"      subtasks that ASK for software : "
+                      f"{verdicts.get('software_shaped_task_detected', 0)}")
+                print("      (counted, never blocked this round -- these are "
+                      "subtasks whose own text uses the vocabulary that would "
+                      "have switched the guard on had the USER written it)")
+
+            # PATCH 7. The distribution, so a threshold can be chosen from
+            # data rather than guessed. Nothing in this run was gated on any
+            # of these numbers.
+            print(chr(10) + "  GOAL DRIFT AT SPAWN (PATCH 7, measure-only -- nothing rejected on this)")
+            samples = getattr(self, "goal_drift_samples", []) or []
+            if not samples:
+                print("    (no subtasks spawned this run)")
+            else:
+                goal_vals = [s["goal_drift"] for s in samples if s["goal_drift"] is not None]
+                parent_vals = [s["parent_drift"] for s in samples if s["parent_drift"] is not None]
+                print(f"    subtasks measured : {len(goal_vals)} of {len(samples)} spawned")
+                unmeasurable = verdicts.get("spawn_drift_goal_unmeasurable", 0)
+                if unmeasurable:
+                    # All-or-nothing in practice: a zero-norm goal vector is
+                    # the phaser's np.zeros fallback, which affects the whole
+                    # run, not one task.
+                    print(f"    goal-cosine unmeasurable : {unmeasurable} "
+                          f"(missing or zero-norm vector -- see "
+                          f"problem_phaser.py:601/:636)")
+                for name, vals in (("cosine to GOAL   (cumulative)", goal_vals),
+                                   ("cosine to PARENT (per hop)   ", parent_vals)):
+                    if not vals:
+                        print(f"    {name} : (none measurable)")
+                        continue
+                    print(f"    {name} : min={min(vals):.3f}  "
+                          f"median={statistics.median(vals):.3f}  "
+                          f"max={max(vals):.3f}  n={len(vals)}")
+                if goal_vals:
+                    print("    5 lowest by goal-cosine (furthest from the project):")
+                    ranked = sorted(
+                        (s for s in samples if s["goal_drift"] is not None),
+                        key=lambda s: s["goal_drift"],
+                    )[:5]
+                    for s in ranked:
+                        description = " ".join(str(s["description"] or "").split())
+                        if len(description) > 58:
+                            description = description[:55] + "..."
+                        parent = ("n/a" if s["parent_drift"] is None
+                                  else f"{s['parent_drift']:.3f}")
+                        # Both numbers on one row on purpose: a low goal
+                        # cosine next to a HIGH parent cosine is the
+                        # gradual-drift signature (every hop looked fine),
+                        # and is a different problem from a low pair.
+                        print(f"      goal={s['goal_drift']:.3f}  parent={parent}  "
+                              f"{s['task_id']}  {description}")
+
             print(chr(10) + "  STRUCTURAL REJECTS (caught before the judge)")
             print(f"    decomposer REPORT, no completed subtask : "
                   f"{verdicts.get('decomposer_report_no_completed_child', 0)}")
             print(f"    REPORT was the prompt's worked example  : "
                   f"{verdicts.get('report_exemplar_echo_rejected', 0)}")
+            print(f"    REPORT was the empty-generation placeholder : "
+                  f"{verdicts.get('report_empty_generation_rejected', 0)}")
+            print(f"    zero-requirement tasks given the goal referent : "
+                  f"{verdicts.get('goal_referent_attached', 0)}")
 
             print("\n  RESPAWNS (top 10 by count)")
             respawns = getattr(self, "respawn_counts", {}) or {}

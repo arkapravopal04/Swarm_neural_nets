@@ -1392,9 +1392,23 @@ def is_exemplar_echo(text, exemplars=()):
     """True when `text` is substantially one of `exemplars` and nothing else.
 
     Compared word-normalized, so punctuation, case and a trailing delimiter
-    do not hide the copy. A text that quotes an exemplar and then goes on
-    to its own answer is NOT an echo by this test -- degeneracy_cut removes
-    the quoted sentence from that one and keeps the rest.
+    do not hide the copy. A text that quotes an exemplar ONCE and then goes
+    on to its own answer is NOT an echo by this test -- degeneracy_cut
+    removes the quoted sentence from that one and keeps the rest.
+
+    PATCH 11. Two or more copies is an echo whatever trails it. The
+    absolute residue cap alone could not catch the shape run 4 produced
+    twice: the model looped the worked REPORT 11 times and the generation
+    budget cut it mid-way through copy 12, so the leftover was a TRUNCATED
+    COPY OF THE EXEMPLAR ITSELF -- 5 words for agent_e0300910, 10 for
+    agent_e6ddc846, both over a cap of 3 that a partial exemplar can never
+    fit under. Both reached the judge and cost a full respawn, while
+    "REPORT was the prompt's worked example" read 0 in the ledger.
+
+    Repetition is the evidence, not the padding: a domain-free illustration
+    stated twice answers nothing no matter how much text follows it. The
+    <=3 residue rule still governs the single-copy case, so the
+    "quotes it, then answers" contract above is unchanged.
     """
     normalized = normalize_words(text)
     if not normalized:
@@ -1404,6 +1418,8 @@ def is_exemplar_echo(text, exemplars=()):
         if not target:
             continue
         rest, hits = re.subn(rf"(?<!\S){re.escape(target)}(?!\S)", " ", normalized)
+        if hits >= 2:
+            return True
         if hits and len(rest.split()) <= EXEMPLAR_ONLY_MAX_EXTRA_WORDS:
             return True
     return False
@@ -1850,6 +1866,20 @@ _CODE_FILENAME_RE = re.compile(
 )
 # snake_case identifier called like a function: "select_book(preferences)".
 _SNAKE_CALL_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\s*\(")
+# PATCH 10. Dotted call: "unicodedata.normalize(", "re.sub(", "title.lower()".
+# _SNAKE_CALL_RE above requires an underscore in the identifier, so the entire
+# stdlib-dotted form went undetected -- run 4 promoted two REPORTs on it
+# (unicodedata.normalize('NFC', title.lower()) and re.sub(r'[^\w\s]', '',
+# title.lower())) while rejecting normalize_title( for the one underscore.
+#
+# Three deliberate narrowings keep this off ordinary prose:
+#   * case-SENSITIVE lowercase both sides, so "the U.S. (see above)" and
+#     "Ms. Owens (chair)" cannot match;
+#   * >=2 chars before the dot and >=3 after it, so "e.g.(", "ch.3(" and
+#     "1.5(" cannot match;
+#   * NO whitespace allowed before the paren, so "the club.org (site)" and
+#     "resolved.Then (later)" cannot match. Real code never spaces a call.
+_DOTTED_CALL_RE = re.compile(r"\b[a-z_][a-z0-9_]{1,}\.[a-z_][a-z0-9_]{2,}\(")
 _SOFTWARE_ARTIFACT_WORD_RE = re.compile(
     r"\b(?:pseudo-?code|checksums?|source code|unit tests?|code snippet)\b",
     re.IGNORECASE,
@@ -1868,6 +1898,30 @@ def asks_for_software(text):
         or "```" in text
         or looks_like_source_code(text)
     )
+
+
+def software_request_words(text):
+    """
+    PATCH 10 (measure-only). The software-request vocabulary this text uses,
+    deduplicated and lowercased, or [].
+
+    _SOFTWARE_REQUEST_RE already knows that "database", "script", "sql",
+    "dataset", "regex", "json" and "csv" mean software is on the table, but
+    asks_for_software consults it on the USER'S request only, to decide
+    whether the framing guard runs at all. Nothing ever asked the same
+    question of a SUBTASK. Run 4 therefore spawned "Query the catalog
+    database to extract records" and "Write a script that processes raw
+    input rows" untouched -- software-shaped TASKS, not merely
+    software-shaped wording, which is all plain_register looks at.
+
+    Separate from software_artifact_reason: that one asks "is this text
+    written as code", which is a syntax question. This asks "is this text
+    asking for software", which is a substance question.
+    """
+    if not text:
+        return []
+    found = [m.group(0).lower() for m in _SOFTWARE_REQUEST_RE.finditer(str(text))]
+    return list(dict.fromkeys(found))
 
 
 def software_artifact_reason(text):
@@ -1893,6 +1947,12 @@ def software_artifact_reason(text):
     match = _SNAKE_CALL_RE.search(text)
     if match:
         return f"contains a function call ({match.group(0).strip()!r})"
+    # PATCH 10: the dotted form, reported distinctly from the snake_case one
+    # so a log says which rule fired. _without_quoted_example strips the
+    # parenthesised evidence before this reaches a respawn's ghost context.
+    match = _DOTTED_CALL_RE.search(text)
+    if match:
+        return f"contains a method call ({match.group(0).strip()!r})"
     match = _SOFTWARE_ARTIFACT_WORD_RE.search(text)
     if match:
         return f"describes a software artifact ({match.group(0)!r})"
