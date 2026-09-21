@@ -9,7 +9,9 @@ from text_utils import (
     dedupe_global_and_cap,
     dedupe_list_exact,
     final_derived_constraint,
+    figure_fidelity,
     goal_clauses,
+    goal_fidelity,
     supplied_data,
     looks_like_source_code,
     plain_register,
@@ -366,33 +368,83 @@ Output:"""
                 )
                 return self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
 
-            goal_sentence = self._pick_goal(sample, raw_text)
-
-            # FIX: greedy decoding here occasionally degenerates into a
-            # repeated clause/sentence, which then silently pushed real
-            # content past all-MiniLM-L6-v2's 256-wordpiece truncation
-            # window at encode() time below. Dedupe (non-adjacent, since a
-            # short goal sentence can interleave a repeat with other
-            # content) and cap BEFORE encoding, so goal_sentence (the root
-            # TaskNode.description the judge prints) and goal_vector (the
-            # tier-2 target) are guaranteed to agree on the same string.
-            cleaned_goal = dedupe_global_and_cap(goal_sentence, max_chars=400)
-            if goal_sentence and len(cleaned_goal) < 0.7 * len(goal_sentence):
-                print(
-                    f"[Problem_Phaser] WARNING: goal generation looked degenerate -- "
-                    f"dedupe removed {100 * (1 - len(cleaned_goal) / len(goal_sentence)):.0f}% "
-                    f"of the text ({len(goal_sentence)} -> {len(cleaned_goal)} chars)."
-                )
-            goal_sentence = cleaned_goal
-
-            # Reworded BEFORE encoding, so goal_vector and the root task
-            # description still agree (see the dedupe note above). Only when
-            # the user's own text never asked for software: there,
-            # "implement" and "algorithm" mean exactly what they say.
-            goal_sentence = self._plain_wording(goal_sentence, raw_text, "goal")
+            goal_sentence, self.goal_fidelity_record = self._faithful_goal(
+                lambda: self._finish_goal(self._pick_goal(sample, raw_text), raw_text),
+                raw_text,
+            )
             goal_vector = self.embed_model.encode(goal_sentence, convert_to_numpy=True)
 
         return goal_sentence, goal_vector
+
+    # PATCH 22. How many goals are drawn before the user's own text is used.
+    GOAL_FIDELITY_ATTEMPTS = 2
+
+    def _finish_goal(self, goal_sentence, raw_text):
+        """The post-sampling pipeline every goal candidate goes through,
+        so a regenerated goal is cleaned exactly like the first one."""
+        # FIX: greedy decoding here occasionally degenerates into a
+        # repeated clause/sentence, which then silently pushed real
+        # content past all-MiniLM-L6-v2's 256-wordpiece truncation
+        # window at encode() time below. Dedupe (non-adjacent, since a
+        # short goal sentence can interleave a repeat with other
+        # content) and cap BEFORE encoding, so goal_sentence (the root
+        # TaskNode.description the judge prints) and goal_vector (the
+        # tier-2 target) are guaranteed to agree on the same string.
+        cleaned_goal = dedupe_global_and_cap(goal_sentence, max_chars=400)
+        if goal_sentence and len(cleaned_goal) < 0.7 * len(goal_sentence):
+            print(
+                f"[Problem_Phaser] WARNING: goal generation looked degenerate -- "
+                f"dedupe removed {100 * (1 - len(cleaned_goal) / len(goal_sentence)):.0f}% "
+                f"of the text ({len(goal_sentence)} -> {len(cleaned_goal)} chars)."
+            )
+        goal_sentence = cleaned_goal
+
+        # Reworded BEFORE encoding, so goal_vector and the root task
+        # description still agree (see the dedupe note above). Only when
+        # the user's own text never asked for software: there,
+        # "implement" and "algorithm" mean exactly what they say.
+        return self._plain_wording(goal_sentence, raw_text, "goal")
+
+    def _faithful_goal(self, draw, raw_text):
+        """PATCH 22. A goal that states the user's figures and covers the
+        user's asks, as (goal, record).
+
+        Run 8's goal turned Rs. 9,000 into 9,567, lost the 12 plots and the
+        fourth question, and turned "summer months" into "six months"; every
+        agent inherited it as the project. `draw` produces one finished
+        candidate. It is drawn up to GOAL_FIDELITY_ATTEMPTS times; if none
+        passes, the user's own text becomes the goal -- verbose, but it says
+        what the user said, which a fluent wrong sentence does not.
+
+        The fallback is NOT capped at dedupe_global_and_cap's 400 characters:
+        a cap is exactly how a fourth part gets dropped a second time.
+        MiniLM still only reads the first 256 wordpieces for goal_vector.
+        """
+        attempts = []
+        for attempt in range(1, self.GOAL_FIDELITY_ATTEMPTS + 1):
+            candidate = draw()
+            check = goal_fidelity(raw_text, candidate)
+            attempts.append({"goal": candidate, **{k: check[k] for k in
+                             ("extra", "missing", "uncovered")}})
+            print(f"[Problem_Phaser] goal fidelity attempt {attempt}: "
+                  f"{'PASS' if check['ok'] else 'FAIL'}"
+                  + ("" if check["ok"] else
+                     f" -- figures not in the request: {check['extra']}; "
+                     f"request figures missing: {check['missing']}; "
+                     f"parts not covered: {check['uncovered']}")
+                  + f" :: {candidate[:160]!r}")
+            for ask, fraction, covered in check["coverage"]:
+                print(f"    [goal fidelity] part {fraction:.2f} "
+                      f"{'covered' if covered else 'MISSING'}: {ask[:100]!r}")
+            if check["ok"]:
+                return candidate, {"outcome": "pass" if attempt == 1 else "pass_on_retry",
+                                   "attempts": attempts}
+
+        fallback = strip_code_fences(" ".join(str(raw_text).split()))
+        fallback, _ = cut_instruction_tail(fallback)
+        print(f"[Problem_Phaser] goal fidelity: FAILED {len(attempts)} draws -- "
+              f"using the user's request as the goal ({len(fallback)} chars).")
+        return fallback, {"outcome": "fallback_raw_text", "attempts": attempts}
 
     def _embed_goal_clauses(self, goal_sentence):
         """PATCH 17 (measure-only). The goal split into its clauses, and one
@@ -510,30 +562,76 @@ Output:
         with torch.no_grad():
             inputs = self.tokeniser(requirement_prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
             prompt_length = inputs.input_ids.shape[1]
-            
-            outputs = self.llm.generate(
-                **inputs, max_new_tokens=120, min_new_tokens=2, do_sample=False,
-                pad_token_id=self.tokeniser.eos_token_id,
-                stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
-                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
-            )
-            req_output = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
-            req_output = self._sanitize_generation(req_output)
 
-        requirements_list = self._clean_requirements(req_output)
-        # Requirements reach every agent's "Constraints you must satisfy"
-        # block, so an extractor that writes "Must implement a fair
-        # resolution algorithm" would re-prime every child regardless of how
-        # its own task is worded. Reworded before encoding, same as the goal.
-        requirements_list = [
-            self._plain_wording(req, raw_text, "constraint") for req in requirements_list
-        ]
+            def extract(sampled):
+                outputs = self.llm.generate(
+                    **inputs, max_new_tokens=120, min_new_tokens=2,
+                    do_sample=sampled,
+                    **({"temperature": 0.7, "top_p": 0.9} if sampled else {}),
+                    pad_token_id=self.tokeniser.eos_token_id,
+                    stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
+                    repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
+                )
+                req_output = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
+                req_output = self._sanitize_generation(req_output)
+                # Requirements reach every agent's "Constraints you must
+                # satisfy" block, so an extractor that writes "Must implement
+                # a fair resolution algorithm" would re-prime every child
+                # regardless of how its own task is worded. Reworded before
+                # encoding, same as the goal.
+                return [self._plain_wording(req, raw_text, "constraint")
+                        for req in self._clean_requirements(req_output)]
+
+            requirements_list, self.constraint_fidelity_record = \
+                self._faithful_constraints(extract, raw_text)
 
         vectored_reqs = []
         if requirements_list:
             vectored_reqs = self.embed_model.encode(requirements_list, convert_to_numpy=True)
 
         return requirements_list, vectored_reqs
+
+    def _faithful_constraints(self, extract, raw_text):
+        """PATCH 22, applied to the constraint list, as (constraints, record).
+
+        Run 8's "Yearly fees must cover Rs. 9,600 total expenses" was a
+        CONSTRAINT, and constraints are what every subtask inherits verbatim
+        -- it is where the root decomposer's "Allocate Rs. 9,600 total annual
+        fees" came from. Only the extra-figure half of the check applies: no
+        single constraint has to carry every figure the user gave.
+
+        The first extraction is greedy (the historical behaviour); if any
+        constraint states a figure the request does not, one SAMPLED
+        extraction is drawn -- a second greedy call would return the same
+        list -- and the list with fewer offenders is kept, the greedy one on
+        a tie. Offenders that survive are dropped and logged: a missing
+        constraint costs a child some guidance, a wrong number in one is
+        copied into every child's answer.
+        """
+        def offenders(items):
+            return [(c, figure_fidelity(raw_text, c, require_all=False)[0])
+                    for c in items
+                    if figure_fidelity(raw_text, c, require_all=False)[0]]
+
+        first = extract(False)
+        bad = offenders(first)
+        record = {"dropped": [], "retried": False}
+        chosen = first
+        if bad:
+            record["retried"] = True
+            second = extract(True)
+            bad_second = offenders(second)
+            print(f"[Problem_Phaser] constraint fidelity: {len(bad)} constraint(s) "
+                  f"state figures the request does not -- re-extracted, "
+                  f"{len(bad_second)} on the second draw.")
+            if len(bad_second) < len(bad):
+                chosen, bad = second, bad_second
+        for constraint, extra in bad:
+            print(f"[Problem_Phaser] constraint fidelity: DROPPED {constraint!r} "
+                  f"(figures not in the request: {extra})")
+            record["dropped"].append({"constraint": constraint, "extra": extra})
+        dropped = {c for c, _ in bad}
+        return [c for c in chosen if c not in dropped], record
 
     def _get_domain(self, raw_text):
         """Classifies the prompt into an exact taxonomy tier, ensuring formatting constraints."""
@@ -697,6 +795,12 @@ Output:"""
         if len(raw_text) > max_chars:
             raw_text = raw_text[:max_chars] + "\n... [TRUNCATED]"
 
+        # PATCH 22. The request itself, printed once. Run 8's log had no copy
+        # of it, so the phaser's goal could only be compared with the user's
+        # words from memory.
+        print(f"[Problem_Phaser] request ({len(raw_text)} chars): {raw_text}")
+        self.goal_fidelity_record = None
+        self.constraint_fidelity_record = None
         try:
             goal_sentence, goal_vector = self._get_goal_prompt(raw_text)
             clauses, clause_vectors = self._embed_goal_clauses(goal_sentence)
@@ -730,6 +834,8 @@ Output:"""
                 "supplies_data": supplies,
                 "supplied_figures": supplied_figures,
                 "supplied_identifiers": supplied_ids,
+                "goal_fidelity": self.goal_fidelity_record,
+                "constraint_fidelity": self.constraint_fidelity_record,
             }
         except Exception as e:
             print(f"Error during problem parsing: {e}")

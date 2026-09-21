@@ -26,6 +26,9 @@ from text_utils import (
     degeneracy_cut as _degeneracy_cut,
     drop_incomplete_tail as _drop_incomplete_tail,
     looks_degenerate as _looks_degenerate,
+    cut_model_not_completed as _cut_model_not_completed,
+    not_completed_sentence as _not_completed_sentence,
+    strip_task_ids as _strip_task_ids,
     trim_degenerate_tails as _trim_degenerate_tails,
     ungrounded_telemetry as _ungrounded_telemetry,
 )
@@ -203,8 +206,11 @@ class Synthesizer:
         if not results:
             return "The colony was unable to produce a result for this problem."
 
+        # PATCH 24. No task IDs in the material: run 8's answer opened with
+        # "[task_e03ea144] 200 rupees/m^3", the labels copied straight out
+        # of this block. The description says what the result is for.
         results_block = "\n\n".join(
-            f"[{r['task_id']}] {r['description']}\nResult: {r['result']}"
+            f"- {r['description']}\n  Result: {r['result']}"
             for r in results
         )
         if len(results_block) > self.MAX_RESULTS_BLOCK_CHARS:
@@ -233,33 +239,25 @@ class Synthesizer:
         # instructions phrased as steps ("copy", "name each item") have no
         # such form to come back in.
         #
-        # The uncovered parts are now GIVEN rather than asked for. The model
-        # could never have answered "say what wasn't addressed" -- it was
-        # only ever shown what was.
+        # PATCH 24. The not-completed sentence is no longer the model's to
+        # write. PATCH 19 asked for it as "part 2", and run 8's answer ended
+        # "Nothing else. Leave this part out if nothing is missing." -- the
+        # instruction itself, shipped to the user. It is built in code from
+        # the abandoned list and appended after every cut below, so the
+        # model sees only the completed work and writes only the answer.
         #
-        # Removed with the grounding sentence: "just solved a problem"
-        # (asserts success before a word is read) and "a single, coherent
-        # answer" (another quality word). Kept: the ban on naming the
-        # colony, agents or subtasks, which the not-completed sentence would
-        # otherwise invite.
-        not_completed_block = (
-            "\n".join(f"- {d}" for d in not_completed) if not_completed
-            else "(nothing)"
-        )
+        # Removed with the grounding sentence (PATCH 19): "just solved a
+        # problem" (asserts success before a word is read) and "a single,
+        # coherent answer" (another quality word). Kept: the ban on naming
+        # the colony, agents or subtasks.
         prompt = (
             "Write the answer to the problem below for the person who asked "
             "it. Your material is the COMPLETED WORK. Do not mention agents, "
             "subtasks, or how the work was divided up.\n\n"
             f"PROBLEM: {problem_spec}\n\n"
             f"COMPLETED WORK:\n{results_block}\n\n"
-            f"NOT COMPLETED:\n{not_completed_block}\n\n"
-            "Write two parts:\n"
-            "1. The answer, built from the COMPLETED WORK. Copy names, "
-            "identifiers and numbers from it as they are written there.\n"
-            "2. One sentence beginning \"Not completed:\" that names, in "
-            "plain words, each item listed under NOT COMPLETED. If NOT "
-            "COMPLETED says (nothing), leave this part out.\n"
-            "End after part 2.\n\n"
+            "Write the answer, built from the COMPLETED WORK. Copy names, "
+            "identifiers and numbers from it as they are written there.\n\n"
             "ANSWER:"
         )
 
@@ -330,6 +328,13 @@ class Synthesizer:
         raw = self.llm_call_fn(prompt)
         grounding = "\n".join([str(problem_spec or "")]
                               + [str(r.get("result", "")) for r in results])
+        # PATCH 24. Cut FIRST, so the empty-answer handling below still
+        # applies if the model wrote nothing but its own not-completed list.
+        raw, wrote_not_completed = _cut_model_not_completed(raw)
+        if wrote_not_completed:
+            self._record_trim("model_not_completed_cut")
+            print("  [synthesis-trim] cut a not-completed section the model "
+                  "wrote itself -- the code-built one is appended instead.")
         cleaned = _drop_incomplete_tail(raw)
 
         uncut = cleaned
@@ -390,18 +395,11 @@ class Synthesizer:
                   "as degenerate after trimming -- shipping it, but the last "
                   "decode of this run did not go cleanly.")
 
-        # PATCH 19 (measure-only). Did the answer carry the not-completed
-        # sentence it was asked for? Counted either way, so run 8's ledger
-        # says whether the NOT COMPLETED block worked or whether the banner
-        # is still doing all of the telling.
-        if not_completed:
-            if "not completed" in answer.lower():
-                self._record_trim("named_not_completed")
-            else:
-                self._record_trim("omitted_not_completed")
-                print(f"  [synthesis-trim] the answer does not name the "
-                      f"{len(not_completed)} not-completed part(s) it was "
-                      f"given -- the [PARTIAL RESULT] banner still will.")
+        answer, removed_ids = _strip_task_ids(answer)
+        if removed_ids:
+            self._record_trim("task_ids_stripped")
+            print(f"  [synthesis-trim] removed {removed_ids} internal task "
+                  f"ID(s) from the final answer.")
 
         # Same stance for a made-up log line that is not at the tail, where
         # cutting it would take real content with it.
@@ -411,6 +409,12 @@ class Synthesizer:
             print(f"  [synthesis-trim] WARNING: the final answer states "
                   f"{len(made_up)} timestamp/metric line(s) no subtask result "
                   f"contains -- shipping it: {made_up[0][:80]!r}")
+
+        # PATCH 24. Appended last, after every cut, so no trim can reach it.
+        sentence = _not_completed_sentence(not_completed)
+        if sentence:
+            self._record_trim("not_completed_appended")
+            answer = f"{answer}\n\n{sentence}"
         return answer
 
     # ------------------------------------------------------------------

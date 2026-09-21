@@ -478,6 +478,59 @@ _CODE_SIGNAL_RES = (
 )
 
 
+# ---------------------------------------------------------------------------
+# PATCH 25 -- LaTeX is not code.
+#
+# Run 8 rejected agent_f9d44dd2's arithmetic as software: "The average
+# monthly water usage per applicant is $ \frac{9567}{12} = 832.25 $". The
+# braces of \frac{..}{..} were one code signal and "20*417=Rs." another, and
+# two signals is the bar. Math notation is removed before any code check
+# reads the text; what is left is judged exactly as before -- run 8's other
+# reject, "charge_per_plot, watering_cost = round(9600/12/20) => (480, 224)",
+# has no math span and is still code.
+#
+# A $...$ span only counts as math when it contains a LaTeX command or a
+# braced super/subscript. Currency is written with dollar signs too: "$9,600
+# total expense divided into six equal payments of $1,600" is one $...$ span
+# of plain prose, and removing it could hide real code between two prices.
+# An escaped "\$" (the same REPORT wrote "\$9600") is a literal dollar sign,
+# never a delimiter.
+# ---------------------------------------------------------------------------
+
+_LATEX_COMMAND_RE = re.compile(r"\\[A-Za-z]+")
+_MATH_SPAN_RE = re.compile(
+    r"(?<!\\)\$\$?(?P<body>[^$\n]{1,300}?)(?<!\\)\$\$?"
+    r"|\\\((?P<paren>.{1,300}?)\\\)"
+    r"|\\\[(?P<bracket>.{1,300}?)\\\]",
+    re.DOTALL,
+)
+_BARE_LATEX_RE = re.compile(
+    r"\\[dt]?frac\s*\{[^{}]*\}\s*\{[^{}]*\}"
+    r"|\\(?:times|cdot|div|pm|approx|leq|geq|neq|le|ge|sqrt|sum|prod|left|right)\b"
+)
+
+
+def strip_math(text):
+    """`text` with math notation replaced by a neutral word, as
+    (text, how many spans/commands were removed)."""
+    if not text:
+        return text, 0
+    count = 0
+
+    def _span(m):
+        nonlocal count
+        body = m.group("body")
+        if body is not None and not (_LATEX_COMMAND_RE.search(body)
+                                     or re.search(r"[\^_]\{", body)):
+            return m.group(0)          # currency, not math
+        count += 1
+        return " MATH "
+
+    out = _MATH_SPAN_RE.sub(_span, str(text))
+    out, bare = _BARE_LATEX_RE.subn(" MATH ", out)
+    return out, count + bare
+
+
 def looks_like_source_code(text):
     """
     True when a generated goal "sentence" is actually code.
@@ -491,6 +544,7 @@ def looks_like_source_code(text):
     """
     if not text:
         return False
+    text, _ = strip_math(text)      # PATCH 25
     if _CODE_STATEMENT_RE.search(text):
         return True
     return sum(1 for r in _CODE_SIGNAL_RES if r.search(text)) >= 2
@@ -2497,10 +2551,268 @@ def asserted_figures(text):
     return list(dict.fromkeys(found))
 
 
+# ---------------------------------------------------------------------------
+# PATCH 24 -- what the synthesizer's model is no longer asked to write.
+#
+# Run 8's final answer ended "NOT COMPLETED: Plot assignment constraints, ...
+# Nothing else. Leave this part out if nothing is missing." -- PATCH 19's own
+# instruction, echoed to the user -- and opened "[task_e03ea144] 200
+# rupees/m^3; [task_e0e43944] 47 m3/yr", the results block's labels copied
+# straight through. The not-completed sentence is now built here, from the
+# abandoned list, and the model writes only the answer.
+# ---------------------------------------------------------------------------
+
+_TASK_ID_RE = re.compile(r"\[\s*(?:root_)?task_[0-9a-zA-Z]+\s*\]:?\s*|\b(?:root_task_\d+|task_[0-9a-f]{6,})\b:?\s*")
+# A model-written not-completed section: a line or sentence that OPENS with
+# the phrase, and everything after it. Only at a line or sentence start, so
+# "the fee was not completed in time" mid-sentence is left alone.
+_MODEL_NOT_COMPLETED_RE = re.compile(
+    r"(?:^|(?<=[.!?])\s+|\n)\s*[*_#\-\s]*not\s+completed\s*[:\-]", re.IGNORECASE)
+
+
+def strip_task_ids(text):
+    """`text` without internal task identifiers ("[task_e03ea144] ",
+    "root_task_0"), as (text, how many were removed)."""
+    if not text:
+        return text, 0
+    count = len(_TASK_ID_RE.findall(str(text)))
+    if not count:
+        return text, 0
+    cleaned = _TASK_ID_RE.sub("", str(text))
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([;,.])", r"\1", cleaned)
+    return cleaned.strip(), count
+
+
+def cut_model_not_completed(text):
+    """`text` cut where the model started its own not-completed section,
+    as (text, cut?). The authoritative sentence is appended by code."""
+    if not text:
+        return text, False
+    m = _MODEL_NOT_COMPLETED_RE.search(str(text))
+    if not m:
+        return text, False
+    return str(text)[:m.start()].rstrip(), True
+
+
+def not_completed_sentence(items):
+    """The sentence naming what was not completed, built from the abandoned
+    subtask descriptions, or "" when nothing was."""
+    parts = []
+    for item in items or ():
+        item = " ".join(str(item).split()).rstrip(" .;")
+        if item:
+            parts.append(item[:1].lower() + item[1:])
+    return f"Not completed: {'; '.join(parts)}." if parts else ""
+
+
 def supplied_data(text):
     """The figures and identifiers the user's own request states, as
     (figures, identifiers). Both empty means a data-free problem."""
     return asserted_figures(text), asserted_identifiers(text)
+
+
+# ---------------------------------------------------------------------------
+# PATCH 22 -- phaser data fidelity.
+#
+# Run 8's request said Rs. 9,000, 12 plots, 20 applicants, summer months, and
+# asked four things. The phaser's goal said 9,567, dropped the 12 and the
+# fourth ask, and turned "summer months" into "six months"; its constraint
+# list said "Yearly fees must cover Rs. 9,600 total expenses". Every agent
+# inherits those strings as the project and as its constraints, and nothing
+# downstream can recover the user's number from them -- the root decomposer
+# spawned "Allocate Rs. 9,600 total annual fees" on its first move. A
+# problem that SUPPLIES data exposes this; runs 1-7 were data-free and never
+# could.
+#
+# Figures are compared by VALUE: "9,000", "9000", "Rs. 9000" and "9K" are one
+# figure, and number words count ("six months" asserts 6, "two guests" is 2
+# -- the requirement prompt's own example turns "two guests" into "2
+# guests"). "one" is deliberately not a number word here: "one sentence",
+# "each one", "one of the plots" are almost never a quantity.
+# ---------------------------------------------------------------------------
+
+_NUMBER_WORDS = {
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90, "hundred": 100, "thousand": 1000,
+    "dozen": 12,
+}
+_TENS = {"twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"}
+_UNITS_1_9 = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+              "seven": 7, "eight": 8, "nine": 9}
+_NUMBER_WORD_RE = re.compile(
+    r"\b(?:(" + "|".join(sorted(_TENS)) + r")-(" + "|".join(_UNITS_1_9) + r")"
+    r"|(" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r"))\b",
+    re.IGNORECASE,
+)
+# Magnitude suffixes that scale the value. Everything else a number can carry
+# ("km", "pm", "x", "hrs") is a unit and leaves the value alone. "m" is a unit
+# here, not "million": metres and minutes are far commoner in these prompts.
+_MAGNITUDE = {"k": 1e3, "bn": 1e9, "b": 1e9}
+
+
+def _figure_value(token):
+    """The numeric value of one asserted_figures() token, or None."""
+    m = re.match(r"^(\d[\d,]*(?:\.\d+)?)(%|[a-zA-Z]+)?$", token)
+    if not m:
+        return None
+    try:
+        value = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    suffix = (m.group(2) or "").lower()
+    return value * _MAGNITUDE.get(suffix, 1.0)
+
+
+def figure_values(text):
+    """{value: how it was written} for every figure `text` states, digits
+    and number words both. Values are floats so "9,000" and "9000" meet."""
+    out = {}
+    if not text:
+        return out
+    for token in asserted_figures(text):
+        value = _figure_value(token)
+        if value is not None:
+            out.setdefault(value, token)
+    for m in _NUMBER_WORD_RE.finditer(str(text)):
+        if m.group(1):
+            value = _NUMBER_WORDS[m.group(1).lower()] + _UNITS_1_9[m.group(2).lower()]
+        else:
+            value = _NUMBER_WORDS[m.group(3).lower()]
+        out.setdefault(float(value), m.group(0))
+    return out
+
+
+def figure_fidelity(source, derived, require_all=True):
+    """How `derived` (model output) disagrees with `source` (the user's own
+    text) on figures, as (extra, missing) lists of the figures as written.
+
+    extra   -- stated in `derived`, absent from `source`: invented or altered.
+    missing -- stated in `source`, absent from `derived`. Only computed when
+               require_all: a goal must carry every figure the user gave, a
+               single constraint obviously need not.
+    """
+    have, said = figure_values(source), figure_values(derived)
+    extra = [said[v] for v in said if v not in have]
+    missing = [have[v] for v in have if v not in said] if require_all else []
+    return extra, missing
+
+
+# --- part coverage -----------------------------------------------------------
+#
+# An ASK is one thing the user wants answered: a sentence ending in "?", a
+# list item ("1)", "2.", "a)", "-", "*"), or a sentence opening with a
+# request verb. Declarative context ("The garden has 12 plots.") is not an
+# ask. When the request contains no recognisable ask at all, there is nothing
+# to check and the check passes.
+#
+# COVERED means: at least ASK_COVERAGE_MIN of the ask's content stems appear
+# in the goal. Lexical rather than embedding cosine, on purpose:
+#   * run 8's goal was ONE clause, so PATCH 17's max-over-clauses equals the
+#     whole-goal cosine -- the measurement runs 6 and 7 showed scores a
+#     single-part match low against a multi-part sentence by construction;
+#   * a cosine floor would be one more MiniLM threshold, and runs 5-7 showed
+#     those floors move from corpus to corpus;
+#   * a dropped part is dropped WORDS: "members who stop tending" had no
+#     stem in the goal but "plot". A fraction, not "any shared stem",
+#     because the domain noun ("plots") is in every ask and in the goal.
+# Asks with fewer than ASK_MIN_STEMS content stems are skipped: "How should
+# we do this?" names nothing a goal could be checked for.
+
+_ASK_VERBS = (
+    "decide", "determine", "propose", "suggest", "explain", "design", "plan",
+    "recommend", "calculate", "compute", "work out", "figure out", "find",
+    "allocate", "assign", "set", "choose", "pick", "create", "describe",
+    "list", "outline", "estimate", "draft", "write", "give", "tell",
+    "provide", "identify", "handle", "split", "divide", "schedule",
+)
+_ASK_OPENER_RE = re.compile(
+    r"^(?:please\s+)?(?:" + "|".join(v.replace(" ", r"\s+") for v in _ASK_VERBS) + r")\b",
+    re.IGNORECASE,
+)
+_LIST_ITEM_RE = re.compile(r"^\s*(?:\(?\d{1,2}[.)]|\(?[a-hA-H][.)]|[-*\u2022])\s+")
+_ASK_STOPWORDS = frozenset(
+    "a an the and or but of to for in on at by with from into over under as "
+    "is are was were be been being it its this that these those there their "
+    "they them we our us you your i me my he she his her who whom which what "
+    "when where why how should would could can will shall may might must do "
+    "does did done have has had not no so if then than also each every all "
+    "any some such very just only more most other per about up out get make "
+    "want need needs like well way ways".split()
+)
+_STEM_SUFFIXES_P22 = ("ations", "ation", "ments", "ment", "ings", "ing",
+                      "ers", "ies", "ied", "ed", "er", "es", "ly", "s")
+ASK_COVERAGE_MIN = 1.0 / 3.0
+ASK_MIN_STEMS = 2
+
+
+def _stem5(word):
+    for suffix in _STEM_SUFFIXES_P22:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            word = word[: -len(suffix)]
+            break
+    return word[:5]
+
+
+def content_stems(text):
+    """Stems of the content words in `text` (letters only, 3+ chars, no
+    stopwords), as a set."""
+    words = re.findall(r"[a-zA-Z]{3,}", str(text or "").lower())
+    return {_stem5(w) for w in words if w not in _ASK_STOPWORDS}
+
+
+def request_asks(text):
+    """The asks in a user request, in order. See the note above."""
+    if not text:
+        return []
+    asks = []
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        is_item = bool(_LIST_ITEM_RE.match(line))
+        body = _LIST_ITEM_RE.sub("", line) if is_item else line
+        for sentence in re.split(r"(?<=[.!?])\s+", body):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if is_item or sentence.endswith("?") or _ASK_OPENER_RE.match(sentence):
+                asks.append(sentence)
+    return list(dict.fromkeys(asks))
+
+
+def ask_coverage(asks, target):
+    """[(ask, fraction covered, covered)] for each checkable ask against
+    `target`. Asks under ASK_MIN_STEMS content stems are left out."""
+    have = content_stems(target)
+    out = []
+    for ask in asks:
+        stems = content_stems(ask)
+        if len(stems) < ASK_MIN_STEMS:
+            continue
+        fraction = len(stems & have) / len(stems)
+        out.append((ask, fraction, fraction >= ASK_COVERAGE_MIN))
+    return out
+
+
+def goal_fidelity(raw_text, goal):
+    """The whole PATCH 22 goal check, as a dict:
+    {ok, extra, missing, uncovered, coverage}. `ok` is False on any extra
+    figure, any missing figure, or any uncovered ask."""
+    extra, missing = figure_fidelity(raw_text, goal, require_all=True)
+    coverage = ask_coverage(request_asks(raw_text), goal)
+    uncovered = [ask for ask, _, covered in coverage if not covered]
+    return {
+        "ok": not extra and not missing and not uncovered,
+        "extra": extra,
+        "missing": missing,
+        "uncovered": uncovered,
+        "coverage": coverage,
+    }
 
 
 def figure_divergence(previous, current,
@@ -2561,7 +2873,8 @@ def software_artifact_reason(text):
     """
     if not text:
         return None
-    text = str(text)
+    # PATCH 25. Math notation is not a software deliverable; see strip_math.
+    text, _ = strip_math(str(text))
     if "```" in text:
         return "contains a code block"
     match = _CODE_FILENAME_RE.search(text)

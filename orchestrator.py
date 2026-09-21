@@ -58,6 +58,8 @@ from text_utils import (
     asserted_figures,
     asserted_identifiers,
     figure_divergence,
+    figure_fidelity,
+    strip_task_ids,
     supplied_data,
     plain_register,
     software_artifact_reason,
@@ -240,6 +242,12 @@ class Orchestrator:
         # _measure_spawn_drift, to mark the ledger entry the spawn itself
         # files -- see the note in _screen_goal_drift_batch.
         self._gate_would_drop: set = set()
+
+        # PATCH 22 (measure-only). Spawned subtasks whose description states
+        # a figure the user's request does not, as [(task_id, [figures],
+        # description)]. Nothing reads it but the ledger.
+        self.unsupplied_figure_subtasks: List[Any] = []
+        self.spawned_subtask_count = 0
 
         # PATCH 17 (measure-only). One vector per goal clause, from the
         # phaser's spec. Scored alongside goal_drift, never instead of it:
@@ -1309,6 +1317,7 @@ class Orchestrator:
         self._measure_spawn_drift(child_node, parent_task_id=child_node.parent_task_id)
         self._flag_software_shaped_task(child_node)
         self._flag_artifact_shaped_task(child_node.task_id, child_node.description)
+        self._flag_unsupplied_figures(child_node.task_id, child_node.description)
         self.task_graph.add_task(child_node)
 
         if self.spawn_agent(role=role, task_id=task_id, parent_id=parent_id,
@@ -2129,6 +2138,66 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # PATCH 16 -- figures that do not survive a retry (measure-only)
     # ------------------------------------------------------------------
+
+    def _flag_unsupplied_figures(self, task_id, description) -> None:
+        """PATCH 22 (measure-only). A subtask description that states a
+        figure the user's request does not.
+
+        Run 8's root decomposer spawned "Allocate Rs. 9,600 total annual
+        fees" on a request that said Rs. 9,000 -- copied from a phaser
+        constraint, and from there into every descendant. Checked against
+        raw_text only: the goal and constraints are model output and may be
+        the very thing that is wrong. Only when the request supplies data;
+        on a data-free problem PATCH 21 counts the answers instead.
+
+        A figure here is not necessarily invented -- "450 per applicant" is
+        9000/20 -- so this counts and lists, and does nothing else.
+        """
+        self.spawned_subtask_count += 1
+        spec = self.spec or {}
+        if not spec.get("supplies_data"):
+            return
+        extra, _ = figure_fidelity(spec.get("raw_text", ""), description,
+                                   require_all=False)
+        if not extra:
+            return
+        self.colony.record_verdict("subtask_states_unsupplied_figure")
+        self.unsupplied_figure_subtasks.append((task_id, extra, description))
+        print(f"  [data fidelity] {task_id} states figures the request does "
+              f"not: {extra} (measure-only): {str(description)[:80]!r}")
+
+    def _print_fidelity_report(self) -> None:
+        """PATCH 22 ledger section: what the phaser did to the user's data,
+        and how many spawned subtasks stated figures the user never gave."""
+        spec = self.spec or {}
+        print(chr(10) + "  PHASER DATA FIDELITY (PATCH 22)")
+        goal = spec.get("goal_fidelity")
+        if not goal:
+            print("    goal : not checked (older spec, or the phaser fell back)")
+        else:
+            print(f"    goal : {goal['outcome']}  "
+                  f"({len(goal['attempts'])} draw(s))")
+            for i, attempt in enumerate(goal["attempts"], 1):
+                problems = [f"figures not in request {attempt['extra']}" if attempt["extra"] else "",
+                            f"request figures missing {attempt['missing']}" if attempt["missing"] else "",
+                            f"{len(attempt['uncovered'])} part(s) not covered" if attempt["uncovered"] else ""]
+                problems = "; ".join(p for p in problems if p) or "ok"
+                print(f"      draw {i}: {problems}")
+                for ask in attempt["uncovered"]:
+                    print(f"        missing part: {ask[:90]!r}")
+        constraints = spec.get("constraint_fidelity")
+        if constraints:
+            print(f"    constraints : {len(constraints['dropped'])} dropped for "
+                  f"figures not in the request"
+                  + (" (after one re-extraction)" if constraints["retried"] else ""))
+            for item in constraints["dropped"]:
+                print(f"      {item['extra']}  {item['constraint'][:80]!r}")
+        if spec.get("supplies_data"):
+            hits = self.unsupplied_figure_subtasks
+            print(f"    spawned subtasks stating figures the request does not : "
+                  f"{len(hits)} of {self.spawned_subtask_count}  (measure-only)")
+            for task_id, extra, description in hits:
+                print(f"      {task_id}  {extra}  {str(description)[:60]!r}")
 
     def _promoted_reports_asserting_data(self):
         """PATCH 21 (measure-only). Every promoted REPORT -- root included --
@@ -4563,6 +4632,7 @@ class Orchestrator:
                   f"{FIGURE_DIVERGENCE_MAX_OVERLAP:.0%} of them; a figure-free "
                   "attempt is vague, not contradictory, and is not compared)")
 
+            self._print_fidelity_report()
             self._print_data_free_report()
 
             print(chr(10) + "  STRUCTURAL REJECTS (caught before the judge)")
@@ -4722,6 +4792,13 @@ class Orchestrator:
         if not isinstance(best_result, str) or not best_result.strip():
             return best_result
 
+        # PATCH 24. Internal task IDs never reach the user, whichever exit
+        # this answer took -- a root REPORT verbatim carries them as easily
+        # as a synthesis does.
+        best_result, removed_ids = strip_task_ids(best_result)
+        if removed_ids:
+            self.colony.record_verdict("final_answer_task_ids_stripped")
+
         # The same three cuts format_output makes, in the same order: a
         # block repeated back to back, degeneracy_cut, then the status-report
         # and closer/restating tails -- so a raw REPORT leaving by the
@@ -4812,8 +4889,10 @@ class Orchestrator:
             ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
             ("synthesis shipped made-up metrics ", trims.get("shipped_telemetry", 0)),
             ("synthesis stump walked back       ", trims.get("incomplete_tail_after_cut", 0)),
-            ("synthesis named not-completed (P19)", trims.get("named_not_completed", 0)),
-            ("synthesis OMITTED not-completed   ", trims.get("omitted_not_completed", 0)),
+            ("not-completed sentence appended   ", trims.get("not_completed_appended", 0)),
+            ("model's own not-completed list cut", trims.get("model_not_completed_cut", 0)),
+            ("task IDs stripped from synthesis  ", trims.get("task_ids_stripped", 0)),
+            ("task IDs stripped on the way out  ", verdicts.get("final_answer_task_ids_stripped", 0)),
             ("returned answer cut on the way out", verdicts.get("final_answer_cut", 0)),
             ("returned answer empty after cut   ",
              verdicts.get("final_answer_empty_after_cut", 0)),
