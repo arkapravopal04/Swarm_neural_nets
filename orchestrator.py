@@ -248,6 +248,9 @@ class Orchestrator:
         # description)]. Nothing reads it but the ledger.
         self.unsupplied_figure_subtasks: List[Any] = []
         self.spawned_subtask_count = 0
+        # PATCH 29. Agents spawned, and how many carried the request in
+        # their prompt.
+        self.request_prompt_counts = {"agents": 0, "with_request": 0}
 
         # PATCH 17 (measure-only). One vector per goal clause, from the
         # phaser's spec. Scored alongside goal_drift, never instead of it:
@@ -902,11 +905,18 @@ class Orchestrator:
             # so a conversion cannot lose it the way the ghost-context path
             # loses the project goal line on attempt 2.
             goal_referent=getattr(task_node, "goal_referent", None),
+            # PATCH 29. Every agent, whatever its role or attempt.
+            request_text=self._request_text(),
         )
-        
+
         self.colony.register_agent(new_agent)
         self.task_graph.assign_agent(task_id, agent_id)
         reservation.attempts += 1
+        # PATCH 29 ledger row: the log prints a full prompt only on DIE, so
+        # "did the fee agent see 9,000" is otherwise unanswerable from it.
+        self.request_prompt_counts["agents"] += 1
+        if new_agent.request_text:
+            self.request_prompt_counts["with_request"] += 1
         if parent_node is not None:
             # Read by Agent.final_actions: a decomposer with no child yet
             # finishes by SPAWNing, one whose children exist by REPORTing.
@@ -2139,6 +2149,16 @@ class Orchestrator:
     # PATCH 16 -- figures that do not survive a retry (measure-only)
     # ------------------------------------------------------------------
 
+    def _request_text(self):
+        """PATCH 29. The user's request as every agent prompt shows it:
+        spec["raw_text"] with its whitespace collapsed, or None without a
+        spec. Not deduped or capped like the goal referent -- it is the
+        person's own words, and the phaser already caps it at 3000 chars."""
+        raw_text = (self.spec or {}).get("raw_text")
+        if not raw_text or not str(raw_text).strip():
+            return None
+        return " ".join(str(raw_text).split())
+
     def _flag_unsupplied_figures(self, task_id, description) -> None:
         """PATCH 22 (measure-only). A subtask description that states a
         figure the user's request does not.
@@ -2192,6 +2212,21 @@ class Orchestrator:
                   + (" (after one re-extraction)" if constraints["retried"] else ""))
             for item in constraints["dropped"]:
                 print(f"      {item['extra']}  {item['constraint'][:80]!r}")
+            # PATCH 30. .get: a spec from before the repair has no key.
+            repaired = constraints.get("repaired", [])
+            print(f"    constraints : {len(repaired)} repaired to the request's figure")
+            for item in repaired:
+                pairs = ", ".join(f"{a} -> {b}" for a, b in item["repairs"])
+                print(f"      [{pairs}]  {item['repaired'][:80]!r}")
+            if "extracted" in constraints:
+                print(f"    constraints : {constraints['extracted']} extracted, "
+                      f"{len(spec.get('requirement') or [])} kept (PATCH 31: the "
+                      f"budget multiplier counts the kept ones)")
+        counts = self.request_prompt_counts
+        print(f"    agents with the request verbatim in their prompt (PATCH 29) : "
+              f"{counts['with_request']} of {counts['agents']}"
+              + (f"  (request figures: {spec.get('supplied_figures')})"
+                 if spec.get("supplied_figures") else ""))
         if spec.get("supplies_data"):
             hits = self.unsupplied_figure_subtasks
             print(f"    spawned subtasks stating figures the request does not : "

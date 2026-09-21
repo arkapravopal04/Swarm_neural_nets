@@ -1475,6 +1475,7 @@ _PROMPT_HEADER_RE = re.compile(
     r"|(?i:Available\s+actions\s*:)"
     r"|(?i:Your\s+role\s*:)"
     r"|(?i:Your\s+task\s*:)"
+    r"|(?i:The\s+request\s*\(the\s+person'?s\s+own\s+words\)\s*:)"
     r"|(?:ACTION|PAYLOAD)\s*:"
 )
 # The colony's own role vocabulary as the value of an echoed "Your Role:".
@@ -1482,6 +1483,11 @@ _PROMPT_ROLE_HEADER_RE = re.compile(
     r"Your\s+role\s*:\s*(?:decomposer|executor|verifier|worker)\b",
     re.IGNORECASE,
 )
+# PATCH 29's request label. Like "Your role: executor" it is unmistakably the
+# harness -- no answer writes "(the person's own words):" -- so it needs no
+# second header to corroborate it.
+_PROMPT_REQUEST_HEADER_RE = re.compile(
+    r"The\s+request\s*\(the\s+person'?s\s+own\s+words\)\s*:", re.IGNORECASE)
 
 
 def prompt_header_echo(text):
@@ -1504,7 +1510,8 @@ def prompt_header_echo(text):
     if not matches:
         return None
     distinct = {re.sub(r"\s+", " ", m.group(0)).strip().casefold() for m in matches}
-    if len(distinct) < 2 and _PROMPT_ROLE_HEADER_RE.search(text) is None:
+    if (len(distinct) < 2 and _PROMPT_ROLE_HEADER_RE.search(text) is None
+            and _PROMPT_REQUEST_HEADER_RE.search(text) is None):
         return None
     return matches[0].start(), matches[0].group(0)
 
@@ -1635,6 +1642,18 @@ _END_MARKER_RE = re.compile(
     r")[\W_]*$",
     re.IGNORECASE,
 )
+# PATCH 32. Run 10's final answer ended "...Final check passed. Ready to
+# submit. Submission ID: submission_8c4f7a2b. Output Format:
+# <OUTPUT>...<OUTPUT> END OF OUTPUT." -- a made-up submission receipt and a
+# format tag, neither of which any segment rule above could see: "Submission
+# ID" has no log word, and "Output Format" carries a tag, not a SHOUTED
+# state. Both are signals on their own.
+_SUBMISSION_ID_RE = re.compile(
+    r"^[-*•>\s]*(?:submission|confirmation|receipt|ticket)\s*"
+    r"(?:id|no\.?|number|#)\s*[:#]",
+    re.IGNORECASE,
+)
+_OUTPUT_TAG_RE = re.compile(r"</?\s*OUTPUT\s*>", re.IGNORECASE)
 _GO_WORD_RE = re.compile(
     r"^[-*•>\s]*(?:go|go\s+go(?:\s+go)?|proceed|ready\s+to\s+go|good\s+to\s+go)[\W_]*$",
     re.IGNORECASE,
@@ -1712,6 +1731,9 @@ def _status_segment_kind(segment, grounding):
     for a go-word, "closer" for a closer or sign-off, None otherwise."""
     segment = segment.strip()
     if _END_MARKER_RE.match(segment):
+        return "signal"
+    if (_SUBMISSION_ID_RE.match(segment) or _OUTPUT_TAG_RE.search(segment)
+            or _END_OF_OUTPUT_RE.search(segment)):
         return "signal"
     match = _LOG_LABEL_RE.match(segment)
     if (match is not None and _LOG_WORD_RE.search(match.group("label"))
@@ -2365,6 +2387,22 @@ _FIGURE_RE = re.compile(r"(?<![\w.])\d[\d,]*(?:\.\d+)?%?(?!\.?\d)(?!\w)")
 # sign, so '19.0' and '19.0%' stopped comparing equal. What actually needs
 # ruling out is a further digit ('1.2.3', a version, not three figures).
 
+# PATCH 30. A currency code glued onto a number. Run 10's constraint said
+# "Rs9,067": the lookbehind above refused the "9" (it follows the "s"), the
+# match restarted after the comma, and the figure was read as "067" -- 67.
+# "Rs.9,000", the correct figure, read as "000", so a faithful constraint
+# written that way would have been dropped as invented. The code is split
+# off before any figure regex runs; a bare "$" or "₹" was never a word
+# character and always worked.
+_CURRENCY_GLUE_RE = re.compile(
+    r"(?<![A-Za-z])(Rs\.?|INR|USD|EUR|GBP|US\$|Rp\.?)(?=\d)", re.IGNORECASE)
+
+
+def unglue_currency(text):
+    """`text` with a space between a currency code and the number glued to
+    it: "Rs9,067" -> "Rs 9,067". Everything else untouched."""
+    return _CURRENCY_GLUE_RE.sub(r"\1 ", str(text))
+
 # Both attempts must assert at least this many figures before they are
 # compared. One number moving is ordinary: an agent told it is drifting and
 # asked to recount may legitimately revise a single count. A whole SET of
@@ -2478,7 +2516,7 @@ def figures(text):
     """
     if not text:
         return []
-    text = str(text)
+    text = unglue_currency(text)
     skip = set(_enumerator_spans(text))
     out = []
     for match in _FIGURE_RE.finditer(text):
@@ -2547,7 +2585,7 @@ def asserted_figures(text):
     unit- and magnitude-suffixed numbers. Deduplicated, in order."""
     if not text:
         return []
-    found = figures(text) + [m.group(0) for m in _UNIT_FIGURE_RE.finditer(str(text))]
+    found = figures(text) + [m.group(0) for m in _UNIT_FIGURE_RE.finditer(unglue_currency(text))]
     return list(dict.fromkeys(found))
 
 
@@ -2700,6 +2738,75 @@ def figure_fidelity(source, derived, require_all=True):
     extra = [said[v] for v in said if v not in have]
     missing = [have[v] for v in have if v not in said] if require_all else []
     return extra, missing
+
+
+# PATCH 30 -- repair, don't drop.
+#
+# A constraint's figure the request does not state is replaced by the
+# request's figure when exactly one request figure is a plausible source for
+# it: both at least REPAIR_MIN_VALUE, and within REPAIR_MAX_GAP of each other
+# (relative to the request's figure). Run 10's "Rs9,067" sits 0.7% from the
+# request's 9,000 and nowhere near 12 or 20, so it becomes "Rs 9,000".
+#
+# The floor is what keeps this to digit-level mangling. Under it a figure
+# is a count, and a count one away from a request count is usually a
+# different quantity -- "11 members" on a request with 12 plots and 20
+# members is not a mis-copied 12. Two request figures inside the gap is
+# ambiguous and drops, and so does a figure written in words.
+REPAIR_MAX_GAP = 0.10
+REPAIR_MIN_VALUE = 100
+
+
+def _format_figure(value):
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return f"{value:,}"
+
+
+def repair_figures(source, derived, max_gap=REPAIR_MAX_GAP,
+                   min_value=REPAIR_MIN_VALUE):
+    """`derived` with each figure `source` does not state replaced by the
+    one `source` figure it unambiguously stands for, as
+    (repaired, repairs, unrepaired).
+
+    repairs    -- [(as written, replacement)] for every figure replaced.
+    unrepaired -- the figures with no unambiguous source figure.
+    repaired   -- the new text, or None when anything is unrepaired: a
+                  half-repaired constraint still states an invented figure.
+    """
+    text = unglue_currency(derived or "")
+    have = figure_values(source)
+    targets, unrepaired = {}, []
+    for value, written in figure_values(text).items():
+        if value in have:
+            continue
+        candidates = [h for h in have
+                      if value >= min_value and h >= min_value
+                      and abs(value - h) / h <= max_gap]
+        if len(candidates) == 1:
+            targets[value] = candidates[0]
+        else:
+            unrepaired.append(written)
+    if unrepaired:
+        return None, [], unrepaired
+    if not targets:
+        return text, [], []
+
+    spans = [m.span() for m in _FIGURE_RE.finditer(text)]
+    spans += [m.span() for m in _UNIT_FIGURE_RE.finditer(text)]
+    repairs = []
+    for start, end in sorted(spans, reverse=True):
+        written = text[start:end]
+        value = _figure_value(written.replace(",", ""))
+        if value not in targets:
+            continue
+        replacement = _format_figure(targets[value])
+        text = text[:start] + replacement + text[end:]
+        repairs.append((written, replacement))
+    # A figure only a number word states has no span to replace.
+    if figure_fidelity(source, text, require_all=False)[0]:
+        return None, [], [w for w, _ in repairs] or list(targets)
+    return text, list(reversed(repairs)), []
 
 
 # --- part coverage -----------------------------------------------------------

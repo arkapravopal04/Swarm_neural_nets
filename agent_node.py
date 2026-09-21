@@ -606,6 +606,11 @@ class Agent:
         return getattr(self.node, "goal_referent", None)
 
     @property
+    def request_text(self):
+        """PATCH 29. The user's request verbatim, on every agent."""
+        return getattr(self.node, "request_text", None)
+
+    @property
     def parent_id(self):
         return self.node.parent_id
 
@@ -997,6 +1002,35 @@ class Agent:
             "answer something the project never asked for.\n"
         )
 
+    def _request_str(self):
+        """
+        PATCH 29. The user's request, verbatim, as its own labelled block
+        above "Your Task" -- in the thinking seed and the decide prompt
+        both, for every role.
+
+        Run 10: the request said 9,000 rupees; the phaser's only fee
+        constraint said 9,067 and was dropped, the root decomposer's fee
+        subtask carried no figure, and no fee agent ever saw 9,000 -- the
+        root then wrote "12 * $80/month = $960/year". The goal and
+        constraints are the phaser's paraphrase and can lose or bend any
+        figure; this block is the one place the figures cannot drift.
+
+        Quoted rather than fenced with an END marker: agents have echoed
+        this prompt's bracketed delimiters back into REPORTs ("[END OF
+        PREVIOUS THOUGHTS]"), and a quote has no closing phrase to recite.
+        The second line keeps it from widening the task: the person's
+        request is where figures and names come from, not the scope.
+        """
+        text = self.request_text
+        if not text:
+            return ""
+        return (
+            "THE REQUEST (the person's own words):\n"
+            f"\"{text}\"\n"
+            "Take figures and names from the request exactly as written "
+            "there. Your task below is the part of it you answer.\n\n"
+        )
+
     def _build_thinking_seed(self, requirements=None, available_tools=None):
         if requirements is None:
             requirements = self.requirements or []
@@ -1067,7 +1101,7 @@ class Agent:
         return (
             f"You are an AI agent in a colony of agents working together to solve problems.\n"
             f"Your Role: {self.role}\n"
-            f"{role_constraint_str}Your Task: {self.task}\n\n"
+            f"{role_constraint_str}{self._request_str()}Your Task: {self.task}\n\n"
             f"{requirements_str}{tools_str}{actions_str}{ghost_str}{fail_str}{tool_result_str}"
             f"Think through how to approach this task."
         )
@@ -1263,7 +1297,7 @@ class Agent:
         prompt = f"""You are an AI agent in a colony of agents working together to solve problems.
 Your Agent ID: {self.agent_id}
 Your Role: {self.role}
-{role_constraint_str}Your Task: {self.task}
+{role_constraint_str}{self._request_str()}Your Task: {self.task}
 
 {requirements_str}{ghost_str}{fail_str}{tool_result_str}{thoughts_str}{child_status_str}{think_cap_str}
 Available actions:

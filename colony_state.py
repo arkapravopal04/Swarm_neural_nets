@@ -33,6 +33,11 @@ class AgentNode:
     # anywhere in its context, which is the state every drifted run-4 subtask
     # in the ISBN subtree was run in.
     goal_referent: str | None = None
+    # PATCH 29. The user's request verbatim (spec["raw_text"]), on EVERY
+    # agent, executor and decomposer alike. The phaser's goal and
+    # constraints paraphrase it, and a paraphrase can lose or bend a figure
+    # ("12 plots" -> "12 gardens", 9,000 -> 9,067); the request cannot.
+    request_text: str | None = None
 
 
 class ColonyState:

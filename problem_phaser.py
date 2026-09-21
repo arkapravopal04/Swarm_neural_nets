@@ -10,6 +10,7 @@ from text_utils import (
     dedupe_list_exact,
     final_derived_constraint,
     figure_fidelity,
+    repair_figures,
     goal_clauses,
     goal_fidelity,
     supplied_data,
@@ -607,6 +608,13 @@ Output:
         a tie. Offenders that survive are dropped and logged: a missing
         constraint costs a child some guidance, a wrong number in one is
         copied into every child's answer.
+
+        PATCH 30. Repaired before dropped. Run 10 dropped "Fee structure
+        must cover at least Rs9,067 ..." -- the run's only fee constraint --
+        so no fee subtask ever saw 9,000. An offender whose every bad figure
+        maps unambiguously onto one request figure (text_utils.
+        repair_figures) is kept with the request's figure in its place; only
+        the rest are dropped. Both are logged and recorded.
         """
         def offenders(items):
             return [(c, figure_fidelity(raw_text, c, require_all=False)[0])
@@ -615,7 +623,7 @@ Output:
 
         first = extract(False)
         bad = offenders(first)
-        record = {"dropped": [], "retried": False}
+        record = {"dropped": [], "repaired": [], "retried": False}
         chosen = first
         if bad:
             record["retried"] = True
@@ -626,12 +634,27 @@ Output:
                   f"{len(bad_second)} on the second draw.")
             if len(bad_second) < len(bad):
                 chosen, bad = second, bad_second
+        # PATCH 31 (measure-only). How many constraints the chosen draw
+        # held before this filter touched it -- the count the budget
+        # multiplier would see if it were taken before the filter.
+        record["extracted"] = len(chosen)
+        replaced = {}
         for constraint, extra in bad:
+            repaired, repairs, unrepaired = repair_figures(raw_text, constraint)
+            if repaired is not None:
+                print(f"[Problem_Phaser] constraint fidelity: REPAIRED {constraint!r} "
+                      f"-> {repaired!r} ({', '.join(f'{a} -> {b}' for a, b in repairs)})")
+                record["repaired"].append({"constraint": constraint, "repaired": repaired,
+                                           "repairs": repairs})
+                replaced[constraint] = repaired
+                continue
             print(f"[Problem_Phaser] constraint fidelity: DROPPED {constraint!r} "
-                  f"(figures not in the request: {extra})")
+                  f"(figures not in the request: {extra}; no unambiguous request "
+                  f"figure for {unrepaired})")
             record["dropped"].append({"constraint": constraint, "extra": extra})
-        dropped = {c for c, _ in bad}
-        return [c for c in chosen if c not in dropped], record
+            replaced[constraint] = None
+        kept = [replaced.get(c, c) for c in chosen]
+        return dedupe_list_exact([c for c in kept if c]), record
 
     def _get_domain(self, raw_text):
         """Classifies the prompt into an exact taxonomy tier, ensuring formatting constraints."""
