@@ -9,6 +9,8 @@ from text_utils import (
     dedupe_global_and_cap,
     dedupe_list_exact,
     final_derived_constraint,
+    goal_clauses,
+    supplied_data,
     looks_like_source_code,
     plain_register,
     reasoning_reason,
@@ -392,6 +394,30 @@ Output:"""
 
         return goal_sentence, goal_vector
 
+    def _embed_goal_clauses(self, goal_sentence):
+        """PATCH 17 (measure-only). The goal split into its clauses, and one
+        vector per clause, as (clauses, vectors).
+
+        Split from the SAME cleaned, reworded string goal_vector was encoded
+        from, so the two references always describe one goal. Printed, because
+        a bad split silently changes every max-over-clauses score in the run.
+        On any failure the lists come back empty and the orchestrator reports
+        the clause score as unmeasurable rather than falling back to the whole
+        goal -- a silent fallback would make the two ledger columns agree for
+        the wrong reason.
+        """
+        clauses = goal_clauses(goal_sentence)
+        if not clauses:
+            return [], []
+        try:
+            vectors = list(self.embed_model.encode(clauses, convert_to_numpy=True))
+        except Exception as e:
+            print(f"[Problem_Phaser] WARNING: goal clause embedding failed: {e}")
+            return clauses, []
+        print(f"[Problem_Phaser] goal clauses ({len(clauses)}): "
+              + " | ".join(clauses))
+        return clauses, vectors
+
     def _get_background_info(self, raw_text):
         """Extracts situational facts and dependencies, or firmly returns NONE."""
         background_info = f"""You are a senior context-extraction expert.
@@ -673,20 +699,37 @@ Output:"""
 
         try:
             goal_sentence, goal_vector = self._get_goal_prompt(raw_text)
+            clauses, clause_vectors = self._embed_goal_clauses(goal_sentence)
             context_sentence, context_vector = self._get_background_info(raw_text)
             requirement_list, vectored_reqs = self._get_requirement(raw_text)
             domain_str, domain_vector = self._get_domain(raw_text)
+
+            # PATCH 21 (measure-only). Whether the user's own request states
+            # any figure or identifier. Read from raw_text, never from the
+            # goal or constraints: those are model output, and a phaser that
+            # invented "at least 3 votes" would otherwise mark the problem as
+            # supplying data. Nothing reads this but the ledger.
+            supplied_figures, supplied_ids = supplied_data(raw_text)
+            supplies = bool(supplied_figures or supplied_ids)
+            print(f"[Problem_Phaser] problem supplies data: "
+                  f"{'yes' if supplies else 'no'}"
+                  + (f" ({(supplied_figures + supplied_ids)[:8]})" if supplies else ""))
 
             return {
                 "raw_text": raw_text,
                 "goal": goal_sentence,
                 "goal_vector": goal_vector,
+                "goal_clauses": clauses,
+                "goal_clause_vectors": clause_vectors,
                 "context": context_sentence,
                 "context_vector": context_vector,
                 "requirement": requirement_list,
                 "requirement_vectors": vectored_reqs,
                 "domain": domain_str,
                 "domain_vector": domain_vector,
+                "supplies_data": supplies,
+                "supplied_figures": supplied_figures,
+                "supplied_identifiers": supplied_ids,
             }
         except Exception as e:
             print(f"Error during problem parsing: {e}")

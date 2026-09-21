@@ -133,6 +133,40 @@ class Synthesizer:
             for tid in ordered_ids
         ]
 
+    def collect_not_completed(self, task_graph, abandoned_ids, results) -> list:
+        """PATCH 19. Descriptions of the abandoned subtasks, for the NOT
+        COMPLETED block of the synthesis prompt, in a stable order.
+
+        Before this the synthesizer saw ONLY promoted results, so "none of
+        the subtasks left any portion unresolved" was the one conclusion its
+        input allowed -- run 7 said exactly that with six subtasks abandoned.
+        The [PARTIAL RESULT] banner told the user, but it is added by the
+        orchestrator after this call and the model never saw it.
+
+        A description that ALSO appears among the completed results is left
+        out. Respawns and success-cache hits routinely leave an abandoned
+        task and a completed one with the same text (run 6: task_f0bb2e25
+        abandoned, task_03a760ea completed, both "Assign individualized
+        reading schedules accounting for current progress status"), and
+        listing it under both headings would ask the model to report as
+        missing a part the answer just covered.
+        """
+        def _norm(text):
+            return " ".join(str(text or "").lower().split())
+
+        covered = {_norm(r.get("description")) for r in results}
+        seen = set()
+        out = []
+        for task_id in sorted(abandoned_ids or ()):
+            task = task_graph.tasks.get(task_id)
+            description = getattr(task, "description", None) if task is not None else None
+            key = _norm(description)
+            if not key or key in covered or key in seen:
+                continue
+            seen.add(key)
+            out.append(" ".join(str(description).split()))
+        return out
+
     # ------------------------------------------------------------------
     # Conflict resolution -- Phase 1 stub
     # ------------------------------------------------------------------
@@ -153,7 +187,8 @@ class Synthesizer:
     # Final English decode
     # ------------------------------------------------------------------
 
-    def format_output(self, results: list, problem_spec: str) -> str:
+    def format_output(self, results: list, problem_spec: str,
+                      not_completed: list = None) -> str:
         """
         The single English decode for the entire colony run. One LLM call,
         combining all collected results into a coherent final answer for
@@ -178,30 +213,54 @@ class Synthesizer:
                 + "\n... [TRUNCATED -- additional subtask results omitted for length]"
             )
 
-        # FIX (synthesizer grounding): collect_results already restricts
-        # SUBTASK RESULTS to promoted (status==2) tasks, so the results
-        # block itself is honest -- but nothing told the model to stay
-        # inside it. "Combine these into a coherent answer" is an open
-        # invitation to bridge gaps with invented facts once it starts
-        # writing prose, and a gap in subtask coverage would come out
-        # looking exactly like a confidently synthesized claim. Every
-        # claim in the final answer now has to trace back to one of the
-        # results actually promoted by the judge, or say plainly that the
-        # colony didn't cover it.
+        # PATCH 19. The prompt is procedural on purpose: it says what to
+        # write, in what order, from which block -- and contains NO word the
+        # model can hand back as a verdict on its own answer.
+        #
+        # The version it replaces asked the model to "Ground every claim in
+        # the SUBTASK RESULTS ... do not introduce facts, figures, or
+        # conclusions that are not traceable to one of them. If the results
+        # leave part of the problem uncovered, say plainly that it wasn't
+        # addressed". Run 7's answer ended "All claims here are grounded in
+        # these results. There are no invented facts or conclusions beyond
+        # what is explicitly stated. ... None of the subtasks left any
+        # portion of the problem unresolved." -- the instruction recited
+        # back as a claim of compliance, right after a sentence that turned
+        # a subtask's "80% of the original proposed titles" into "over 80% of
+        # readers' preferences". An instruction phrased as a quality
+        # standard ("grounded", "traceable", "coherent", "no invented
+        # facts") comes back as an assertion that the standard was met;
+        # instructions phrased as steps ("copy", "name each item") have no
+        # such form to come back in.
+        #
+        # The uncovered parts are now GIVEN rather than asked for. The model
+        # could never have answered "say what wasn't addressed" -- it was
+        # only ever shown what was.
+        #
+        # Removed with the grounding sentence: "just solved a problem"
+        # (asserts success before a word is read) and "a single, coherent
+        # answer" (another quality word). Kept: the ban on naming the
+        # colony, agents or subtasks, which the not-completed sentence would
+        # otherwise invite.
+        not_completed_block = (
+            "\n".join(f"- {d}" for d in not_completed) if not_completed
+            else "(nothing)"
+        )
         prompt = (
-            "You are the final synthesizer for an AI agent colony that just "
-            "solved a problem by decomposing it into subtasks. Combine the "
-            "following subtask results into a single, coherent answer to the "
-            "original problem. Do not mention the colony, agents, or subtasks "
-            "in your answer -- write as if you solved the problem directly.\n\n"
-            "Ground every claim in the SUBTASK RESULTS below -- do not "
-            "introduce facts, figures, or conclusions that are not traceable "
-            "to one of them. If the results leave part of the problem "
-            "uncovered, say plainly that it wasn't addressed rather than "
-            "inventing an answer for it.\n\n"
-            f"ORIGINAL PROBLEM: {problem_spec}\n\n"
-            f"SUBTASK RESULTS:\n{results_block}\n\n"
-            "FINAL ANSWER:"
+            "Write the answer to the problem below for the person who asked "
+            "it. Your material is the COMPLETED WORK. Do not mention agents, "
+            "subtasks, or how the work was divided up.\n\n"
+            f"PROBLEM: {problem_spec}\n\n"
+            f"COMPLETED WORK:\n{results_block}\n\n"
+            f"NOT COMPLETED:\n{not_completed_block}\n\n"
+            "Write two parts:\n"
+            "1. The answer, built from the COMPLETED WORK. Copy names, "
+            "identifiers and numbers from it as they are written there.\n"
+            "2. One sentence beginning \"Not completed:\" that names, in "
+            "plain words, each item listed under NOT COMPLETED. If NOT "
+            "COMPLETED says (nothing), leave this part out.\n"
+            "End after part 2.\n\n"
+            "ANSWER:"
         )
 
         # Same greedy-decoding sentence-looping failure mode every other
@@ -331,6 +390,19 @@ class Synthesizer:
                   "as degenerate after trimming -- shipping it, but the last "
                   "decode of this run did not go cleanly.")
 
+        # PATCH 19 (measure-only). Did the answer carry the not-completed
+        # sentence it was asked for? Counted either way, so run 8's ledger
+        # says whether the NOT COMPLETED block worked or whether the banner
+        # is still doing all of the telling.
+        if not_completed:
+            if "not completed" in answer.lower():
+                self._record_trim("named_not_completed")
+            else:
+                self._record_trim("omitted_not_completed")
+                print(f"  [synthesis-trim] the answer does not name the "
+                      f"{len(not_completed)} not-completed part(s) it was "
+                      f"given -- the [PARTIAL RESULT] banner still will.")
+
         # Same stance for a made-up log line that is not at the tail, where
         # cutting it would take real content with it.
         made_up = _ungrounded_telemetry(answer, grounding)
@@ -345,7 +417,8 @@ class Synthesizer:
     # Entry point
     # ------------------------------------------------------------------
 
-    def run(self, colony_state, task_graph, problem_spec: str, root_task_id=None) -> str:
+    def run(self, colony_state, task_graph, problem_spec: str, root_task_id=None,
+            abandoned_ids=None) -> str:
         """
         The orchestrator's one call site: gather everything, decode once.
 
@@ -358,4 +431,5 @@ class Synthesizer:
         results = self.collect_results(colony_state, task_graph, root_task_id=root_task_id)
         if not results:
             return "No subtask results were produced -- there is nothing to synthesize."
-        return self.format_output(results, problem_spec)
+        not_completed = self.collect_not_completed(task_graph, abandoned_ids, results)
+        return self.format_output(results, problem_spec, not_completed=not_completed)

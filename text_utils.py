@@ -2032,6 +2032,56 @@ def cut_instruction_tail(text):
         return text, []
     return kept, [reason]
 
+
+# ---------------------------------------------------------------------------
+# PATCH 17 -- the goal as its clauses.
+#
+# Runs 6 and 7 settled what the whole-goal cosine measures. The phaser's goal
+# is a conjunction -- "Choose books using majority vote; assign tasks based on
+# availability; replace disliked books with alternate options." -- and MiniLM
+# puts a conjunction's embedding in the AVERAGE direction of its clauses. A
+# subtask that serves exactly one clause is far from that average by
+# construction, and the run's ceiling is set by whichever subtask happens to
+# straddle two: run 6's 0.658 ("voting-based book selection ... tiebreakers")
+# and run 7's 0.793 ("Assign preferred books to readers using a majority-vote
+# tallying method"). Every single-clause child is then judged against a
+# two-clause ceiling. Run 7 cleaned the goal string and the shape did not
+# change: the gate would still have dropped task_33196afe (0.227), which was
+# promoted, and the run's minimum, task_1bc0856d (0.175), was promoted too.
+#
+# So a subtask is scored against the clause it is closest to. The split is
+# deliberately dumb -- ';' and sentence ends, nothing else. A comma or "and"
+# split would cut "Choose books based on member votes and reading history"
+# into a clause that is just "reading history", and a fragment that short
+# scores high against almost anything.
+# ---------------------------------------------------------------------------
+
+_CLAUSE_SPLIT_RE = re.compile(r";|(?<=[.!?])\s+")
+# A fragment under this many words is not a clause the goal commits to
+# ("etc.", "e.g." debris, a trailing "Done."), and would score high against
+# anything that shares one word with it.
+GOAL_CLAUSE_MIN_WORDS = 3
+
+
+def goal_clauses(goal):
+    """The goal's clauses, split at ';' and sentence ends, trailing
+    punctuation stripped, in order.
+
+    A goal with one clause comes back as a one-item list (the goal itself),
+    so max-over-clauses degrades to the whole-goal cosine rather than to
+    nothing. Fragments under GOAL_CLAUSE_MIN_WORDS words are dropped; if that
+    drops everything, the stripped goal is returned whole.
+    """
+    if not goal or not str(goal).strip():
+        return []
+    whole = str(goal).strip().rstrip(".!?;: ").strip()
+    clauses = []
+    for part in _CLAUSE_SPLIT_RE.split(str(goal)):
+        part = part.strip().rstrip(".!?;: ").strip()
+        if len(part.split()) >= GOAL_CLAUSE_MIN_WORDS:
+            clauses.append(part)
+    return clauses or ([whole] if whole else [])
+
 # ---------------------------------------------------------------------------
 # Software framing on projects that are not about software.
 #
@@ -2179,13 +2229,26 @@ def software_request_words(text):
 #     case is caught on "presentation" regardless.
 #   * "agenda", "minutes" -- both are ordinary meeting vocabulary for a book
 #     club, which is precisely the domain this has to stay quiet in.
+#   * "proposal"/"proposals" -- REMOVED after run 7 (PATCH 18). In a
+#     selection project a proposal is a NOMINATED OPTION, not a document:
+#     "List the number of votes cast for each book proposal", "Determine
+#     which proposals meet or exceed the minimum passing threshold", "Count
+#     votes per proposal". Run 5 was 3/3 true positives on it, run 7 3/3
+#     false. It was never the word doing the work on run 5: "Compose a formal
+#     proposal letter" is caught on "letter", and "Write a formatted letter
+#     proposing ..." never matched "proposal" at all.
+#     Exempting words that appear in the user's own request would NOT have
+#     fixed run 7: the guard that runs this list is only armed when
+#     asks_for_artifact(raw_text) is False, so on every run where it fired,
+#     raw_text by construction contained no word from this list. The
+#     vocabulary came from a decomposer, not from the user.
 _ARTIFACT_REQUEST_RE = re.compile(
     r"(?<!\w)(?:"
     r"slide ?decks?|slide ?shows?|slides?|presentations?|"
     r"letters?|memos?|memorandums?|newsletters?|"
     r"brochures?|posters?|flyers?|leaflets?|pamphlets?|handouts?|"
     r"one[- ]pagers?|templates?|"
-    r"proposals?|press releases?|white ?papers?|infographics?|"
+    r"press releases?|white ?papers?|infographics?|"
     r"e-?mails?|invoices?|certificates?|"
     r"executive summar(?:y|ies)|deliverables?"
     r")(?!\w)",
@@ -2370,6 +2433,74 @@ def figures(text):
         token = match.group(0).replace(",", "")
         out.append(token)
     return out
+
+
+# ---------------------------------------------------------------------------
+# PATCH 21 -- data-free problems.
+#
+# If the user's request states no figures and no identifiers, then a specific
+# number or ID in a promoted answer came from somewhere other than the user.
+# Run 7 shipped {1004879: ['R1', 'R2'], 9874021: ['R3'], 2483902: ['R4']} as
+# its book assignment, on a problem that named no book and no reader. That is
+# a fact about the input, not a threshold, which is why it can be counted
+# without tuning anything.
+#
+# What it does NOT prove, and why the ledger lists each hit's figures rather
+# than calling them fabricated: a figure can be DERIVED from words in the
+# request. "More than half" becomes 50%, "each of the three clauses" becomes
+# 3, "five members" becomes 5. The count is an upper bound on fabrication,
+# and the per-REPORT figures are there so a reader can tell the two apart.
+#
+# Identifiers are codes that MIX letters and digits ("R1", "B12", "ISBN978").
+# Bare numbers are figures() already -- list markers excluded, per PATCH 16 --
+# and snake_case words are left out: in prose they are variable names, which
+# is the software-framing problem, not this one.
+# ---------------------------------------------------------------------------
+
+_IDENTIFIER_RE = re.compile(r"(?<![\w.])(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{2,}(?![\w])(?!\.\d)")
+# Ordinals and units written onto a number are not identifiers:
+# "1st", "2nd", "3rd", "4th", "10km", "5pm", "3x".
+_NOT_IDENTIFIER_RE = re.compile(
+    r"^\d+(?:st|nd|rd|th|s|x|am|pm|k|m|km|kg|g|h|hr|hrs|min|mins|mb|gb|d)$",
+    re.IGNORECASE,
+)
+
+
+def asserted_identifiers(text):
+    """Letter-and-digit codes `text` asserts, deduplicated, in order."""
+    if not text:
+        return []
+    found = [m.group(0) for m in _IDENTIFIER_RE.finditer(str(text))
+             if not _NOT_IDENTIFIER_RE.match(m.group(0))]
+    return list(dict.fromkeys(found))
+
+
+# A number with a magnitude or unit glued on: "9K", "6.9K", "10km", "5pm",
+# "2hrs". figures() deliberately rejects these -- PATCH 16 compares bare
+# quantities -- but for "did this answer state a specific number" they count:
+# run 5's promoted root REPORT said "over 9K votes each" and "6.9K votes",
+# and had nothing figures() would see. Ordinals ("1st", "3rd") are NOT here:
+# a position is not a measured quantity.
+_UNIT_FIGURE_RE = re.compile(
+    r"(?<![\w.])\d[\d,]*(?:\.\d+)?"
+    r"(?:k|m|bn|b|km|kg|g|mb|gb|h|hr|hrs|min|mins|am|pm|x)(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def asserted_figures(text):
+    """Every specific number `text` states, for PATCH 21: figures() plus
+    unit- and magnitude-suffixed numbers. Deduplicated, in order."""
+    if not text:
+        return []
+    found = figures(text) + [m.group(0) for m in _UNIT_FIGURE_RE.finditer(str(text))]
+    return list(dict.fromkeys(found))
+
+
+def supplied_data(text):
+    """The figures and identifiers the user's own request states, as
+    (figures, identifiers). Both empty means a data-free problem."""
+    return asserted_figures(text), asserted_identifiers(text)
 
 
 def figure_divergence(previous, current,

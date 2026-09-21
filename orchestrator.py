@@ -55,7 +55,10 @@ from text_utils import (
     FIGURE_DIVERGENCE_MIN,
     FIGURE_DIVERGENCE_MAX_OVERLAP,
     artifact_request_words,
+    asserted_figures,
+    asserted_identifiers,
     figure_divergence,
+    supplied_data,
     plain_register,
     software_artifact_reason,
     software_request_words,
@@ -237,6 +240,13 @@ class Orchestrator:
         # _measure_spawn_drift, to mark the ledger entry the spawn itself
         # files -- see the note in _screen_goal_drift_batch.
         self._gate_would_drop: set = set()
+
+        # PATCH 17 (measure-only). One vector per goal clause, from the
+        # phaser's spec. Scored alongside goal_drift, never instead of it:
+        # nothing reads clause_drift except the ledger, so the two
+        # distributions can be compared on the same run.
+        self.goal_clause_texts: List[str] = []
+        self.goal_clause_embeddings: List[Any] = []
 
         # PATCH 16. The last REPORT each task produced, as
         # {task_id: (agent_id, untrimmed result)}. One entry per task,
@@ -757,6 +767,8 @@ class Orchestrator:
               f"starting_budget={self.colony.starting_budget})")
 
         self.colony.goal_embedding = spec.get("goal_vector")
+        self.goal_clause_texts = list(spec.get("goal_clauses") or [])
+        self.goal_clause_embeddings = list(spec.get("goal_clause_vectors") or [])
 
         goal_text = spec.get("goal", problem_spec)
         print(f"[initialize_colony] goal ({len(goal_text)} chars): {goal_text}")
@@ -1315,6 +1327,60 @@ class Orchestrator:
             return None
         return _dedupe_repeated_sentences(str(goal_text), max_chars=300)
 
+    def _print_clause_reference_comparison(self, samples) -> None:
+        """PATCH 17 ledger section. Whole-goal and max-over-clauses scored on
+        the same subtasks, side by side: who sets each ceiling, and who falls
+        under GOAL_DRIFT_GATE_FRACTION of each. Measure-only -- the gate
+        still reads goal_drift, and is itself measure-only."""
+        both = [s for s in samples
+                if s.get("goal_drift") is not None and s.get("clause_drift") is not None]
+        print(f"    PATCH 17 -- whole goal vs max over "
+              f"{len(self.goal_clause_embeddings)} clause(s), measure-only:")
+        for i, text in enumerate(self.goal_clause_texts, 1):
+            print(f"      c{i}: {text}")
+        if not both:
+            print("      (no subtask has both scores -- clause vectors missing?)")
+            return
+
+        def _short(s):
+            d = " ".join(str(s["description"] or "").split())
+            return d[:52] + "..." if len(d) > 55 else d
+
+        below = {}
+        for key, label in (("goal_drift", "whole-goal"), ("clause_drift", "max-clause")):
+            ceiling = max(both, key=lambda s: s[key])
+            threshold = GOAL_DRIFT_GATE_FRACTION * ceiling[key]
+            below[key] = {s["task_id"] for s in both if s[key] < threshold}
+            print(f"      {label}: ceiling {ceiling[key]:.3f} set by "
+                  f"{ceiling['task_id']} ({_short(ceiling)}); "
+                  f"{len(below[key])} of {len(both)} under "
+                  f"{GOAL_DRIFT_GATE_FRACTION:g} x max = {threshold:.3f}")
+        print("      lowest 8 by max-clause (* = under that reference's threshold):")
+        for s in sorted(both, key=lambda s: s["clause_drift"])[:8]:
+            w = "*" if s["task_id"] in below["goal_drift"] else " "
+            c = "*" if s["task_id"] in below["clause_drift"] else " "
+            print(f"        goal={s['goal_drift']:.3f}{w} "
+                  f"clause={s['clause_drift']:.3f}{c}(c{s['clause_index']})  "
+                  f"{s['task_id']}  {_short(s)}")
+
+    def _clause_drift(self, embedding):
+        """PATCH 17 (measure-only). This embedding's cosine to the goal
+        clause it is CLOSEST to, and that clause's 1-based index, as
+        (score, index) -- or (None, None) when no clause is measurable.
+
+        Why max over clauses: the goal is a conjunction and its embedding
+        sits in the average of its clauses, so a subtask serving exactly one
+        clause scores low against the whole goal by construction, while the
+        run's ceiling is set by whichever subtask straddles two (run 6:
+        0.658, run 7: 0.793). See goal_clauses in text_utils.
+        """
+        best, best_i = None, None
+        for i, clause_vec in enumerate(self.goal_clause_embeddings):
+            score = _cosine(embedding, clause_vec)
+            if score is not None and (best is None or score > best):
+                best, best_i = score, i + 1
+        return best, best_i
+
     def _measure_spawn_drift(self, child_node: TaskNode, parent_task_id: Optional[str]):
         """
         PATCH 7. Score every spawned subtask against the colony goal and
@@ -1353,6 +1419,7 @@ class Orchestrator:
             child_node.description_embedding,
             getattr(parent_task, "description_embedding", None),
         )
+        clause_drift, clause_index = self._clause_drift(child_node.description_embedding)
         child_node.goal_drift = goal_drift
         child_node.parent_drift = parent_drift
         self.goal_drift_samples.append({
@@ -1360,6 +1427,8 @@ class Orchestrator:
             "description": child_node.description,
             "goal_drift": goal_drift,
             "parent_drift": parent_drift,
+            "clause_drift": clause_drift,
+            "clause_index": clause_index,
             "gated": child_node.task_id in self._gate_would_drop,
         })
 
@@ -1378,8 +1447,10 @@ class Orchestrator:
 
         kept = ("kept, GATE WOULD HAVE DROPPED"
                 if child_node.task_id in self._gate_would_drop else "kept")
+        clause = (f"{_fmt(clause_drift)}(c{clause_index})"
+                  if clause_index is not None else "n/a")
         print(f"  [spawn-drift] {child_node.task_id} goal={_fmt(goal_drift)} "
-              f"parent={_fmt(parent_drift)} ({kept}): "
+              f"clause={clause} parent={_fmt(parent_drift)} ({kept}): "
               f"{str(child_node.description)[:70]!r}")
 
     def _flag_software_shaped_task(self, child_node: TaskNode):
@@ -1957,11 +2028,15 @@ class Orchestrator:
                 prepared[i][2], prepared[i][1],
                 drift_dropped=GOAL_DRIFT_GATE_ACTS)
             if GOAL_DRIFT_GATE_ACTS:
+                clause_drift, clause_index = self._clause_drift(
+                    self._gate_description_embeddings.get(prepared[i][2]))
                 self.goal_drift_samples.append({
                     "task_id": prepared[i][2],
                     "description": prepared[i][1],
                     "goal_drift": scores[i],
                     "parent_drift": None,
+                    "clause_drift": clause_drift,
+                    "clause_index": clause_index,
                     "gated": True,
                 })
             else:
@@ -2054,6 +2129,51 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # PATCH 16 -- figures that do not survive a retry (measure-only)
     # ------------------------------------------------------------------
+
+    def _promoted_reports_asserting_data(self):
+        """PATCH 21 (measure-only). Every promoted REPORT -- root included --
+        as (task_id, figures, identifiers), and the total promoted count.
+        Read from the task graph at ledger time, so it is the text that was
+        actually promoted and threaded onward, not a draft."""
+        hits, total = [], 0
+        for task_id, task in self.task_graph.tasks.items():
+            if getattr(task, "status", None) != 2 or getattr(task, "result", None) is None:
+                continue
+            total += 1
+            text = str(task.result)
+            figs = asserted_figures(text)
+            ids = asserted_identifiers(text)
+            if figs or ids:
+                hits.append((task_id, figs, ids))
+        return hits, total
+
+    def _print_data_free_report(self) -> None:
+        """PATCH 21 ledger rows. Measure-only: nothing is rejected on it.
+
+        When the request supplies no figure and no identifier, every
+        specific number or ID in a promoted REPORT came from somewhere other
+        than the user. Each hit's own figures are printed because some will
+        be DERIVED from words ("more than half" -> 50%) rather than made up,
+        and only a reader can tell those apart -- see supplied_data."""
+        spec = self.spec or {}
+        if "supplies_data" in spec:
+            supplies = bool(spec.get("supplies_data"))
+            source = "phaser"
+        else:
+            figs, ids = supplied_data(spec.get("raw_text", ""))
+            supplies = bool(figs or ids)
+            source = "raw_text, recomputed"
+        print(chr(10) + "  DATA-FREE PROBLEM (PATCH 21, measure-only)")
+        print(f"    problem supplies data : {'yes' if supplies else 'no'}  ({source})")
+        if supplies:
+            return
+        hits, total = self._promoted_reports_asserting_data()
+        print(f"    promoted REPORTs asserting figures or IDs anyway : "
+              f"{len(hits)} of {total}")
+        for task_id, figs, ids in hits:
+            shown = (figs + ids)[:8]
+            more = len(figs) + len(ids) - len(shown)
+            print(f"      {task_id}  {shown}" + (f" +{more} more" if more > 0 else ""))
 
     def _check_figure_divergence(self, task_id, agent_id, result):
         """
@@ -3203,7 +3323,9 @@ class Orchestrator:
                 goal_text = self.spec.get("goal", "") if self.spec else ""
                 try:
                     final_answer = self.synthesizer.run(
-                        self.colony, self.task_graph, goal_text, root_task_id=self.root_task_id
+                        self.colony, self.task_graph, goal_text,
+                        root_task_id=self.root_task_id,
+                        abandoned_ids=set(self.abandoned_tasks),
                     )
                     # Read by terminate()'s partial banner: this answer is a
                     # synthesis, not the root agent's raw REPORT.
@@ -4378,7 +4500,8 @@ class Orchestrator:
                 goal_vals = [s["goal_drift"] for s in samples if s["goal_drift"] is not None]
                 parent_vals = [s["parent_drift"] for s in samples if s["parent_drift"] is not None]
                 gated = [s for s in samples if s.get("gated")]
-                verb = "dropped by the gate" if GOAL_DRIFT_GATE_ACTS                     else "below threshold, started anyway"
+                verb = ("dropped by the gate" if GOAL_DRIFT_GATE_ACTS
+                        else "below threshold, started anyway")
                 spawned = len(samples) - (len(gated) if GOAL_DRIFT_GATE_ACTS else 0)
                 print(f"    subtasks measured : {len(goal_vals)} of {len(samples)} "
                       f"scored ({spawned} spawned, {len(gated)} {verb})")
@@ -4400,7 +4523,10 @@ class Orchestrator:
                     print(f"    goal-cosine unmeasurable : {unmeasurable} "
                           f"(missing or zero-norm vector -- see "
                           f"problem_phaser.py:601/:636)")
+                clause_vals = [s["clause_drift"] for s in samples
+                               if s.get("clause_drift") is not None]
                 for name, vals in (("cosine to GOAL   (cumulative)", goal_vals),
+                                   ("cosine to CLAUSE (max, P17)  ", clause_vals),
                                    ("cosine to PARENT (per hop)   ", parent_vals)):
                     if not vals:
                         print(f"    {name} : (none measurable)")
@@ -4427,6 +4553,7 @@ class Orchestrator:
                         mark = "  [GATED]" if s.get("gated") else ""
                         print(f"      goal={s['goal_drift']:.3f}  parent={parent}  "
                               f"{s['task_id']}  {description}{mark}")
+                self._print_clause_reference_comparison(samples)
 
             print(chr(10) + "  FIGURE DIVERGENCE ACROSS ATTEMPTS (PATCH 16, measure-only)")
             print(f"    same task, consecutive attempts, figures that did "
@@ -4435,6 +4562,8 @@ class Orchestrator:
                   f"{FIGURE_DIVERGENCE_MIN} figures and share under "
                   f"{FIGURE_DIVERGENCE_MAX_OVERLAP:.0%} of them; a figure-free "
                   "attempt is vague, not contradictory, and is not compared)")
+
+            self._print_data_free_report()
 
             print(chr(10) + "  STRUCTURAL REJECTS (caught before the judge)")
             print(f"    decomposer REPORT, no completed subtask : "
@@ -4683,6 +4812,8 @@ class Orchestrator:
             ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
             ("synthesis shipped made-up metrics ", trims.get("shipped_telemetry", 0)),
             ("synthesis stump walked back       ", trims.get("incomplete_tail_after_cut", 0)),
+            ("synthesis named not-completed (P19)", trims.get("named_not_completed", 0)),
+            ("synthesis OMITTED not-completed   ", trims.get("omitted_not_completed", 0)),
             ("returned answer cut on the way out", verdicts.get("final_answer_cut", 0)),
             ("returned answer empty after cut   ",
              verdicts.get("final_answer_empty_after_cut", 0)),
@@ -4808,7 +4939,10 @@ class Orchestrator:
             if partial_results:
                 goal_text = self.spec.get("goal", "") if self.spec else ""
                 try:
-                    best_result = self.synthesizer.format_output(partial_results, goal_text)
+                    not_completed = self.synthesizer.collect_not_completed(
+                        self.task_graph, set(self.abandoned_tasks), partial_results)
+                    best_result = self.synthesizer.format_output(
+                        partial_results, goal_text, not_completed=not_completed)
                     synthesized = partial_synthesis = True
                 except Exception as e:
                     print(f"Warning: failed synthesizing partial result: {e}")
