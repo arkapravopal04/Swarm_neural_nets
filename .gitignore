@@ -1,4 +1,4 @@
-# Model outputs / artifacts
+# Model outputs / artifacts (kept local; not published)
 fine_tune/
 fine_tuned_params_v1/
 fine_tuning.py
@@ -7,8 +7,12 @@ fine_tuning.py
 outreach/
 paper/
 
+# Local assistant state
 .claude/
 Claude outputs/
+
+# Tests: only force-added files are tracked (git add -f tests/<file>)
+tests/
 
 # Python caches
 __pycache__/
@@ -21,7 +25,23 @@ __pycache__/
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
+# Local environments and secrets
+.env
+.env.*
+.venv/
+venv/
+env/
 
-tests/
-# per-run energy traces (main.py / notebook)
+# Model weights and training checkpoints
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+qwen3-4b-local/
+
+# Per-run outputs (main.py / notebook)
 hive_energy_trace.jsonl
+hive_memory/
+hive_answer.txt

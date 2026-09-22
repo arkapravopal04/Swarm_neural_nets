@@ -1,0 +1,16 @@
+# Runtime dependencies, taken from what the code imports.
+# Lower bounds are the versions the code was last run or tested with; nothing
+# stricter has been verified. On Kaggle, torch/numpy/pandas are preinstalled
+# and the notebook installs the rest.
+torch>=2.1
+transformers>=4.51        # Qwen3 support
+accelerate                # device_map="auto" in main.py
+peft>=0.19                # the adapter was saved with peft 0.19.1
+sentence-transformers
+faiss-cpu
+numpy
+pandas
+sympy
+
+# Tests
+pytest
