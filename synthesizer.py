@@ -104,6 +104,9 @@ class Synthesizer:
         dicts, ordered so that a task never appears before any task it
         depends on.
         """
+        # PATCH 32 (cont.). Reset first so a second call never reports (or,
+        # in collect_not_completed, covers with) roll-ups from the first.
+        self.last_rollups_omitted = []
         tasks = task_graph.tasks  # dict: task_id -> TaskNode
 
         completed = {
@@ -111,6 +114,22 @@ class Synthesizer:
             if tid != root_task_id
             and getattr(t, "status", None) == 2 and getattr(t, "result", None) is not None
         }
+
+        # PATCH 32 (cont.). Drop a roll-up whose direct children all
+        # completed: its children are already in the list, and run 10's
+        # synthesizer got a roll-up AND its two children -- three of five
+        # items the same fee chain -- copied them, and ignored a concrete
+        # rule that appeared once. A child counts as covered when it is in
+        # `completed`, or when it failed (status 3) and a completed sibling
+        # has the same normalised description (the parent spawned the same
+        # subtask again; a respawn reuses the task_id, so it never does
+        # this). Decided against the ORIGINAL `completed` set, so a
+        # grandparent whose child is itself an omitted roll-up goes too.
+        # Omitted roll-ups are completed work, not abandoned work.
+        omitted = self._rollups_to_omit(completed, task_graph)
+        self.last_rollups_omitted = [tid for tid in completed if tid in omitted]
+        for _ in self.last_rollups_omitted:
+            self._record_trim("rollups_omitted")
 
         ordered_ids = []
         visited = set()
@@ -134,7 +153,38 @@ class Synthesizer:
                 "result": completed[tid].result,
             }
             for tid in ordered_ids
+            if tid not in omitted
         ]
+
+    @staticmethod
+    def _rollups_to_omit(completed, task_graph) -> set:
+        """PATCH 32 (cont.). IDs in `completed` whose direct children (graph
+        parent_task_id, not AgentNode.children) are all covered -- see
+        collect_results. A task with no children is never omitted."""
+        def _norm(text):
+            return " ".join(str(text or "").lower().split())
+
+        def _kids(task_id):
+            direct_children = getattr(task_graph, "direct_children", None)
+            if callable(direct_children):
+                return list(direct_children(task_id) or [])
+            return [t for t in task_graph.tasks.values()
+                    if getattr(t, "parent_task_id", None) == task_id]
+
+        omitted = set()
+        for tid in completed:
+            kids = _kids(tid)
+            if not kids:
+                continue
+            done_descs = {_norm(getattr(k, "description", None))
+                          for k in kids if getattr(k, "task_id", None) in completed}
+            done_descs.discard("")
+            if all(getattr(k, "task_id", None) in completed
+                   or (getattr(k, "status", None) == 3
+                       and _norm(getattr(k, "description", None)) in done_descs)
+                   for k in kids):
+                omitted.add(tid)
+        return omitted
 
     def collect_not_completed(self, task_graph, abandoned_ids, results) -> list:
         """PATCH 19. Descriptions of the abandoned subtasks, for the NOT
@@ -158,6 +208,14 @@ class Synthesizer:
             return " ".join(str(text or "").lower().split())
 
         covered = {_norm(r.get("description")) for r in results}
+        # PATCH 32 (cont.). A roll-up omitted by collect_results is completed
+        # work that is no longer in `results`; its description still covers
+        # an abandoned same-description attempt, or that attempt would be
+        # listed as NOT COMPLETED.
+        for task_id in getattr(self, "last_rollups_omitted", None) or ():
+            task = task_graph.tasks.get(task_id)
+            if task is not None:
+                covered.add(_norm(getattr(task, "description", None)))
         seen = set()
         out = []
         for task_id in sorted(abandoned_ids or ()):
