@@ -634,9 +634,12 @@ Output:
                   f"{len(bad_second)} on the second draw.")
             if len(bad_second) < len(bad):
                 chosen, bad = second, bad_second
-        # PATCH 31 (measure-only). How many constraints the chosen draw
-        # held before this filter touched it -- the count the budget
-        # multiplier would see if it were taken before the filter.
+        # PATCH 31. How many constraints the chosen draw held before this
+        # filter touched it. _estimate_by_constraints reads this count, not
+        # the kept list, so a constraint the filter drops no longer shrinks
+        # the budget. Known edge (not fixed): extracted can exceed kept even
+        # when nothing is dropped, if two constraints are repaired into the
+        # same string and the dedupe below merges them.
         record["extracted"] = len(chosen)
         replaced = {}
         for constraint, extra in bad:
@@ -726,9 +729,29 @@ Output:"""
                 
         return "General Discourse > Unstructured Inquiry (Focus: Everyday Conversational Knowledge)"
 
+    @staticmethod
+    def _constraint_counts(spec):
+        """PATCH 31. (n for the budget, extracted or None, kept).
+
+        extracted is the pre-filter count from the fidelity record; None when
+        the record or its "extracted" key is missing, in which case n is the
+        kept count.
+        """
+        kept = len(spec.get("requirement") or [])
+        extracted = (spec.get("constraint_fidelity") or {}).get("extracted")
+        return (kept if extracted is None else extracted), extracted, kept
+
     def _estimate_by_constraints(self, spec):
-        """Scales difficulty based on constraints using a diminishing returns (sqrt) curve."""
-        num_reqs = len(spec["requirement"])
+        """Scales difficulty based on constraints using a diminishing returns (sqrt) curve.
+
+        PATCH 31. n is the PRE-filter count (constraint_fidelity["extracted"],
+        set by _faithful_constraints), so every constraint the Patch 22/30
+        fidelity filter drops no longer also shrinks the budget. Falls back to
+        len(spec["requirement"]) -- the kept list -- when there is no record
+        or no "extracted" key (phaser exception path, old or hand-built
+        specs). spec["requirement"] itself stays the filtered list.
+        """
+        num_reqs = self._constraint_counts(spec)[0]
         constraint_score = self.CONSTRAINT_BASE + self.CONSTRAINT_COEF * np.sqrt(num_reqs)
         return min(constraint_score, self.CONSTRAINT_CAP)
 
@@ -766,7 +789,8 @@ Output:"""
         semantic_gap = self._estimate_by_semantic_gap(spec)
 
         raw_score = base_mult * constraint_wt * semantic_gap
-        
+        _, extracted, kept = self._constraint_counts(spec)
+
         if raw_score <= 2.0:
             tier = "S"
         elif raw_score <= 3.5:
@@ -791,12 +815,17 @@ Output:"""
                 "constraint_weight": round(constraint_wt, 2),
                 "semantic_gap": round(semantic_gap, 2),
                 "raw_score": round(raw_score, 2),
+                "constraints_extracted": extracted,
+                "constraints_kept": kept,
             }
         })
 
+        # PATCH 31. Both counts: the budget uses the pre-filter one.
+        counts = (f"({extracted} before fidelity, {kept} kept)"
+                  if extracted is not None else f"({kept} kept)")
         print(
             f"--> Assigned Tier: {tier} (Budget: {budget}) "
-            f"[domain={base_mult:.2f}x constraints={constraint_wt:.2f}x "
+            f"[domain={base_mult:.2f}x constraints={constraint_wt:.2f}x {counts} "
             f"semantic_gap={semantic_gap:.2f}x score={raw_score:.2f}]\n"
         )
         return spec

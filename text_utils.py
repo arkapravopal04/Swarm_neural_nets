@@ -1104,6 +1104,11 @@ _SIGNOFF_RE = re.compile(
     r"(?:needed|necessary|required)"
     r"|that(?:'s|\s+is)\s+(?:all|it)"
     r"|this\s+(?:completes|concludes)\s+(?:the|this|my)\s+(?:task|answer|report)"
+    # PATCH 32 (cont.). Run 10 shipped "...two warnings. Final check passed."
+    # "passed" is no closer stem and the sentence is too long for the echo
+    # trimmer, so only this whole-sentence match can cut it, and only at the
+    # tail. "The final check passed inspection on three plots." is content.
+    r"|(?:final\s+checks?|all\s+checks)\s*[:\-]?\s*(?:passed|completed?|ok|done)"
     r")(?:\s+(?:at|for)\s+(?:this|the)\s+(?:stage|point|time|moment))?[.!]?$",
     re.IGNORECASE,
 )
@@ -2755,6 +2760,108 @@ def figure_fidelity(source, derived, require_all=True):
 # ambiguous and drops, and so does a figure written in words.
 REPAIR_MAX_GAP = 0.10
 REPAIR_MIN_VALUE = 100
+
+
+# ---------------------------------------------------------------------------
+# PATCH 23 (measure-only) -- where a figure came from.
+#
+# Run 11 is the first run where every agent sees the request verbatim
+# (PATCH 29), so it is the first where a figure the user gave can be told
+# apart from one the colony made up. Runs 8, 9 and 10 wrote 9,567, 9,600 and
+# 9,067 for a request that said 9,000: all within 7%. Each distinct value is
+# GROUNDED (the request states it), DERIVABLE (one + - x / of two distinct
+# request values), or NEITHER -- with NEAR-MISS as NEITHER's sub-label for a
+# value within REPAIR_MAX_GAP of a request value of at least
+# REPAIR_MIN_VALUE. No chaining and no constants (12 months, 52 weeks, 100%):
+# "62.5" on {12, 20, 9000} is two steps and stays NEITHER. Nothing here
+# rejects or flags anything; the ledger counts it.
+# ---------------------------------------------------------------------------
+
+FIGURE_GROUNDED = "grounded"
+FIGURE_DERIVABLE = "derivable"
+FIGURE_NEAR_MISS = "near-miss"
+FIGURE_NEITHER = "neither"
+_FIGURE_OPS = (
+    ("+", lambda a, b: a + b),
+    ("-", lambda a, b: a - b),
+    ("x", lambda a, b: a * b),
+    ("/", lambda a, b: a / b if b else None),
+)
+
+
+def compact_figure(value):
+    """`value` as a short plain number: "9000", "0.6", "0.00133"."""
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    text = f"{value:.6g}"
+    if "e" in text:
+        text = f"{value:.8f}".rstrip("0").rstrip(".")
+    return text
+
+
+def _figure_matches(value, result):
+    """PATCH 23's tolerance: half a unit from 10 up, 1% below it."""
+    if abs(result) >= 10:
+        return abs(value - result) <= 0.5
+    return abs(value - result) <= 0.01 * abs(result)
+
+
+def _one_op_match(value, pairs):
+    """The first (a, op, b) over `pairs` x (+ - x /) with op(a, b) matching
+    `value`, or None. Negative results and division by zero are skipped."""
+    for a, b in pairs:
+        for symbol, op in _FIGURE_OPS:
+            result = op(a, b)
+            if result is None or result < 0:
+                continue
+            if _figure_matches(value, result):
+                return a, symbol, b
+    return None
+
+
+def classify_figures(request_text, text, near_misses=None):
+    """PATCH 23. One entry per DISTINCT value `text` states, in order, as
+    {"value", "written", "class", "detail"}.
+
+    Values come from figure_values() on both sides, so "9,000", "Rs9,000"
+    and "9k" are one figure. First match wins: grounded, derivable,
+    near-miss, neither. `near_misses` (values found elsewhere in the run)
+    only annotate a plain NEITHER value that is op(near_miss, request value):
+    "traces to 9567 / 20". The class stays NEITHER.
+    """
+    request = list(figure_values(request_text))
+    pairs = [(a, b) for a in request for b in request if a != b]
+    near = list(dict.fromkeys(float(n) for n in (near_misses or ())))
+    out = []
+    for value, written in figure_values(text).items():
+        entry = {"value": value, "written": written,
+                 "class": FIGURE_NEITHER, "detail": ""}
+        hit = None if value in request else _one_op_match(value, pairs)
+        if value in request:
+            entry["class"] = FIGURE_GROUNDED
+        elif hit is not None:
+            a, symbol, b = hit
+            entry["class"] = FIGURE_DERIVABLE
+            entry["detail"] = (f"{compact_figure(value)} = "
+                               f"{compact_figure(a)} {symbol} {compact_figure(b)}")
+        else:
+            close = [r for r in request
+                     if r >= REPAIR_MIN_VALUE and abs(value - r) / r <= REPAIR_MAX_GAP]
+            if close:
+                r = min(close, key=lambda c: abs(value - c) / c)
+                entry["class"] = FIGURE_NEAR_MISS
+                entry["detail"] = (f"near-miss of {compact_figure(r)} "
+                                   f"({(value - r) / r * 100:+.1f}%)")
+            else:
+                trace = _one_op_match(
+                    value, [(n, r) for n in near for r in request if n != r])
+                if trace is not None:
+                    a, symbol, b = trace
+                    entry["detail"] = (f"traces to {compact_figure(a)} "
+                                       f"{symbol} {compact_figure(b)}")
+        out.append(entry)
+    return out
 
 
 def _format_figure(value):

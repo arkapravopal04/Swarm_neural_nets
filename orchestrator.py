@@ -78,6 +78,11 @@ FRAMING_LEVERS = ("reword", "block")
 # memory_state pulls in faiss/sentence_transformers at import time.
 CACHE_OUTCOME_ACCEPTED = "accepted"
 
+# PATCH 33: memory_state.SUCCESS_CACHE_THRESHOLD, repeated for the same
+# reason. Ghost read-back keeps a hit at/above it (tuned for MiniLM).
+GHOST_LESSON_THRESHOLD = 0.45
+GHOST_LESSON_TOP_K = 3
+
 
 # --- PATCH 12: the goal-drift gate ------------------------------------------
 # PATCH 7 measured; this acts, at the extreme only.
@@ -734,6 +739,15 @@ class Orchestrator:
 
     def initialize_colony(self, problem_spec: str):
         """System entry point. Bootstraps the first task and the root agent."""
+        # PATCH 33: the success cache lives for ONE colony run. The notebook
+        # builds one MemoryStore and reuses it for every new_colony(), so
+        # without this a later prompt could be served accepted entries from
+        # an earlier one. Ghosts are untouched: they persist by design.
+        # getattr: test fakes of the store need not implement it.
+        if self.memory_store is not None:
+            clear_session = getattr(self.memory_store, "clear_session", None)
+            if callable(clear_session):
+                clear_session()
         self.root_task_id = "root_task_0"
 
         if self.phaser is not None:
@@ -2221,7 +2235,7 @@ class Orchestrator:
             if "extracted" in constraints:
                 print(f"    constraints : {constraints['extracted']} extracted, "
                       f"{len(spec.get('requirement') or [])} kept (PATCH 31: the "
-                      f"budget multiplier counts the kept ones)")
+                      f"budget multiplier counts the extracted ones)")
         counts = self.request_prompt_counts
         print(f"    agents with the request verbatim in their prompt (PATCH 29) : "
               f"{counts['with_request']} of {counts['agents']}"
@@ -2270,6 +2284,53 @@ class Orchestrator:
         print(chr(10) + "  DATA-FREE PROBLEM (PATCH 21, measure-only)")
         print(f"    problem supplies data : {'yes' if supplies else 'no'}  ({source})")
         if supplies:
+            # PATCH 23 (measure-only). The request supplies data, so each
+            # promoted REPORT's figures -- distinct values per REPORT --
+            # are sorted into grounded / derivable / near-miss / neither
+            # against raw_text. The same set PATCH 21 walks (status 2,
+            # result not None, root and roll-ups included). Two passes: the
+            # run's near-miss values feed the second one's trace annotation.
+            from text_utils import (classify_figures, compact_figure,
+                                    FIGURE_GROUNDED, FIGURE_DERIVABLE,
+                                    FIGURE_NEAR_MISS, FIGURE_NEITHER)
+            request = spec.get("raw_text", "")
+            promoted = [(task_id, str(task.result))
+                        for task_id, task in self.task_graph.tasks.items()
+                        if getattr(task, "status", None) == 2
+                        and getattr(task, "result", None) is not None]
+            near = sorted({e["value"] for _, text in promoted
+                           for e in classify_figures(request, text)
+                           if e["class"] == FIGURE_NEAR_MISS})
+            classes = (FIGURE_GROUNDED, FIGURE_DERIVABLE, FIGURE_NEAR_MISS,
+                       FIGURE_NEITHER)
+            counts = {c: 0 for c in classes}
+            rows = {c: [] for c in classes}
+            distinct = {c: set() for c in classes}
+            with_figures = 0
+            for task_id, text in promoted:
+                entries = classify_figures(request, text, near_misses=near)
+                with_figures += bool(entries)
+                for e in entries:
+                    counts[e["class"]] += 1
+                    distinct[e["class"]].add(e["value"])
+                    shown = compact_figure(e["value"])
+                    if e["class"] == FIGURE_DERIVABLE:
+                        rows[e["class"]].append(f"{task_id}  {e['detail']}")
+                    elif e["class"] != FIGURE_GROUNDED:
+                        rows[e["class"]].append(
+                            f"{task_id}  {shown}"
+                            + (f"  {e['detail']}" if e["detail"] else ""))
+            print(f"    promoted REPORTs with figures : {with_figures} of {len(promoted)}")
+            for c in classes:
+                label = f"figures {c}".ljust(18)
+                note = "   (not counting near-misses)" if c == FIGURE_NEITHER else ""
+                print(f"    {label} : {counts[c]}{note}")
+                for row in rows[c]:
+                    print(f"        {row}")
+            print("    run-level distinct values:")
+            print("        " + "  ".join(
+                f"{c} [{', '.join(compact_figure(v) for v in sorted(distinct[c]))}]"
+                for c in classes))
             return
         hits, total = self._promoted_reports_asserting_data()
         print(f"    promoted REPORTs asserting figures or IDs anyway : "
@@ -2278,6 +2339,35 @@ class Orchestrator:
             shown = (figs + ids)[:8]
             more = len(figs) + len(ids) - len(shown)
             print(f"      {task_id}  {shown}" + (f" +{more} more" if more > 0 else ""))
+
+    def _print_final_answer_figures(self, final_answer) -> None:
+        """PATCH 23 (measure-only). The FINAL ANSWER's figures, classified
+        separately from the REPORTs: the text as shipped, after the exit
+        guard and the partial banner. Called from terminate() on both exit
+        paths -- not from _print_data_free_report, which runs before the
+        partial-path synthesis exists. Silent on a data-free problem."""
+        spec = self.spec or {}
+        if "supplies_data" in spec:
+            supplies = bool(spec.get("supplies_data"))
+        else:
+            figs, ids = supplied_data(spec.get("raw_text", ""))
+            supplies = bool(figs or ids)
+        if not supplies:
+            return
+        from text_utils import (classify_figures, compact_figure,
+                                FIGURE_GROUNDED, FIGURE_DERIVABLE,
+                                FIGURE_NEAR_MISS, FIGURE_NEITHER)
+        print(chr(10) + "  FINAL ANSWER figures (PATCH 23):")
+        if not isinstance(final_answer, str):
+            print("      not a text answer, not classified")
+            return
+        distinct = {c: set() for c in (FIGURE_GROUNDED, FIGURE_DERIVABLE,
+                                       FIGURE_NEAR_MISS, FIGURE_NEITHER)}
+        for e in classify_figures(spec.get("raw_text", ""), final_answer):
+            distinct[e["class"]].add(e["value"])
+        print("      " + "  ".join(
+            f"{c} [{', '.join(compact_figure(v) for v in sorted(vals))}]"
+            for c, vals in distinct.items()))
 
     def _check_figure_divergence(self, task_id, agent_id, result):
         """
@@ -3424,7 +3514,7 @@ class Orchestrator:
         if task_id == self.root_task_id:
             print("Root task completed! Triggering Synthesizer...")
             if self.synthesizer is not None:
-                goal_text = self.spec.get("goal", "") if self.spec else ""
+                goal_text = self._synthesis_problem_text()
                 try:
                     final_answer = self.synthesizer.run(
                         self.colony, self.task_graph, goal_text,
@@ -3654,6 +3744,48 @@ class Orchestrator:
               f"{getattr(lookup, 'hit_score', 0.0):.2f}) would have completed it "
               f"-- withheld. The root is never completed from the cache.")
 
+    def _measure_ghost_lessons(self, agent_id: str, task_id: str, task_node) -> None:
+        """PATCH 33, MEASURE-ONLY: would the persistent ghost memory have had
+        an earlier lesson for this respawn?
+
+        Queries the ghost index with the task's description, keeps hits at
+        or above GHOST_LESSON_THRESHOLD, and drops the ghost _retire_agent
+        just wrote for agent_id -- a task must not "find" its own fresh
+        death. Prints what it found and counts ghost_lessons_available /
+        ghost_lessons_none. Nothing it finds reaches ghost_context or any
+        prompt; injection is a later patch. Never raises.
+        """
+        query_ghosts = getattr(self.memory_store, "query_ghosts", None)
+        if not callable(query_ghosts):
+            return  # a store with no ghost index (test fakes): nothing to measure
+        try:
+            # One extra neighbour: the agent's own fresh ghost scores ~1.0
+            # against its task and would otherwise take one of the slots.
+            raw = query_ghosts(task_node.description, top_k=GHOST_LESSON_TOP_K + 1) or []
+            hits = []
+            for h in raw:
+                meta = h.get("metadata") or {}
+                if meta.get("agent_id") == agent_id:
+                    continue
+                if float(h.get("score", 0.0)) < GHOST_LESSON_THRESHOLD:
+                    continue
+                hits.append((float(h.get("score", 0.0)), meta))
+            hits = hits[:GHOST_LESSON_TOP_K]
+        except Exception:
+            print(f"Warning: ghost read-back failed for {task_id}:\n"
+                  f"{traceback.format_exc()}")
+            return
+        if not hits:
+            self.colony.record_verdict("ghost_lessons_none")
+            return
+        self.colony.record_verdict("ghost_lessons_available")
+        print(f"  [ghost-memory] {task_id}: {len(hits)} earlier failure(s) on similar tasks")
+        for score, meta in hits:
+            reason = " ".join(str(meta.get("failure_reason") or "").split())
+            if len(reason) > 100:
+                reason = reason[:97] + "..."
+            print(f"      {score:.2f}  {meta.get('failure_type') or 'unknown'}  {reason!r}")
+
     def _kill_and_respawn(self, agent_id: str, task_id: Optional[str], role: str,
                            parent_id: Optional[str], verdict: Optional[Dict[str, Any]] = None,
                            count_attempt: bool = True):
@@ -3767,6 +3899,12 @@ class Orchestrator:
                 reason_label="energy ceiling",
             )
             return
+
+        # PATCH 33: ghost read-back, measure-only. Counted once per respawn,
+        # here where the respawn is certain to be attempted (cache hits and
+        # abandonments above return first). ghost_context is not touched.
+        if self.memory_store is not None and task_node is not None:
+            self._measure_ghost_lessons(agent_id, task_id, task_node)
 
         if count_attempt:
             print(f"Agent {agent_id} failed. Respawning {role} with ghost context "
@@ -4527,6 +4665,11 @@ class Orchestrator:
             # have completed the run with, had it been allowed to.
             print(f"    root lookups not served     : {verdicts.get('root_cache_lookup_skipped', 0)}")
             print(f"      would have hit            : {verdicts.get('root_cache_hit_withheld', 0)}")
+            # PATCH 33, measure-only: nothing found here reaches a prompt.
+            ghost_avail = verdicts.get('ghost_lessons_available', 0)
+            ghost_total = ghost_avail + verdicts.get('ghost_lessons_none', 0)
+            print(f"    ghost memory: respawns with earlier lessons available : "
+                  f"{ghost_avail} of {ghost_total}")
 
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
             # Read these three together. "decisions at the cap" is the number
@@ -4886,6 +5029,21 @@ class Orchestrator:
               "text was degenerate from its first sentence.")
         return Synthesizer.DEGENERATE_ANSWER_MESSAGE
 
+    def _synthesis_problem_text(self):
+        """PATCH 32 (cont.). What the synthesizer is told the PROBLEM is: the
+        user's request (spec["raw_text"]), not the phaser's goal. Run 10's
+        goal said "12 gardens" where the request said "12 plots", and the
+        answer followed the goal. Used by BOTH synthesis paths (root
+        completion and terminate()'s partial synthesis). raw_text may end
+        in the phaser's "... [TRUNCATED]" suffix; it is passed as is. Falls
+        back to the goal only when there is no raw_text, and counts that."""
+        raw = (self.spec or {}).get("raw_text") or ""
+        if raw:
+            return raw
+        if self.synthesizer is not None:
+            self.synthesizer._record_trim("problem_fell_back_to_goal")
+        return (self.spec or {}).get("goal", "") or ""
+
     def _print_final_answer_report(self):
         """What the guards did to the text the user actually reads, and to
         the child results that text is built from.
@@ -4927,6 +5085,9 @@ class Orchestrator:
             ("not-completed sentence appended   ", trims.get("not_completed_appended", 0)),
             ("model's own not-completed list cut", trims.get("model_not_completed_cut", 0)),
             ("task IDs stripped from synthesis  ", trims.get("task_ids_stripped", 0)),
+            ("synthesis roll-ups omitted (children present)", trims.get("rollups_omitted", 0)),
+            ("synthesis problem fell back to goal         ",
+             trims.get("problem_fell_back_to_goal", 0)),
             ("task IDs stripped on the way out  ", verdicts.get("final_answer_task_ids_stripped", 0)),
             ("returned answer cut on the way out", verdicts.get("final_answer_cut", 0)),
             ("returned answer empty after cut   ",
@@ -5051,7 +5212,7 @@ class Orchestrator:
                 partial_results = []
 
             if partial_results:
-                goal_text = self.spec.get("goal", "") if self.spec else ""
+                goal_text = self._synthesis_problem_text()
                 try:
                     not_completed = self.synthesizer.collect_not_completed(
                         self.task_graph, set(self.abandoned_tasks), partial_results)
@@ -5086,6 +5247,7 @@ class Orchestrator:
         # them, and its answer carried no sign of it.
         if partial_synthesis or self.abandoned_tasks:
             best_result = self._with_partial_banner(best_result, is_successful, synthesized)
+        self._print_final_answer_figures(best_result)
         self._print_final_answer_report()
         return best_result
 
