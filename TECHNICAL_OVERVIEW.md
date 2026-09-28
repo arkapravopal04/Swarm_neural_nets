@@ -4,7 +4,7 @@ A single fine-tuned Qwen3-4B, driven as a colony. One user prompt enters in Engl
 one answer leaves in English. In between, the model plays every role — parser,
 decomposer, executor, verifier, critic, synthesizer — coordinated by a non-model
 orchestrator that owns all state, energy, and lifecycle decisions. Phase 1 (text
-between agents) is functional end to end on a single 16 GB T4.
+between agents) is functional end to end on free Kaggle GPUs (16 GB T4s).
 
 ## The run, end to end
 
@@ -30,10 +30,12 @@ between agents) is functional end to end on a single 16 GB T4.
 
 ## The agent cycle
 
-`think()` is raw latent continuation: the model is called directly with a persistent
-`past_key_values`, one token at a time, greedy, feeding its own last token back in. No
-generate() wrapper, no format pressure, no stop strings. Role-capped per cycle
-(decomposer 128, executor 256, verifier 128 tokens) against a hard lifetime ceiling of
+`think()` is free-form continuation: the model is called directly with a persistent
+`past_key_values`, one token at a time, nucleus-sampled (temperature 0.7, top-p 0.9,
+repetition penalty 1.15), feeding its own last token back in. No generate() wrapper, no
+format pressure, no stop strings. It is still token-level reasoning, not latent; see
+`LATENT_PHASE.md`. Role-capped per cycle (decomposer 64, executor 128, verifier 64
+tokens) against a hard lifetime ceiling of
 `MAX_TOTAL_THINK_TOKENS = 4096`.
 
 `decide()` is a separate, clean generation from a freshly-built prompt that commits to
@@ -90,19 +92,16 @@ Compliance cannot call `run_code` at all.
 | Component | Choice |
 |---|---|
 | Base model | Qwen3-4B, fp16, one shared instance |
-| Adaptation | QLoRA adapter (~50 MB) trained on the colony's own decision format |
+| Adaptation | LoRA adapter (r=16, ~47 MB, in `adapter/`) trained on the colony's own decision format |
 | Embeddings | `all-MiniLM-L6-v2` (384-d), one shared instance |
 | Vector store | FAISS `IndexIDMap(IndexFlatIP)` — ghosts on disk, successes in memory |
-| Compute | single Kaggle T4, 16 GB |
+| Compute | Kaggle T4s, 16 GB each |
 
 `main.py` constructs every expensive object exactly once and injects it downstream; nothing
 below it loads its own copy of a model.
 
 ## Known gaps
 
-- **`memory_state.py:30` is a live bug** — `self.embedding_dim = embedding_dima` raises
-  `NameError` on every `MemoryStore` construction. The entire ghost/success memory path is
-  unreachable until that typo is fixed.
 - `ColonyState.consolidate_idle_agents()` is a permanent no-op: nothing sets
   `status = "idle"` any more, so the MERGE relief valve never releases energy.
 - Sibling dependencies within one SPAWN batch aren't addressable — the task graph supports

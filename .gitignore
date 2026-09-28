@@ -1,18 +1,14 @@
-# Model outputs / artifacts (kept local; not published)
-fine_tune/
+# Local training scratch (the published adapter lives in adapter/, data in fine_tune/)
 fine_tuned_params_v1/
 fine_tuning.py
 
 # Research-only folders
 outreach/
-paper/
 
 # Local assistant state
 .claude/
 Claude outputs/
 
-# Tests: only force-added files are tracked (git add -f tests/<file>)
-tests/
 
 # Python caches
 __pycache__/
@@ -34,6 +30,7 @@ env/
 
 # Model weights and training checkpoints
 *.safetensors
+!adapter/adapter_model.safetensors
 *.bin
 *.pt
 *.pth

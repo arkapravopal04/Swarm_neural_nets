@@ -3,6 +3,12 @@
 *How Project Hive gets from "text between agents" to a colony that thinks and
 hands off in latent space, on one 16 GB T4, in two compute sessions.*
 
+> **Status (Sept 2026):** this is a dated plan from August. The audit items in section 1
+> have since been fixed or superseded: the `memory_state.py` typo is fixed, the README no
+> longer describes `think()` as latent, and `think()` now samples (temperature 0.7, top-p
+> 0.9) instead of taking the argmax. Line anchors below refer to the code as it was then.
+> The phases themselves are still the plan.
+
 ---
 
 ## The verdict first

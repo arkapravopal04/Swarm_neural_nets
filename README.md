@@ -1,8 +1,8 @@
 # Project Hive
 
-A multi-agent colony driven by one fine-tuned Qwen3-4B on a single 16 GB T4. One English prompt in, one English answer out. In between the model plays every role — parser, decomposer, executor, verifier, critic, synthesizer — while a non-model orchestrator owns all state, energy, and lifecycle decisions.
+A multi-agent colony driven by one LoRA-fine-tuned Qwen3-4B on free Kaggle GPUs (16 GB T4s). One English prompt in, one English answer out. In between the model plays every role — parser, decomposer, executor, verifier, critic, synthesizer — while a non-model orchestrator owns all state, energy, and lifecycle decisions.
 
-Agents reason in latent space before emitting tokens ([Coconut](https://arxiv.org/abs/2412.06769)), communicate over an event bus rather than chat, spend from a fixed energy budget, and read a persistent index of prior failures before starting. The decision format is learned via QLoRA, not prompted.
+Agents reason freely over a persistent KV cache before committing to an action, communicate over an event bus rather than chat, spend from a fixed energy budget, and read a persistent index of prior failures before starting. The decision format is learned by a LoRA adapter, not prompted. Reasoning is still in tokens; moving it into latent space ([Coconut](https://arxiv.org/abs/2412.06769), [LatentMAS](https://arxiv.org/abs/2511.20639)) is the next phase, see `LATENT_PHASE.md`.
 
 ## Run
 
@@ -12,7 +12,7 @@ HIVE_BUDGET_OVERRIDE=500 python main.py # skip the phaser's computed budget
 pytest tests/
 ```
 
-Requires `torch`, `transformers`, `peft`, `bitsandbytes`, `trl`, `sentence-transformers`, `faiss`. `hive_kaggle.ipynb` is the notebook driver. `main.py` builds the model, tokeniser, embedder, and adapter exactly once and injects them downstream — nothing below it loads its own copy.
+Dependencies are in `requirements.txt` (`torch`, `transformers`, `accelerate`, `peft`, `sentence-transformers`, `faiss-cpu`, `numpy`, `pandas`, `sympy`). The LoRA adapter is in [`adapter/`](adapter), so a fresh clone runs as is; the first run downloads Qwen3-4B from Hugging Face. `hive_kaggle.ipynb` is the notebook driver. `main.py` builds the model, tokeniser, embedder, and adapter exactly once and injects them downstream — nothing below it loads its own copy.
 
 ## Run sequence
 
@@ -30,7 +30,7 @@ domain_multiplier            # 1.0x General Discourse -> 2.0x Theoretical Mathem
 
 ## think() and decide()
 
-`think()` is raw latent continuation: the model is called directly against a persistent `past_key_values`, one token at a time, greedy, feeding its own last hidden state back in. No `generate()` wrapper, no format pressure, no stop strings. Capped per cycle by role (decomposer 128, executor 256, verifier 128) against a lifetime `MAX_TOTAL_THINK_TOKENS = 4096`.
+`think()` is free-form continuation: the model is called directly against a persistent `past_key_values`, one token at a time, nucleus-sampled (temperature 0.7, top-p 0.9, repetition penalty 1.15), feeding its own last token back in. No `generate()` wrapper, no format pressure, no stop strings. Capped per cycle by role (decomposer 64, executor 128, verifier 64) against a lifetime `MAX_TOTAL_THINK_TOKENS = 4096`.
 
 `decide()` is a separate generation from a freshly built prompt that commits to exactly one action: `SPAWN`, `TOOL`, `REPORT`, `DIE`, or another `THINK`. It parses `ACTION:` / `PAYLOAD:` with layered recovery — bare leading keyword, trailing-brace trimming, `ast.literal_eval` for single-quoted dicts — and retries up to 3x with sampling when output looks degenerate.
 
@@ -75,12 +75,16 @@ event_queue.py       Messenger — the agent mailbox
 tools.py             tool registry and subprocess sandbox
 text_utils.py        parsing and normalization helpers
 probes/              experiments gating the latent-passing phase
-tests/               pytest suite
+sims/                Monte Carlo evaluation of the energy-admission formula
+tests/               pytest suite (~700 tests)
+adapter/             the LoRA adapter (weights + config)
+fine_tune/           the 836 decision-format examples the adapter was trained on
+paper/               preprint and overview (LaTeX)
 ```
 
-Config lives at the top of `main.py`: `MODEL_NAME` (`Qwen/Qwen3-4B`), `ADAPTER_PATH` (~50 MB QLoRA adapter, 4-bit NF4), `EMBED_MODEL_NAME` (`all-MiniLM-L6-v2`, 384-d), `GHOST_PERSIST_PATH`.
+Config lives at the top of `main.py`: `MODEL_NAME` (`Qwen/Qwen3-4B`, fp16), `ADAPTER_PATH` (the ~47 MB LoRA adapter in `adapter/`, overridable with `HIVE_ADAPTER_PATH`), `EMBED_MODEL_NAME` (`all-MiniLM-L6-v2`, 384-d), `GHOST_PERSIST_PATH`.
 
-Deeper mechanics in `TECHNICAL_OVERVIEW.md`; the latent-communication design in `LATENT_PHASE.md`.
+Deeper mechanics in `TECHNICAL_OVERVIEW.md`; the latent-communication design in `LATENT_PHASE.md`; the write-up, including a catalogue of how a 4B model fails inside agent loops, in [`paper/hive_preprint.tex`](paper/hive_preprint.tex).
 
 ## Gaps
 
@@ -93,3 +97,7 @@ Energy is one flat currency; the two-currency design (compute + confidence-debt)
 Nothing checks whether a REPORT's specific claims are grounded in anything. Tier 3 sees the subtask, the goal and the output, and never the user's input or a prior result, so it judges form and topicality only; `ungrounded_telemetry` keys on log-line shape (`Label: value`, `key=number`, clock timestamps) and so reads straight past a fabricated quantity in prose. Run 5 shipped "Book A received the highest number of resolved votes (9,761)" from a figure one agent invented mid-degeneration. A numeral-grounding check against `orchestrator._grounding_for` (goal, raw text, the task's own description and requirements, and its prerequisites' results -- deliberately NOT the synthesizer's corpus, which includes every sibling result and so launders fabrication) is DEFERRED, not rejected: run 5's request contained zero numerals while 18 of 30 REPORTs asserted at least one, so the check would flag 100% and could not separate fabricated from derived. It needs a run where the user supplies data before a threshold means anything. PATCH 16 is the part that works without a corpus.
 
 Inter-agent communication is still text. `probes/` holds the three experiments gating the move to KV-cache passing: VRAM census (how many agents fit), think→decide cache bridge (skip re-tokenizing the prompt), and cache splice with RoPE offset (can agent B read agent A's state). Target is [LatentMAS](https://arxiv.org/abs/2511.20639).
+
+## License
+
+Apache 2.0, see [`LICENSE`](LICENSE). The adapter is a derivative of Qwen3-4B, which is also Apache 2.0.

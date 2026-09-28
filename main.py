@@ -53,7 +53,12 @@ os.environ.setdefault("HUGGINGFACE_HUB_DISABLE_UPDATE_CHECK", "1")
 MODEL_NAME = "Qwen/Qwen3-4B"
 LOCAL_MODEL_DIR = "/kaggle/working/qwen3-4b-local"
 
-ADAPTER_PATH = "/kaggle/input/datasets/arkapravopal/adapter-model-v1"
+# The LoRA adapter ships in the repo under adapter/. HIVE_ADAPTER_PATH
+# overrides it, e.g. to point at a Kaggle dataset input instead.
+ADAPTER_PATH = os.environ.get(
+    "HIVE_ADAPTER_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapter"),
+)
 
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 GHOST_PERSIST_PATH = "./hive_memory/ghosts"

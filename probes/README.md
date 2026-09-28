@@ -7,9 +7,9 @@ model directly and exit. Nothing here is part of a colony run.
 Run them in order. Each one's answer changes what the next one is worth doing.
 
 ```bash
-python probes/probe1_vram_census.py --adapter /kaggle/input/datasets/arkapravopal/adapter-model-v1 --test-offload
-python probes/probe2_think_decide_bridge.py --adapter /kaggle/input/datasets/arkapravopal/adapter-model-v1
-python probes/probe3_cache_splice.py --adapter /kaggle/input/datasets/arkapravopal/adapter-model-v1 --slice-last 64
+python probes/probe1_vram_census.py --adapter adapter --test-offload
+python probes/probe2_think_decide_bridge.py --adapter adapter
+python probes/probe3_cache_splice.py --adapter adapter --slice-last 64
 ```
 
 `--adapter` is optional on all three; without it you measure the base model.
