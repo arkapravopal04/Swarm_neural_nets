@@ -5,6 +5,10 @@ fine_tuning.py
 # Research-only folders
 outreach/
 
+# Reasoning Benchmark v2 curator bundle: answer keys + hold-out set must stay
+# private (EVALUATION_PROTOCOL.md). hive_grader.py reads it locally.
+reasoning_benchmark/
+
 # Local assistant state
 .claude/
 Claude outputs/
