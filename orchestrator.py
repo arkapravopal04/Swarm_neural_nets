@@ -4650,6 +4650,9 @@ class Orchestrator:
                 print(f"    accept : {accepts}")
                 print(f"    reject : {rejects}")
                 print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
+            # PATCH 34. "Caught" = a tier-3 reject; printed even at 0/0 so
+            # every run's log carries the line.
+            print(f"    {rejects} caught / {tier3_total} checked")
 
             print(chr(10) + "  SUCCESS CACHE (outcome-gated)")
             neg = {k[len("cache_write_negative_"):]: v for k, v in verdicts.items()
