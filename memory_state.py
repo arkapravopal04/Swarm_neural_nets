@@ -45,6 +45,7 @@ class SuccessLookup:
     negative_count: int = 0         # non-servable entries at/above threshold
     negative_outcomes: dict = field(default_factory=dict)  # outcome -> count
     cross_task_below_threshold: int = 0  # accepted, other task, under the cross-task bar
+    cross_task_blocked: list = field(default_factory=list)  # (score, donor_task_id)
 
 
 class MemoryStore:
@@ -144,6 +145,7 @@ class MemoryStore:
                 cross_task = task_id is not None and meta.get("task_id") != task_id
                 if cross_task and h["score"] < cross_task_threshold:
                     lookup.cross_task_below_threshold += 1
+                    lookup.cross_task_blocked.append((round(h["score"], 3), meta.get("task_id")))
                     continue
                 if lookup.hit is None:
                     lookup.hit, lookup.hit_score = meta, h["score"]
