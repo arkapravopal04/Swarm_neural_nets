@@ -586,14 +586,9 @@ class Orchestrator:
         every agent whose task is currently running.
         """
         available_roles = ["decomposer", "executor", "verifier"]
-        # A8 STEP 1 (temporary experiment -- REVERT TO ToolRegistry.list_tools()
-        # AFTERWARDS): tools disabled entirely to isolate whether TOOL is
-        # part of what's blocking subtask completion. With this and tier 3
-        # (see judge.decide() call below) both off, the only paths an agent
-        # has left are THINK -> REPORT -> tier 1/2 -- the maximum-isolation
-        # run. request_tool() now enforces this (not just the prompt text),
-        # so a TOOL action can't sneak through even if the model emits one.
-        available_tools = []
+        # Tools enabled: every tool in tools.TOOL_ALLOWLIST (run_code,
+        # safe_read_file, write_file, verify_math, query_dataframe).
+        available_tools = ToolRegistry.list_tools()
 
         for agent_id, live_agent in list(self.live_agents.items()):
             task_id = live_agent.task_id
@@ -3292,9 +3287,8 @@ class Orchestrator:
                 # A8 STEP 2, re-enabled: tier 1 now closes the empty-answer
                 # hole (see judge.fast_check), so a REPORT reaching
                 # deep_critique is no longer a bare heading/colon/placeholder
-                # by construction. Tools stay disabled (see
-                # _run_live_agents's available_tools) -- this is the clean
-                # tier-3 experiment: if deep_critique itself is still
+                # by construction. Tools are enabled again (see
+                # _run_live_agents's available_tools). Tier-3 note: if deep_critique itself is still
                 # blocking subtask completion, the tier3_accept/tier3_reject
                 # counters below will now actually populate and show it.
                 needs_deep_check=True,
@@ -3826,7 +3820,8 @@ class Orchestrator:
             blocked = getattr(lookup, "cross_task_below_threshold", 0)
             if blocked:
                 print(f"  [success-cache] {task_id}: {blocked} accepted entry(ies) "
-                      f"from other tasks below the cross-task threshold -- not served.")
+                      f"from other tasks below the cross-task threshold -- not served. "
+                      f"scores/donors={getattr(lookup, 'cross_task_blocked', [])}")
                 self.colony.record_verdict("cache_cross_task_below_threshold")
             if negatives:
                 print(f"  [success-cache] {task_id}: {negatives} failed outcome(s) on "
