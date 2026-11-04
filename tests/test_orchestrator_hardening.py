@@ -528,6 +528,8 @@ def _tool_orchestrator(agent, monkeypatch):
     orch.judge = None
     orch.live_agents = {agent.agent_id: agent}
     orch.messenger = Messenger()
+    orch.colony = ColonyState(initial_budget=1000, goal_embedding=None)
+    orch.task_energy_ceiling = lambda task_id=None: 10**9
     return orch, executed
 
 

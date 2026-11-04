@@ -182,6 +182,28 @@ def test_capped_decide_converts_think_to_report():
     assert agent.cap_coerced_last_run
 
 
+def _tool_capped(agent):
+    agent.node.tool_call_count = agent.MAX_TOOL_ATTEMPTS_PER_AGENT
+    agent.thought_process = "The density is 7.8 g/cm3 for steel."
+    return agent
+
+
+def test_tool_after_tool_cap_is_forced_to_report_not_run():
+    agent = _tool_capped(_with_reply(_agent(), 'ACTION: TOOL\nPAYLOAD: {"tool_name": "run_code", "args": {}}'))
+    ran = []
+    agent.request_tool = ran.append
+    action, payload = agent.decide(available_tools=["run_code"], requirements=[])
+    assert action == "REPORT" and "7.8" in payload
+    assert agent.fail_reason is None and not ran
+
+
+def test_tool_after_tool_cap_without_payload_is_not_a_format_retry():
+    agent = _tool_capped(_with_reply(_agent(), "ACTION: TOOL\nI would run some code here."))
+    action, _ = agent.decide(available_tools=["run_code"], requirements=[])
+    assert action == "REPORT"
+    assert agent.fail_reason is None
+
+
 def test_capped_decide_converts_parse_failure_and_clears_fail_reason():
     agent = _capped(_with_reply(_agent(), "ACTION: TOOL\nI would run some code here."))
     action, _ = agent.decide(available_tools=[], requirements=[])
@@ -626,6 +648,68 @@ def _cap_ledger(orch, capsys):
             for label, _, value in (l.partition(":") for l in out.splitlines())
             if label.strip() in ("agents that reached it", "decisions at the cap",
                                  "model kept to the menu", "actions forced by the cap")}
+
+
+def test_tool_cap_fallback_fails_the_agent_and_is_counted(capsys):
+    """No run reaches this path (decide() catches a TOOL past the cap
+    first), so this test is what keeps the fallback working."""
+    orch, agent = _capped_executor_in_colony("")
+    agent.node.tool_call_count = agent.MAX_TOOL_ATTEMPTS_PER_AGENT
+    agent.request_tool({"tool_name": "run_code", "args": {"code_string": "print(1)"}})
+
+    events = orch.messenger.drain()
+    assert [e.type for e in events] == ["failure_request"]
+    assert events[0].payload["tool_cap_fallback"] is True
+    assert "[TOOL CAP FALLBACK HIT] agent=a-1 task=t-1" in capsys.readouterr().out
+
+    orch.handle_failure(events[0])
+    assert "a-1" not in orch.live_agents
+    assert orch.colony.verdict_counts.get("tool_cap_fallback_hit") == 1
+    capsys.readouterr()
+    orch._print_energy_report()
+    assert "fallback hits (expect 0) : 1" in capsys.readouterr().out
+
+
+def test_tool_round_that_would_cross_the_ceiling_is_not_run_and_forces_report(capsys):
+    orch, agent = _capped_executor_in_colony("")
+    agent.non_terminal_cycles = 0
+    agent.thought_process = "The density is 7.8 g/cm3 for steel."
+    ceiling = orch.task_energy_ceiling("t-1")
+    orch.colony.task_energy_spent["t-1"] = ceiling - orch.TOOL_ROUND_THINK_COST + 1
+
+    ran = []
+    import orchestrator as orch_mod
+    real_execute = orch_mod.ToolRegistry.execute
+    orch_mod.ToolRegistry.execute = staticmethod(lambda *a, **k: ran.append(a) or {})
+    try:
+        orch.handle_tool_request(Event(type="tool_request", from_agent="a-1", payload={
+            "agent_id": "a-1", "tool_name": "run_code", "args": {"code_string": "print(1)"}}))
+    finally:
+        orch_mod.ToolRegistry.execute = real_execute
+
+    assert not ran
+    assert orch.colony.verdict_counts.get("tool_skipped_for_ceiling") == 1
+    orch.messenger.drain()
+    action = agent.run(available_tools=["run_code"])
+    assert action == "REPORT"
+    assert "7.8" in orch.messenger.drain()[0].payload["result"]
+    assert agent.forced_report_reason is None
+
+
+def test_ceiling_overshoot_is_logged_once_and_counted(capsys):
+    orch, _ = _capped_executor_in_colony("")
+    ceiling = orch.task_energy_ceiling("t-1")
+    orch.colony.task_energy_spent["t-1"] = ceiling + 5
+    capsys.readouterr()
+
+    orch._task_energy_overrun("t-1")
+    orch._task_energy_overrun("t-1")
+
+    out = capsys.readouterr().out
+    assert out.count(f"[CEILING OVERSHOOT] task=t-1 spent={ceiling + 5} ceiling={ceiling}") == 1
+    assert orch.colony.verdict_counts.get("ceiling_overshoot") == 1
+    orch._print_energy_report()
+    assert "tasks that went over it        : 1" in capsys.readouterr().out
 
 
 def test_a_compliant_capped_decision_is_counted_even_though_nothing_was_forced(capsys):

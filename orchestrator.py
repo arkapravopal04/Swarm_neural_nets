@@ -315,6 +315,8 @@ class Orchestrator:
         # result is kept -- it was produced and judged good -- but the
         # overrun is recorded so the ledger stays honest about it.
         self.completed_over_ceiling: Dict[str, tuple] = {}
+        # Tasks whose ceiling overshoot has already been logged once.
+        self.ceiling_overshoot_logged: set = set()
 
         # Child tasks that never got an agent because spawn_agent had no
         # energy for them -- see _close_unstartable_child.
@@ -3603,6 +3605,8 @@ class Orchestrator:
         role = payload.get("role", "worker")
         parent_id = payload.get("parent_id")
         verdict = payload.get("judge_verdict")
+        if payload.get("tool_cap_fallback"):
+            self.colony.record_verdict("tool_cap_fallback_hit")
 
         die_text = payload.get("result", "") or ""
         # A DIE's text becomes the dead agent's fail_reason (Agent.die), and
@@ -4156,6 +4160,12 @@ class Orchestrator:
             return None
         spent = self.colony.task_energy_spent.get(task_id, 0)
         ceiling = self.task_energy_ceiling(task_id)
+        # Once per task: spend that got past the line before a check saw it
+        # (checks run after a round is charged). Counted for the summary.
+        if spent > ceiling and task_id not in self.ceiling_overshoot_logged:
+            self.ceiling_overshoot_logged.add(task_id)
+            self.colony.record_verdict("ceiling_overshoot")
+            print(f"  [CEILING OVERSHOOT] task={task_id} spent={spent} ceiling={ceiling}")
         return (spent, ceiling) if spent >= ceiling else None
 
     def _enforce_task_energy_ceiling(self, agent_id: str,
@@ -4396,6 +4406,28 @@ class Orchestrator:
             )
         return False
 
+    # A tool round's cost is the think round that reads its result, billed
+    # after the tool has already run. About 8 energy per round.
+    TOOL_ROUND_THINK_COST = 8
+
+    def _tool_round_would_cross_ceiling(self, agent_id: str, tool_name) -> bool:
+        """True (and the agent set to REPORT on its next run) if one more
+        think round after this tool would take the task past its ceiling."""
+        live_agent = self.live_agents.get(agent_id)
+        task_id = getattr(live_agent, "task_id", None)
+        if live_agent is None or not task_id:
+            return False
+        spent = self.colony.task_energy_spent.get(task_id, 0)
+        ceiling = self.task_energy_ceiling(task_id)
+        if spent + self.TOOL_ROUND_THINK_COST <= ceiling:
+            return False
+        print(f"  [energy-ceiling PRE-TOOL] task={task_id} spent={spent} "
+              f"ceiling={ceiling} -- one more think round (~{self.TOOL_ROUND_THINK_COST}) "
+              f"would cross it; not running '{tool_name}', agent {agent_id} must REPORT.")
+        self.colony.record_verdict("tool_skipped_for_ceiling")
+        live_agent.forced_report_reason = "Task energy ceiling reached"
+        return True
+
     def handle_tool_request(self, event: Event):
         """Handles external tool execution requests from agents."""
         payload = event.payload
@@ -4405,6 +4437,8 @@ class Orchestrator:
         domain = self.spec.get("domain", "General Discourse") if self.spec else "General Discourse"
 
         if not self._tool_request_allowed(event):
+            return
+        if self._tool_round_would_cross_ceiling(agent_id, tool_name):
             return
 
         print(f"Executing tool '{tool_name}' for agent {agent_id}...")
@@ -4634,6 +4668,10 @@ class Orchestrator:
                 print("    [OK] ledger reconciles with the remaining budget.")
 
             print(chr(10) + "  TIER-3 VERDICTS (deep_critique accept/reject)")
+            if header == "final":
+                # Catch any overshoot no in-run check happened to see.
+                for task_id in list(self.colony.task_energy_spent):
+                    self._task_energy_overrun(task_id)
             verdicts = dict(getattr(self.colony, "verdict_counts", {}) or {})
             accepts = verdicts.get("tier3_accept", 0)
             rejects = verdicts.get("tier3_reject", 0)
@@ -4668,6 +4706,12 @@ class Orchestrator:
             ghost_total = ghost_avail + verdicts.get('ghost_lessons_none', 0)
             print(f"    ghost memory: respawns with earlier lessons available : "
                   f"{ghost_avail} of {ghost_total}")
+
+            # decide() turns a TOOL past the cap into a REPORT before it can
+            # reach request_tool, so this should read 0. Anything above 0
+            # means that early check is broken.
+            print(chr(10) + "  TOOL CAP (Agent.MAX_TOOL_ATTEMPTS_PER_AGENT)")
+            print(f"    fallback hits (expect 0) : {verdicts.get('tool_cap_fallback_hit', 0)}")
 
             print(chr(10) + "  CYCLE CAP (Agent.MAX_NON_TERMINAL_CYCLES)")
             # Read these three together. "decisions at the cap" is the number
@@ -4899,6 +4943,8 @@ class Orchestrator:
             at_respawn = verdicts.get("energy_ceiling_at_respawn", 0)
             print(f"    stopped mid-agent (per cycle)  : {midagent}")
             print(f"    stopped at a respawn decision  : {at_respawn}")
+            print(f"    tool rounds skipped (pre-check): {verdicts.get('tool_skipped_for_ceiling', 0)}")
+            print(f"    tasks that went over it        : {verdicts.get('ceiling_overshoot', 0)}")
 
             # What admission turned away. All zero on a run whose budget
             # covered everything it planned.

@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from colony_state import AgentNode
+from colony_state import AgentNode, ColonyState
 from event_queue import Event
 from judge import Judge
 from orchestrator import Orchestrator
@@ -80,6 +80,9 @@ def _make_orchestrator(agent, judge=None):
     orch.live_agents = {agent.agent_id: agent}
     orch.messenger = _FakeMessenger()
     orch.messenger.push_event = lambda *a, **k: None
+    # The pre-tool energy check: an empty colony and a ceiling it never reaches.
+    orch.colony = ColonyState(initial_budget=1000, goal_embedding=None)
+    orch.task_energy_ceiling = lambda task_id=None: 10**9
     return orch
 
 
@@ -282,6 +285,8 @@ def test_history_window_is_bounded_so_old_calls_can_be_retried():
     iterative agent must be able to re-run a check it ran long ago (re-running
     a test after editing a file it reads, say)."""
     agent, messenger = _make_agent()
+    # The window (5) is wider than the tool cap (4); lift the cap to test it.
+    agent.MAX_TOOL_ATTEMPTS_PER_AGENT = 15
 
     _call(agent, "print(0)")
     for i in range(1, agent.TOOL_CALL_HISTORY + 1):
@@ -743,6 +748,18 @@ def test_orchestrator_logs_and_echoes_the_canonical_name():
     assert "__run_code__" in agent.last_tool_result  # the correction note
 
 
+def test_last_capped_call_hands_the_agent_the_cap_message():
+    agent, _ = _make_agent()
+    for i in range(agent.MAX_TOOL_ATTEMPTS_PER_AGENT):
+        _call(agent, f"print({i})")
+        agent.receive_tool_result("run_code", f"{i}", success=True)
+
+    assert agent.tool_budget_exhausted
+    assert agent.fail_reason == agent.TOOL_CAP_MESSAGE
+    prompt = agent._build_prompt(available_tools=["run_code"], requirements=[])
+    assert agent.TOOL_CAP_MESSAGE in prompt and "ACTION: TOOL" not in prompt
+
+
 def test_three_failing_calls_through_the_orchestrator_open_the_circuit():
     """The end-to-end shape of the loop being broken: three real failing
     run_code calls, then TOOL refused -- against 15 before this change."""
@@ -766,6 +783,8 @@ def test_the_original_seven_call_loop_is_stopped_on_call_two():
     """The reported failure, replayed: the same call submitted over and over
     with cosmetic whitespace differences and two spellings of the tool name."""
     agent, messenger = _make_agent()
+    # Seven calls replayed against the duplicate window, not the tool cap.
+    agent.MAX_TOOL_ATTEMPTS_PER_AGENT = 15
     orch = _make_orchestrator(agent, judge=None)
 
     variants = [

@@ -440,6 +440,9 @@ class Agent:
         # Set by decide() when the cap forced a different action than the
         # model chose; the orchestrator reads it after run() to tally it.
         self.cap_coerced_last_run = False
+        # Set by the orchestrator when it refuses a tool round (energy
+        # ceiling): the next run() goes straight to a forced REPORT/DIE.
+        self.forced_report_reason = None
         # actions
         self.action_tokens = ["THINK", "SPAWN", "TOOL", "REPORT", "DIE"]
         # Set by run() to whatever available_tools it was actually called
@@ -1058,6 +1061,11 @@ class Agent:
                 "(TOOL is closed to you after repeated tool failures -- do "
                 "not attempt it).\n"
             )
+        elif self.tool_budget_exhausted:
+            actions_str = (
+                "Real actions that exist for your role: THINK, REPORT, DIE. "
+                f"{self.TOOL_CAP_MESSAGE}\n"
+            )
         elif self.disabled_tool_closed:
             actions_str = (
                 "Real actions that exist for your role: THINK, REPORT, DIE "
@@ -1189,6 +1197,11 @@ class Agent:
                 "- TOOL   — UNAVAILABLE. Your last "
                 f"{self.MAX_CONSECUTIVE_TOOL_FAILURES} tool calls all failed; "
                 "further TOOL actions are refused. Do not attempt one.\n"
+            )
+            tool_format_line = ""
+        elif self.tool_budget_exhausted:
+            tool_action_line = (
+                f"- TOOL   — UNAVAILABLE. {self.TOOL_CAP_MESSAGE}\n"
             )
             tool_format_line = ""
         elif self.disabled_tool_closed:
@@ -1684,6 +1697,15 @@ Your next action:"""
                         f"failure)."
                     )
 
+        # Past the tool cap a TOOL (from habit, or copied from earlier
+        # context) is turned into a REPORT here, before the payload parser:
+        # it never runs, and never becomes a "no PAYLOAD" format error that
+        # sends the agent round a retry.
+        if action == "TOOL" and self.tool_budget_exhausted:
+            return self._coerce_final_action(action, "", forced_by=(
+                f"Tool limit reached ({self.node.tool_call_count}/"
+                f"{self.MAX_TOOL_ATTEMPTS_PER_AGENT} tool calls)"))
+
         payload = ""
         payload_match = _payload_match_for(generated_text, action_match)
 
@@ -1860,7 +1882,7 @@ Your next action:"""
             return any(has_task(sub) for sub in subtasks)
         return "role" in payload and has_task(payload)
 
-    def _coerce_final_action(self, action, payload):
+    def _coerce_final_action(self, action, payload, forced_by=None):
         """
         Cycle cap reached but decide() still produced an action outside
         final_actions (or a parse failure, which lands on THINK above).
@@ -1891,6 +1913,13 @@ Your next action:"""
         else:
             text = ""
         forced = "REPORT" if text else "DIE"
+        if forced_by:
+            # A TOOL refused for a reason other than the cycle cap (tool
+            # limit, energy ceiling): same REPORT-what-you-have outcome.
+            print(f"  [TOOL NOT RUN] agent={self.agent_id} -- {forced_by}; forcing {forced}.")
+            if text:
+                return "REPORT", _dedupe_repeated_sentences(trim_closer_tail(text), max_chars=2000)
+            return "DIE", f"{forced_by} with no usable result to report."
         print(
             f"  [decide() CYCLE CAP] agent={self.agent_id} role={self.role} "
             f"cycles={self.non_terminal_cycles} menu={self.final_actions} -- "
@@ -1963,7 +1992,11 @@ Your next action:"""
 
         self.awaiting = "children"
 
-    MAX_TOOL_ATTEMPTS_PER_AGENT = 15
+    # Hard per-agent tool budget. Once spent, TOOL leaves the prompt menu
+    # (see tool_budget_exhausted) and the agent must REPORT or DIE.
+    MAX_TOOL_ATTEMPTS_PER_AGENT = 4
+    # Short on purpose: it lands in the next think round as well as decide().
+    TOOL_CAP_MESSAGE = "Tool limit reached. REPORT your result now using what you have."
     # How many recent tool-call signatures to remember for duplicate
     # detection. Long enough to catch an A -> B -> A alternation, short
     # enough that a genuinely iterative agent (edit, run, edit, run) is
@@ -1971,8 +2004,8 @@ Your next action:"""
     TOOL_CALL_HISTORY = 5
     # Consecutive error-returning tool calls tolerated before TOOL is
     # refused outright. Deliberately far below MAX_TOOL_ATTEMPTS_PER_AGENT:
-    # a call that keeps failing is not converging, and letting it run to 15
-    # just burns energy producing the same SyntaxError fifteen times.
+    # a call that keeps failing is not converging, and letting it run to the cap
+    # just burns energy producing the same SyntaxError over and over.
     MAX_CONSECUTIVE_TOOL_FAILURES = 3
     # Blocked-because-tools-are-disabled-this-run calls tolerated before TOOL
     # is refused outright. This is not a failing call -- it's a call that
@@ -2091,6 +2124,11 @@ Your next action:"""
         """
         return self.disabled_tool_attempts >= self.MAX_DISABLED_TOOL_ATTEMPTS
 
+    @property
+    def tool_budget_exhausted(self):
+        """True once this agent has used all MAX_TOOL_ATTEMPTS_PER_AGENT tool calls."""
+        return getattr(self.node, "tool_call_count", 0) >= self.MAX_TOOL_ATTEMPTS_PER_AGENT
+
     def _tools_blocked(self, available_tools=None):
         """True when no TOOL call this agent makes can possibly succeed.
 
@@ -2117,7 +2155,7 @@ Your next action:"""
         calls fall back to), `[]` means "explicitly nothing". Only the
         latter blocks.
         """
-        if self.tool_circuit_open or self.disabled_tool_closed:
+        if self.tool_circuit_open or self.disabled_tool_closed or self.tool_budget_exhausted:
             return True
         if available_tools is None:
             available_tools = self._run_available_tools
@@ -2132,6 +2170,12 @@ Your next action:"""
         )
 
     def _push_tool_budget_failure(self):
+        # Fallback only: decide() already turns a TOOL past the cap into a
+        # REPORT, so reaching this means that check is broken. Failing the
+        # agent is safer than inventing a result.
+        print(f"  [TOOL CAP FALLBACK HIT] agent={self.agent_id} task={self.task_id} "
+              f"tool_calls={self.node.tool_call_count}/{self.MAX_TOOL_ATTEMPTS_PER_AGENT} "
+              f"-- the early tool-cap check in decide() did not catch this; failing the agent.")
         event = Event(type="failure_request", from_agent=self.agent_id)
         event.payload.update({
             "agent_id": self.agent_id,
@@ -2139,6 +2183,8 @@ Your next action:"""
             "task_id": self.task_id,
             "role": self.role,
             "result": str(self.fail_reason),
+            # Counted as tool_cap_fallback_hit in the end-of-run summary.
+            "tool_cap_fallback": True,
         })
         self.message.push(event)
 
@@ -2157,7 +2203,7 @@ Your next action:"""
         # at all -- so it costs the agent nothing toward
         # MAX_TOOL_ATTEMPTS_PER_AGENT. Closes TOOL itself after
         # MAX_DISABLED_TOOL_ATTEMPTS identical-in-kind blocks instead of
-        # letting the agent grind all the way to the 15-call ceiling
+        # letting the agent grind all the way to the per-agent tool cap
         # re-discovering the same "no tools available" fact each time.
         if self._run_available_tools is not None and tool_name not in self._run_available_tools:
             self.disabled_tool_attempts += 1
@@ -2329,6 +2375,13 @@ Your next action:"""
             self.recent_tool_error_text.clear()
             self.fail_reason = None
 
+        if self.tool_budget_exhausted:
+            self.fail_reason = (f"{self.fail_reason}\n{self.TOOL_CAP_MESSAGE}"
+                                if self.fail_reason else self.TOOL_CAP_MESSAGE)
+            print(f"  [TOOL CAP REACHED] agent={self.agent_id} used "
+                  f"{self.node.tool_call_count}/{self.MAX_TOOL_ATTEMPTS_PER_AGENT} "
+                  f"tool calls -- {self.TOOL_CAP_MESSAGE}")
+
     def run(self, available_roles=None, available_tools=None, requirements=None):
         """The core heartbeat coordinator for a single execution cycle."""
         # Record what this cycle was actually told is available so
@@ -2339,6 +2392,14 @@ Your next action:"""
         self._run_available_tools = available_tools
 
         self.cap_coerced_last_run = False
+        if self.forced_report_reason:
+            # No think(): generating would spend the very round the
+            # orchestrator refused the tool to save.
+            reason, self.forced_report_reason = self.forced_report_reason, None
+            action, payload = self._coerce_final_action("TOOL", "", forced_by=reason)
+            self.execute(action, payload)
+            return action
+
         if self.final_only:
             # No think() once the cap is hit (or SPAWN is closed): its
             # generation is the bulk of a tick's think_tick cost, and it can
