@@ -915,12 +915,14 @@ class Agent:
             )
             if self.generation == 0:
                 tier_rule = (
-                    "You are the ROOT decomposer (generation 0). SPAWN ONLY "
-                    "\"decomposer\" children here, one per large independent "
-                    "chunk of the problem -- do NOT spawn "
-                    "\"executor\" children directly yourself. Each decomposer "
-                    "child you create will handle breaking its chunk down "
-                    "further into small, concrete pieces of work.\n"
+                    "You are the ROOT decomposer (generation 0). SPAWN one "
+                    "child per independent part of the problem. Give a part "
+                    "the role \"executor\" when one agent can answer it "
+                    "directly (one calculation, one decision, one schedule). "
+                    "Give it the role \"decomposer\" only when that part is "
+                    "itself several separate pieces of work; a decomposer "
+                    "child breaks ONLY its own part down, never the whole "
+                    "request again.\n"
                     "STAGE your children as a real dependency graph, not one "
                     "flat independent batch and not one single linear chain. "
                     "EVERY child you list MUST have an explicit "
