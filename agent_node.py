@@ -535,15 +535,30 @@ class Agent:
             if len(task) > 70:
                 task = task[:67] + "..."
             label = f"{c['label']} " if c.get("label") else ""
-            line = f'- {label}"{task}": {c.get("status")}'
+            reused = " (reused from elsewhere in the colony)" if c.get("reused") else ""
+            line = f'- {label}"{task}"{reused}: {c.get("status")}'
             if c.get("excerpt"):
                 line += f" -- {c['excerpt']}"
             lines.append(line)
+        # PATCH 35. A decomposer that SPAWNs again (a second batch, or a
+        # respawned agent on the same task) re-planned the whole task and
+        # re-issued finished subtasks. The orchestrator now links such a
+        # repeat to the existing task instead of spawning it; this line
+        # tells the planner up front so the batch covers only the gaps.
+        covered = ""
+        if any(c.get("status") == "completed" for c in children):
+            covered = (
+                "\n[If you SPAWN again, SPAWN only the parts of your task that "
+                "no completed subtask above already covers. A completed "
+                "subtask is not redone: a repeat of it is linked to the "
+                "existing result instead of being spawned.]"
+            )
         return (
             "[YOUR SUBTASKS -- their status as the colony recorded it. This is "
             "a record, not your notes: only a subtask marked completed "
             "produced a result you can report.]\n"
             + "\n".join(lines)
+            + covered
             + "\n[END OF YOUR SUBTASKS]\n"
         )
 

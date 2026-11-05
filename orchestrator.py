@@ -148,6 +148,15 @@ GOAL_DRIFT_GATE_MIN_SAMPLES = 6
 # run's own outcomes agree.
 GOAL_DRIFT_GATE_ACTS = False
 
+# PATCH 35. Spawn-time duplicate check. A subtask whose description embeds at
+# or above this cosine to a task that is live or completed is not spawned
+# again: that task becomes its dependency instead. Deliberately high --
+# siblings from one decomposition routinely sit in the 0.6-0.8 band and are
+# different work; a duplicate is the same instruction reworded. Normalised
+# text equality counts as a match whatever the cosine (and is the only test
+# when there is no embedding model).
+SPAWN_DEDUP_COSINE = 0.92
+
 
 def _cosine(a, b) -> Optional[float]:
     """
@@ -310,6 +319,19 @@ class Orchestrator:
         # result's cause line: the attempt cap, the energy ceiling, or no
         # energy to respawn.
         self.abandon_reasons: Dict[str, str] = {}
+
+        # PATCH 35. spawner TASK id -> task ids it asked for that already
+        # existed elsewhere in the colony (live or completed), linked in
+        # place of spawning a duplicate. Keyed by task, not agent, so a
+        # respawned decomposer on the same task inherits them the way it
+        # inherits its direct children. Read by _open_child_task_ids (wait
+        # on a live one), the YOUR SUBTASKS rows and the completed-child
+        # predicate; _notify_borrowers delivers a live one's result when it
+        # closes.
+        self.borrowed_tasks: Dict[str, List[str]] = {}
+        # Reused-task count of the SPAWN being handled, read by
+        # _release_spawner_if_nothing_started right after it.
+        self._last_spawn_reused = 0
         # task_id -> (spent, ceiling) for a task whose REPORT was promoted
         # after its agents had already crossed the energy ceiling. The
         # result is kept -- it was produced and judged good -- but the
@@ -1599,6 +1621,7 @@ class Orchestrator:
         self._release_dependents(task_node)
         self._thread_results_to_unblocked_dependents(task_node)
         self._drain_pending_overflow(parent_id)
+        self._notify_borrowers(task_id, result)
         if parent_id:
             self.messenger.push_event(
                 "parent_notification",
@@ -2407,6 +2430,170 @@ class Orchestrator:
         print(f"      shared={divergence['shared'] or 'none'}"
               + (f"  largest-figure ratio={ratio:.1f}x" if ratio else ""))
 
+    # ------------------------------------------------------------------
+    # PATCH 35. Duplicate subtasks, removed at spawn time.
+    # ------------------------------------------------------------------
+    def _task_waits_on(self, start_id: str, target_id: str) -> bool:
+        """True if open task `start_id` cannot close before `target_id` does:
+        a path over open dependencies, open direct children and open
+        borrowed tasks. Linking a spawner to such a task would deadlock it
+        (the spawner waits on the task, the task waits on the spawner)."""
+        seen = set()
+        stack = [start_id]
+        while stack:
+            tid = stack.pop()
+            if tid == target_id:
+                return True
+            if tid in seen:
+                continue
+            seen.add(tid)
+            node = self.task_graph.tasks.get(tid)
+            if node is None or node.status not in (0, 1):
+                continue
+            nxt = list(node.dependencies)
+            nxt += [c.task_id for c in self.task_graph.direct_children(tid)]
+            nxt += self.borrowed_tasks.get(tid, [])
+            for n in nxt:
+                n_node = self.task_graph.tasks.get(n)
+                if n_node is not None and n_node.status in (0, 1):
+                    stack.append(n)
+        return False
+
+    def _ancestor_task_ids(self, task_id: Optional[str]) -> set:
+        """task_id and every task above it by parent_task_id."""
+        out = set()
+        while task_id and task_id not in out:
+            out.add(task_id)
+            node = self.task_graph.tasks.get(task_id)
+            task_id = node.parent_task_id if node is not None else None
+        return out
+
+    def _subtask_matches(self, desc_a: str, emb_a, desc_b: str, emb_b) -> Optional[float]:
+        """The match score of two subtask descriptions, or None if they are
+        not the same work: 1.0 on normalised-text equality, else the cosine
+        when it clears SPAWN_DEDUP_COSINE."""
+        if not desc_a or not desc_b:
+            return None
+        if (self._normalize_for_exemplar_match(desc_a)
+                == self._normalize_for_exemplar_match(desc_b)):
+            return 1.0
+        cos = _cosine(emb_a, emb_b)
+        if cos is not None and cos >= SPAWN_DEDUP_COSINE:
+            return cos
+        return None
+
+    def _find_duplicate_task(self, description: str, embedding,
+                             spawner_task_id: Optional[str]) -> Optional[tuple]:
+        """The live (status 0/1) or completed (2) task this subtask
+        duplicates, as (task_id, score), or None. Completed matches win over
+        live ones, then the higher score. Never the spawner's own task, an
+        ancestor of it or the root, and never a live task that is itself
+        waiting on the spawner -- any of those would deadlock."""
+        excluded = self._ancestor_task_ids(spawner_task_id)
+        if self.root_task_id:
+            excluded.add(self.root_task_id)
+        best = None
+        for node in list(self.task_graph.tasks.values()):
+            if node.task_id in excluded or node.status not in (0, 1, 2):
+                continue
+            score = self._subtask_matches(description, embedding,
+                                          node.description, node.description_embedding)
+            if score is None:
+                continue
+            if (node.status != 2 and spawner_task_id
+                    and self._task_waits_on(node.task_id, spawner_task_id)):
+                continue
+            key = (node.status == 2, score)
+            if best is None or key > best[0]:
+                best = (key, node.task_id, score)
+        return (best[1], best[2]) if best else None
+
+    def _reuse_existing_task(self, parent_id: Optional[str],
+                             spawner_task_id: Optional[str], match_id: str):
+        """Link `match_id` to the spawner in place of a new subtask. A task
+        that is not already one of the spawner's direct children is recorded
+        as borrowed (waited on while open, listed under YOUR SUBTASKS). A
+        completed one's result is delivered now through the ordinary
+        parent_notification path."""
+        match = self.task_graph.tasks.get(match_id)
+        if match is None:
+            return
+        if spawner_task_id and match.parent_task_id != spawner_task_id:
+            borrowed = self.borrowed_tasks.setdefault(spawner_task_id, [])
+            if match_id not in borrowed:
+                borrowed.append(match_id)
+        parent_node = self.colony.get_agent(parent_id) if parent_id else None
+        if parent_node is not None:
+            # A linked subtask counts as "has children" for final_actions: a
+            # decomposer whose whole batch was reused finishes by REPORTing,
+            # not by SPAWNing the same batch again.
+            parent_node.has_spawned = True
+        if match.status == 2 and parent_id:
+            self.messenger.push_event(
+                "parent_notification",
+                "orchestrator",
+                {"parent_id": parent_id, "child_id": match_id,
+                 "task_id": match_id, "result": match.result},
+            )
+
+    def _dedupe_spawn_batch(self, parent_id: Optional[str], prepared: list,
+                            label_to_id: dict) -> tuple:
+        """Drop every entry of a prepared SPAWN batch that duplicates a live
+        or completed task. Each dropped entry's labels are re-pointed at the
+        task it matched, so a sibling that depended on it depends on that
+        task instead.
+
+        Returns (kept_prepared, reused_ids): reused_ids are existing task ids
+        a kept sibling may legitimately depend on."""
+        spawner = self.colony.get_agent(parent_id) if parent_id else None
+        spawner_task_id = getattr(spawner, "task_id", None)
+        kept = []
+        reused_ids = set()
+        for sub, description, task_id in prepared:
+            embedding = self._gate_description_embeddings.get(task_id)
+            if embedding is None and self.embed_model is not None:
+                embedding = self._embed_description(description)
+                if embedding is not None:
+                    self._gate_description_embeddings[task_id] = embedding
+
+            found = self._find_duplicate_task(description, embedding, spawner_task_id)
+            if found is None:
+                kept.append((sub, description, task_id))
+                continue
+
+            match_id, score = found
+            match_node = self.task_graph.tasks[match_id]
+            where = "completed" if match_node.status == 2 else "live"
+            for key, val in list(label_to_id.items()):
+                if val == task_id:
+                    label_to_id[key] = match_id
+            self._gate_description_embeddings.pop(task_id, None)
+            reused_ids.add(match_id)
+            self._reuse_existing_task(parent_id, spawner_task_id, match_id)
+            self.colony.record_verdict(f"spawn_dedup_{where}")
+            print(f"  [spawn-dedup] {parent_id}: subtask \"{description[:60]}\" "
+                  f"duplicates {where} task {match_id} "
+                  f"(\"{match_node.description[:60]}\", score {score:.2f}) -- "
+                  f"linked as a dependency, not spawned.")
+        return kept, reused_ids
+
+    def _notify_borrowers(self, task_id: str, result) -> None:
+        """A borrowed task closed: hand its result to every spawner that
+        linked it, the same way a direct child's result reaches its parent,
+        so a decomposer waiting on it resumes."""
+        for spawner_task_id, ids in self.borrowed_tasks.items():
+            if task_id not in ids:
+                continue
+            spawner_node = self.task_graph.tasks.get(spawner_task_id)
+            borrower = getattr(spawner_node, "agent_id", None)
+            if borrower and borrower in self.live_agents:
+                self.messenger.push_event(
+                    "parent_notification",
+                    "orchestrator",
+                    {"parent_id": borrower, "child_id": task_id,
+                     "task_id": task_id, "result": result},
+                )
+
     def _reject_spawn_from_non_decomposer(self, event: Event) -> bool:
         """
         Returns True if this SPAWN may proceed, False if it was rejected and
@@ -2478,6 +2665,29 @@ class Orchestrator:
         tally = self._direct_child_tally(parent_task_id)
         has_completed_child = self._has_completed_direct_child(parent_task_id)
         was_capped = getattr(live_parent, "cycles_capped", False)
+
+        # PATCH 35. Nothing new started because the batch duplicated
+        # subtasks that are already completed: their results are linked to
+        # this task and on their way through parent_notification. Not a
+        # failed SPAWN -- hand it back to REPORT (or SPAWN only what is
+        # still uncovered).
+        if self._last_spawn_reused and has_completed_child and not out_of_energy:
+            print(f"  [handle_spawn] {parent_id}'s SPAWN matched only "
+                  f"completed subtasks -- results linked, releasing it to "
+                  f"REPORT instead of re-running them.")
+            live_parent.fail_reason = (
+                "Every subtask you requested is already completed in the "
+                "colony; those results are now yours and listed under YOUR "
+                "SUBTASKS. Do not SPAWN them again. REPORT what they "
+                "produced, or SPAWN only the parts of your task that none "
+                "of them covers."
+            )
+            live_parent.awaiting = None
+            if hasattr(live_parent, "non_terminal_cycles"):
+                live_parent.non_terminal_cycles += 1
+                if live_parent.cycles_capped:
+                    self.colony.record_verdict("cycle_cap_reached")
+            return
 
         # Two cases where releasing it to try again cannot help, so it goes
         # down the normal DIE path (failure -> respawn or abandon) instead:
@@ -2565,6 +2775,7 @@ class Orchestrator:
         other case (including when nothing ended up being spawned)."""
         payload = event.payload
         parent_id = payload.get("parent_id")
+        self._last_spawn_reused = 0
 
         # Only a decomposer may spawn. The prompt already says so in bold,
         # and _enforce_child_role only constrains WHICH role a child gets --
@@ -2650,6 +2861,15 @@ class Orchestrator:
                 prepared = [entry for i, entry in enumerate(prepared)
                             if i not in set(drifted)]
 
+            # PATCH 35. Duplicate check, after the gates (a dropped subtask
+            # never links anything) and BEFORE admission and the fan-out cap
+            # (a duplicate reserves no budget and takes no fan-out slot). A
+            # subtask matching a live or completed task is not spawned; that
+            # task becomes the dependency in its place.
+            prepared, reused_ids = self._dedupe_spawn_batch(
+                parent_id, prepared, label_to_id)
+            self._last_spawn_reused = len(reused_ids)
+
             # Admission: the batch is cut to the largest k whose reservation
             # fits (queued overflow included -- it is reserved now, spawned
             # later). The rest is dropped, not bundled, and the decomposer is
@@ -2667,7 +2887,7 @@ class Orchestrator:
                     for _, _, dropped_id in prepared[admitted:]:
                         self._gate_description_embeddings.pop(dropped_id, None)
                     prepared = prepared[:admitted]
-            admitted_ids = {task_id for _, _, task_id in prepared}
+            admitted_ids = {task_id for _, _, task_id in prepared} | reused_ids
 
             # Fan-out cap: resolved against the FULL original batch's labels
             # above (so an item past the cap can still be a valid dependency
@@ -2777,6 +2997,13 @@ class Orchestrator:
         if not proceed:
             return False
 
+        # PATCH 35. Same duplicate check as the batch path.
+        kept, reused_ids = self._dedupe_spawn_batch(
+            parent_id, [({}, description, self._generate_task_id())], {})
+        self._last_spawn_reused = len(reused_ids)
+        if not kept:
+            return True
+
         spawner = self.colony.get_agent(parent_id) if parent_id else None
         if spawner is not None and self._admit_spawn_batch(spawner.task_id, [role]) == 0:
             self._refuse_spawn_for_budget(parent_id, spawner)
@@ -2787,6 +3014,7 @@ class Orchestrator:
             role=role,
             parent_id=parent_id,
             dependencies=payload.get("dependencies", []),
+            task_id=kept[0][2],
         )
         return True
 
@@ -2897,6 +3125,14 @@ class Orchestrator:
                 if (task is not None and task.status in (0, 1)
                         and child.task_id not in open_ids):
                     open_ids.append(child.task_id)
+            # PATCH 35: a live task linked in place of a duplicate subtask is
+            # working on this agent's behalf too; _notify_borrowers sends its
+            # result here when it closes.
+            for borrowed_id in self.borrowed_tasks.get(parent.task_id, []):
+                task = self.task_graph.tasks.get(borrowed_id)
+                if (task is not None and task.status in (0, 1)
+                        and borrowed_id not in open_ids):
+                    open_ids.append(borrowed_id)
         for queued in self.pending_overflow.get(parent_id) or []:
             open_ids.append(queued.get("task_id"))
         return open_ids
@@ -2917,8 +3153,14 @@ class Orchestrator:
 
     def _has_completed_direct_child(self, task_id: Optional[str]) -> bool:
         """The one predicate shared by the SPAWN-refusal fail branch and the
-        decomposer REPORT gate: did at least one DIRECT subtask complete?"""
-        return self._direct_child_tally(task_id)["completed"] > 0
+        decomposer REPORT gate: did at least one DIRECT subtask complete?
+        PATCH 35: a completed task linked in place of a duplicate subtask
+        counts -- its result reached this task the same way."""
+        if self._direct_child_tally(task_id)["completed"] > 0:
+            return True
+        return any(self.task_graph.tasks.get(t) is not None
+                   and self.task_graph.tasks[t].status == 2
+                   for t in self.borrowed_tasks.get(task_id, []))
 
     def _direct_child_status_label(self, child: TaskNode) -> str:
         if child.status == 2:
@@ -2953,7 +3195,11 @@ class Orchestrator:
         inside its 500-character thought window -- run 3's root decided with
         all three [ABANDONED] injections pushed out of it."""
         rows = []
-        for child in self.task_graph.direct_children(task_id):
+        # PATCH 35: tasks linked in place of a duplicate subtask are listed
+        # too, marked as reused, so the decomposer sees them as covered.
+        borrowed = [self.task_graph.tasks[t] for t in self.borrowed_tasks.get(task_id, [])
+                    if t in self.task_graph.tasks]
+        for child in self.task_graph.direct_children(task_id) + borrowed:
             status = self._direct_child_status_label(child)
             excerpt = None
             if status == "completed" and child.result:
@@ -2963,7 +3209,8 @@ class Orchestrator:
             rows.append({"task": child.description or child.task_id,
                          "status": status,
                          "label": child.label,
-                         "excerpt": excerpt})
+                         "excerpt": excerpt,
+                         "reused": child.parent_task_id != task_id})
         return rows
 
     def handle_completion(self, event: Event):
@@ -3544,6 +3791,7 @@ class Orchestrator:
         # reuses the same task_id/slot). Drain one queued overflow subtask
         # into it, if that parent has any waiting.
         self._drain_pending_overflow(parent_id)
+        self._notify_borrowers(task_id, result)
 
         if agent_node and parent_id:
             self.messenger.push_event(
@@ -3863,6 +4111,7 @@ class Orchestrator:
                 # and since queued subtasks count as unfinished children in
                 # _open_child_task_ids, the parent then waited forever.
                 self._drain_pending_overflow(parent_id)
+                self._notify_borrowers(task_id, cached_result)
                 if parent_id:
                     self.messenger.push_event(
                         "parent_notification",
@@ -4323,6 +4572,7 @@ class Orchestrator:
         # was abandoned -- otherwise a decomposer's queued overflow never
         # spawns at all once one of its children dies permanently.
         self._drain_pending_overflow(parent_id)
+        self._notify_borrowers(task_id, abandoned_result)
 
         if parent_id:
             self.messenger.push_event(
