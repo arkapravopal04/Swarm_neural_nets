@@ -1200,7 +1200,16 @@ class Orchestrator:
             return requested_role
         if requested_role == "verifier":
             return requested_role
-        return "decomposer" if parent_node.generation == 0 else "executor"
+        if parent_node.generation == 0:
+            # PATCH 37. The root's children keep the role the root asked
+            # for. Run 16's root asked for four executors, one per clause;
+            # forced to decomposers, each re-planned the WHOLE request (it
+            # is in every prompt verbatim, PATCH 29) -- the watering one
+            # spawned plot and fee subtasks -- and the colony spent its
+            # budget computing 9000/12 six times. A chunk that turns out too
+            # big for one executor still converts via TASK TOO LARGE.
+            return "decomposer" if requested_role == "decomposer" else "executor"
+        return "executor"
 
     # Stands in for a result that scrub_result cut to nothing. Shaped like
     # the [ABANDONED ...] and [NOT STARTED ...] markers so the parent can
@@ -4216,8 +4225,10 @@ class Orchestrator:
 
     @staticmethod
     def _child_kind(res: TaskReservation) -> str:
-        # Mirrors _enforce_child_role: the root's children are decomposers,
-        # every other decomposer's are executors.
+        # The one child an unspawned decomposer's k=1 pricing assumes. The
+        # root's children may be decomposers (PATCH 37: whichever role the
+        # root asks for), so the root reserves the dearer kind; every other
+        # decomposer's children are executors.
         return "decomposer" if res.kind == "root" else "executor"
 
     def _unspawned_children_reservation(self, res: TaskReservation) -> float:
