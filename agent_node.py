@@ -472,8 +472,30 @@ class Agent:
     @property
     def final_only(self):
         """Only final_actions are on the menu: the cycle cap is reached, or
-        SPAWN was closed for lack of energy (spawn_closed)."""
-        return self.cycles_capped or self.spawn_closed
+        SPAWN was closed for lack of energy (spawn_closed), or a decomposer's
+        subtasks are done (_decomposer_spawn_done)."""
+        return self.cycles_capped or self.spawn_closed or self._decomposer_spawn_done
+
+    # Child statuses that mean "closed without a result" -- the only reason a
+    # decomposer whose subtasks have run may SPAWN again.
+    _FAILED_CHILD_STATUSES = ("failed", "abandoned", "not started")
+
+    @property
+    def _decomposer_spawn_done(self):
+        """PATCH 36. A decomposer that has spawned, with at least one subtask
+        completed and none failed, has nothing left to plan: it REPORTs the
+        roll-up. Run dd996f3 had two decomposers re-plan 3 and 4 times after
+        their subtasks finished, each batch re-asking for finished work in
+        new words. SPAWN stays only while a failed subtask needs redoing
+        (a repeat of a completed one is linked by the spawn-time dedup)."""
+        if self.role != "decomposer" or not getattr(self.node, "has_spawned", False):
+            return False
+        children = self._direct_child_statuses()
+        if not children:
+            return False
+        statuses = [c.get("status") for c in children]
+        return ("completed" in statuses
+                and not any(s in self._FAILED_CHILD_STATUSES for s in statuses))
 
     @property
     def _decomposer_awaiting_first_spawn(self):
@@ -1305,6 +1327,12 @@ class Agent:
                         "You must finish now: DIE, and say that no subtask "
                         "completed.]\n"
                     )
+                elif self._decomposer_spawn_done and not self.cycles_capped:
+                    think_cap_str = (
+                        "[YOUR SUBTASKS ARE DONE -- SPAWN is closed. You must "
+                        "finish now: REPORT the combined result of your "
+                        "completed subtasks, or DIE if there is nothing usable.]\n"
+                    )
                 elif self.spawn_closed and not self.cycles_capped:
                     think_cap_str = (
                         "[NO ENERGY FOR NEW SUBTASKS -- SPAWN is closed. You "
@@ -1950,6 +1978,8 @@ Your next action:"""
             reason = "with no usable result to report"
         if self.spawn_closed and not self.cycles_capped:
             return "DIE", f"No energy left for new subtasks, {reason}."
+        if self._decomposer_spawn_done and not self.cycles_capped:
+            return "DIE", f"Subtasks done, {reason}."
         return "DIE", (
             f"Cycle cap reached ({self.non_terminal_cycles} cycles) {reason}."
         )

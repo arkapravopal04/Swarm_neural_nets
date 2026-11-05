@@ -260,3 +260,36 @@ def test_subtask_block_tells_a_respawn_to_cover_only_the_gaps():
 
 def test_tool_cap_stays_at_four():
     assert Agent.MAX_TOOL_ATTEMPTS_PER_AGENT == 4
+
+
+# ------------------------------------------------------------ PATCH 36
+
+def _dec_agent(rows, has_spawned=True):
+    node = AgentNode(agent_id="d-1", role="decomposer", status="running",
+                     parent_id="root", task="t", task_id="t-1",
+                     generation=1, has_spawned=has_spawned)
+    agent = Agent(tokeniser=None, model=None, message=Messenger(), node=node)
+    agent.child_status_fn = lambda: rows
+    return agent
+
+
+def test_decomposer_with_completed_subtasks_cannot_spawn_again():
+    agent = _dec_agent([{"task": "a", "status": "completed"},
+                        {"task": "b", "status": "completed"}])
+    assert agent.final_only
+    assert agent.final_actions == ("REPORT", "DIE")
+    # decide()'s coercion turns a SPAWN into REPORT/DIE on this menu.
+    action, _ = agent._coerce_final_action(
+        "SPAWN", {"subtasks": [{"role": "executor", "task": "redo a"}]})
+    assert action in ("REPORT", "DIE")
+
+
+def test_decomposer_keeps_spawn_to_redo_a_failed_subtask():
+    agent = _dec_agent([{"task": "a", "status": "completed"},
+                        {"task": "b", "status": "abandoned"}])
+    assert not agent.final_only
+
+
+def test_unspawned_decomposer_still_spawns():
+    agent = _dec_agent([{"task": "a", "status": "completed"}], has_spawned=False)
+    assert not agent.final_only
