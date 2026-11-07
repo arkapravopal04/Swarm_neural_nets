@@ -55,8 +55,14 @@ from collections import deque
 # inside a PAYLOAD -- and once decide() started taking the LAST block,
 # prose like "PAYLOAD: The recommended action: DIE if pressure > 5 bar."
 # was parsed as ACTION: DIE. A real label always opens its own line.
+#
+# PATCH 48 (review): markdown emphasis around the colon is tolerated --
+# "**ACTION:** REPORT" and "**ACTION**: REPORT" used to match nothing (the
+# "**" after the colon is not a letter), so a bold-labelled answer fell
+# through to the no-ACTION path.
 _ACTION_LINE_RE = re.compile(
-    r"^[ \t>*_#-]*ACTION\s*:\s*(?:(?:ACTION|PAYLOAD)\b\s*:?\s*)*([A-Za-z]+)",
+    r"^[ \t>*_#-]*ACTION[*_`]*\s*:[*_`\s]*"
+    r"(?:(?:ACTION|PAYLOAD)\b[*_`]*\s*:?[*_`\s]*)*([A-Za-z]+)",
     re.IGNORECASE | re.MULTILINE,
 )
 _ACTION_TOKENS = ("THINK", "SPAWN", "TOOL", "REPORT", "DIE")
@@ -64,7 +70,10 @@ _ACTION_TOKENS = ("THINK", "SPAWN", "TOOL", "REPORT", "DIE")
 _BARE_ACTION_RE = re.compile(
     r"^[ \t]*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECASE | re.MULTILINE
 )
-_PAYLOAD_RE = re.compile(r"PAYLOAD:\s*(.*)", re.DOTALL | re.IGNORECASE)
+# PATCH 48 (review): "**PAYLOAD:** x" / "**PAYLOAD**: x" -- emphasis
+# characters around the colon are not part of the payload.
+_PAYLOAD_RE = re.compile(r"PAYLOAD[*_`]*\s*:[*_`\s]*(.*)", re.DOTALL | re.IGNORECASE)
+_PAYLOAD_LABEL_RE = re.compile(r"PAYLOAD[*_`]*\s*:", re.IGNORECASE)
 # PATCH 47. Where a plain-text payload ends if the model opened another
 # block after it: a line starting with an uppercase "ACTION:" label, or a
 # bare "ACTION" at the very end. The colon is required otherwise, so prose
@@ -139,7 +148,7 @@ def _payload_match_for(text, action_match):
     if action_match is not None:
         return _PAYLOAD_RE.search(text, action_match.end())
     last = None
-    for last in re.finditer(r"PAYLOAD:", text, re.IGNORECASE):
+    for last in _PAYLOAD_LABEL_RE.finditer(text):
         pass
     return _PAYLOAD_RE.search(text, last.start()) if last else None
 
@@ -1833,6 +1842,7 @@ Your next action:"""
         self.thought_process += f"\n{record_decision_text(strip_special_tokens(generated_text))}\n"
 
         action = "REPORT"  # Safe default fallback
+        recovered_spawn = None  # PATCH 48 (review): unlabelled decomposer SPAWN
         # Last block wins -- see _last_action_match.
         action_match = _last_action_match(generated_text)
 
@@ -1909,14 +1919,27 @@ Your next action:"""
                 # "PAYLOAD: answer" with no ACTION line: still a REPORT.
                 pass
             else:
-                action = "THINK"
-                self.fail_reason = (
-                    "No ACTION: line was found in your last response, so "
-                    "nothing was done. Reply with exactly one ACTION: line "
-                    "followed by one PAYLOAD: line."
-                )
-                print(f"  [decide() NO ACTION] agent={self.agent_id} role={self.role} "
-                      f"-- unlabelled text treated as THINK, not REPORT.")
+                # PATCH 48 (review): a decomposer that wrote its batch with no
+                # labels at all has still written the SPAWN -- run it rather
+                # than spend a THINK cycle re-deriving it.
+                recovered_spawn = (
+                    self._recover_unlabelled_payload("SPAWN", generated_text)
+                    if self.role == "decomposer" else None)
+                if isinstance(recovered_spawn, dict):
+                    action = "SPAWN"
+                    self.fail_reason = None
+                    print(f"  [decide() payload RECOVERED] agent={self.agent_id} "
+                          f"-- no ACTION line, but a well-formed SPAWN object was "
+                          f"found; running the SPAWN.")
+                else:
+                    action = "THINK"
+                    self.fail_reason = (
+                        "No ACTION: line was found in your last response, so "
+                        "nothing was done. Reply with exactly one ACTION: line "
+                        "followed by one PAYLOAD: line."
+                    )
+                    print(f"  [decide() NO ACTION] agent={self.agent_id} role={self.role} "
+                          f"-- unlabelled text treated as THINK, not REPORT.")
 
         # Past the tool cap a TOOL (from habit, or copied from earlier
         # context) is turned into a REPORT here, before the payload parser:
@@ -1929,6 +1952,9 @@ Your next action:"""
 
         payload = ""
         payload_match = _payload_match_for(generated_text, action_match)
+        if recovered_spawn is not None:
+            # PATCH 48 (review): the unlabelled SPAWN object found above.
+            payload, payload_match = recovered_spawn, None
 
         if payload_match:
             payload_raw = payload_match.group(1).strip()
@@ -2042,6 +2068,8 @@ Your next action:"""
                 # the chosen ACTION line is the body.
                 body = strip_scaffolding_lines(
                     strip_special_tokens(generated_text[action_match.end():])).strip()
+                # PATCH 48 (review): the closing "**" of "**ACTION: REPORT**".
+                body = body.lstrip("*_`").strip()
                 if body:
                     payload = _dedupe_repeated_sentences(
                         trim_closer_tail(body), max_chars=2000)

@@ -79,3 +79,39 @@ def test_capped_unlabelled_prose_is_still_coerced_to_report():
     assert action == "REPORT"
     assert "five" in payload
     assert agent.cap_coerced_last_run
+
+
+# ---------------------------------------------------------------- review fixes
+
+def test_bold_action_label_without_payload_label():
+    _, action, payload = _decide("**ACTION:** REPORT\nThe answer is 5.")
+    assert action == "REPORT"
+    assert payload == "The answer is 5."
+
+
+def test_bold_action_and_payload_labels():
+    _, action, payload = _decide("**ACTION:** REPORT\n**PAYLOAD:** The answer is 5.")
+    assert action == "REPORT"
+    assert payload == "The answer is 5."
+
+
+def test_bold_wrapped_action_line_with_spawn():
+    _, action, payload = _decide(
+        '**ACTION: SPAWN**\nPAYLOAD: {"role": "executor", "task": "compute x"}',
+        role="decomposer")
+    assert action == "SPAWN"
+    assert payload == {"role": "executor", "task": "compute x"}
+
+
+def test_unlabelled_spawn_object_from_decomposer_is_spawned():
+    reply = '{"subtasks":[{"role":"executor","task":"t1","dependencies":[]}]}'
+    agent, action, payload = _decide(reply, role="decomposer")
+    assert action == "SPAWN"
+    assert payload == {"subtasks": [{"role": "executor", "task": "t1", "dependencies": []}]}
+    assert agent.fail_reason is None
+
+
+def test_unlabelled_spawn_object_from_executor_is_still_think():
+    reply = '{"subtasks":[{"role":"executor","task":"t1","dependencies":[]}]}'
+    _, action, _ = _decide(reply)
+    assert action == "THINK"
