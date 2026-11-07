@@ -1,4 +1,4 @@
-"""PATCH 44 (1/2): ColonyState.extract_agent_ghost carries the base ghost
+"""PATCH 55 (1/2): ColonyState.extract_agent_ghost carries the base ghost
 context and the failure history forward across respawns."""
 
 import os
@@ -88,7 +88,7 @@ def test_blank_string_ghost_and_empty_reasons_dropped():
     c = _colony()
     g1 = _die(c, 1, "   ", None)
     assert g1["base_context"] is None
-    # PATCH 44 (review): empty items already in the list are still dropped,
+    # PATCH 55 (review): empty items already in the list are still dropped,
     # but the dying respawn's own missing reason is now recorded.
     g2 = _die(c, 2, {"base_context": BASE, "earlier_failures": ["", "E1"],
                      "fail_reason": ""}, "R")
@@ -101,7 +101,7 @@ def test_unknown_agent_returns_empty_dict():
 
 
 def test_attempt_without_reason_is_recorded():
-    # PATCH 44 (review): chain of fail_reasons [None, "R2"].
+    # PATCH 55 (review): chain of fail_reasons [None, "R2"].
     c = _colony()
     g1 = _die(c, 1, BASE, None)
     assert g1["earlier_failures"] == []  # string ghost: first attempt

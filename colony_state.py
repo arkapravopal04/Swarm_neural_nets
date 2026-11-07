@@ -5,7 +5,7 @@ general tree with hashing ids
 from dataclasses import dataclass, field 
 import time
 
-from text_utils import dedupe_and_cap as _dedupe_and_cap  # PATCH 44
+from text_utils import dedupe_and_cap as _dedupe_and_cap  # PATCH 55
 
 @dataclass
 class AgentNode:
@@ -160,7 +160,7 @@ class ColonyState:
     def extract_agent_ghost(self, agent_id: str) -> dict:
         """Extracts context, memory, and failure reason before agent death.
 
-        PATCH 44 (1/2): a respawn now carries the background it needs.
+        PATCH 55 (1/2): a respawn now carries the background it needs.
           "base_context"     -- the dying agent's string ghost (project goal
                                 line + prerequisite results / shared state),
                                 or the base_context its own ghost dict carried;
@@ -176,12 +176,12 @@ class ColonyState:
                                 stays in "fail_reason".
         last_task / energy_spent / role are kept for compatibility only.
         The prompt renders this dict via Agent._ghost_context_str in
-        agent_node.py (PATCH 44 part 2).
+        agent_node.py (PATCH 55 part 2).
         """
         agent = self.agents.get(agent_id)
         if not agent:
             return {}
-        # PATCH 44: carry the base ghost context and failure history forward.
+        # PATCH 55: carry the base ghost context and failure history forward.
         prev = agent.ghost_context
         if isinstance(prev, str) and prev.strip():
             base_context = prev
@@ -191,7 +191,7 @@ class ColonyState:
             base_context = None
         if isinstance(prev, dict):
             items = list(prev.get("earlier_failures") or [])
-            # PATCH 44 (review): prev being a dict means the dying agent was
+            # PATCH 55 (review): prev being a dict means the dying agent was
             # itself a respawn, so a previous attempt did end -- record it
             # even when it died without a stated reason (e.g. watchdog kill).
             prev_reason = prev.get("fail_reason")
@@ -201,10 +201,10 @@ class ColonyState:
             items = []
         capped = []
         for x in items:
-            # PATCH 44 (review): flatten to one line so a reason containing
+            # PATCH 55 (review): flatten to one line so a reason containing
             # newlines cannot break the rendered bullet list.
             c = _dedupe_and_cap(" ".join(str(x).split()), max_chars=300)
-            # PATCH 44: dedupe_and_cap keeps a single over-long sentence
+            # PATCH 55: dedupe_and_cap keeps a single over-long sentence
             # whole (soft cap); hard-cap that case so the ~300 limit holds.
             if c and len(c) > 300:
                 c = c[:297].rstrip() + "..."
