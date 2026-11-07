@@ -154,3 +154,42 @@ def test_ghost_and_child_status_changes_are_fed():
     assert "Shared state: X=5" in update
     assert "A=7" in update
     assert "energy_spent" not in update
+
+
+# ---------------------------------------------------------------- review fixes
+
+def test_failed_tool_result_is_fed_once_inside_the_verdict():
+    agent = _agent()
+    _second_cycle(agent, lambda a: a.receive_tool_result(
+        "run_code", "FAILED: NameError: name 'q' is not defined", False))
+    (update,) = _update_texts(agent)
+    assert "[VERDICT FROM REVIEWER" in update
+    assert update.count("NameError: name 'q' is not defined") == 1
+    assert "Result of your most recent TOOL call" not in update
+
+
+def test_successful_tool_result_still_gets_its_block():
+    agent = _agent()
+    _second_cycle(agent, lambda a: a.receive_tool_result("run_code", "SUCCESS: 42", True))
+    (update,) = _update_texts(agent)
+    assert "Result of your most recent TOOL call" in update
+
+
+def test_no_update_at_token_ceiling_and_change_stays_pending():
+    agent = _agent()
+    agent.think(available_tools=["run_code"], requirements=[])
+    key_before = agent._think_context_key
+    agent.receive_tool_result("run_code", "SUCCESS: 42", True)
+    agent._total_generated = agent.MAX_TOTAL_THINK_TOKENS
+    agent.model.lengths.clear()
+    agent.tokeniser.encoded.clear()
+    agent.think(available_tools=["run_code"], requirements=[])
+    assert agent.model.lengths == []          # nothing generated or fed
+    assert _update_texts(agent) == []
+    assert agent._think_context_key == key_before  # not advanced
+    # Below the ceiling again, the pending change is fed.
+    agent._total_generated = 0
+    agent.model.lengths.clear()
+    agent.think(available_tools=["run_code"], requirements=[])
+    assert agent.model.lengths[0] > 1
+    assert "42" in _update_texts(agent)[0]

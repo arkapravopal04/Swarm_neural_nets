@@ -1517,8 +1517,14 @@ Your next action:"""
                 f"ruling on your last attempt]\n{fail_reason}\n[END VERDICT]\n")
             changed.append("fail_reason")
         if tool_result != prev[1] and tool_result:
-            body.append(f"Result of your most recent TOOL call:\n{tool_result}\n")
-            changed.append("last_tool_result")
+            # PATCH 45 (review): a failed call's result is already inside
+            # fail_reason ("Tool call to X failed: <result>") -- feed it once.
+            result_text = tool_result.split("]: ", 1)[-1]
+            if fail_reason and result_text in fail_reason:
+                changed.append("last_tool_result (in verdict)")
+            else:
+                body.append(f"Result of your most recent TOOL call:\n{tool_result}\n")
+                changed.append("last_tool_result")
         if ghost_repr != prev[2]:
             ghost_str = self._ghost_context_str()
             if ghost_str:
@@ -1561,7 +1567,11 @@ Your next action:"""
             # Prompt-side only: not added to thought_process, not counted in
             # _total_generated or the repetition window.
             snap = self._think_context_snapshot()
-            if snap != self._think_context_key:
+            # PATCH 45 (review): at the lifetime token ceiling the loop below
+            # generates nothing, so feeding an update now would only grow the
+            # cache. Leave the change pending (key not advanced).
+            if (snap != self._think_context_key
+                    and self._total_generated < self.MAX_TOTAL_THINK_TOKENS):
                 update_text, changed = self._think_context_update(snap)
                 if update_text:
                     delta = self.tokeniser(update_text, return_tensors="pt",
