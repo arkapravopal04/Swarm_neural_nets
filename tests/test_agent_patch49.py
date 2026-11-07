@@ -62,3 +62,16 @@ def test_long_failures_feed_error_text_and_open_circuit():
     assert agent.tool_circuit_open
     assert "TOOL is closed to you" in agent.fail_reason
     assert len(agent.last_tool_result) <= 1600
+
+
+# ---------------------------------------------------------------- review fix
+
+def test_cut_note_advice_only_on_success():
+    ok = _agent()
+    ok.receive_tool_result("run_code", "SUCCESS: " + _big(5_000), True)
+    assert "characters cut -- print only the values you need ...]" in ok.last_tool_result
+
+    bad = _agent()
+    bad.receive_tool_result("run_code", "FAILED: " + _big(5_000), False)
+    assert "characters cut ...]" in bad.last_tool_result
+    assert "print only the values" not in bad.last_tool_result

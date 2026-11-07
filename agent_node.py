@@ -414,8 +414,8 @@ class Agent:
     THINK_CYCLES_BEFORE_DECIDE = 0
 
     # Hard ceiling on run() cycles that end without finishing or handing off.
-    # Every run() past the first spends a full think() generation AND a
-    # decide() generation, so an agent whose decide() keeps answering THINK
+    # Every run() spends a full think() generation AND a decide() generation
+    # (PATCH 46: the first one included), so an agent whose decide() keeps answering THINK
     # never ends -- one executor looped THINK seven-plus times without a
     # REPORT or DIE and was most of that run's think_tick spend on its own.
     # MAX_TOTAL_THINK_TOKENS does not catch it: it only stops think() from
@@ -1695,6 +1695,11 @@ Your next action:"""
         # THINK continues the same KV cache that just produced the loop, so
         # it would most likely reproduce it. Hand control to decide()
         # instead, which has its own retry loop and can re-roll.
+        #
+        # PATCH 46: with THINK_CYCLES_BEFORE_DECIDE = 0 the "THINK" return is
+        # unreachable (think_cycle is already >= 1 here), so think() always
+        # returns FORCE_DECIDE. Kept so the constant still means what it
+        # says if it is ever raised again.
         if (self.think_cycle <= self.THINK_CYCLES_BEFORE_DECIDE
                 and not hit_token_ceiling and not hit_degenerate):
             return "THINK"
@@ -2711,10 +2716,10 @@ Your next action:"""
             head = result_summary[:self.TOOL_RESULT_HEAD_CHARS]
             tail = result_summary[-self.TOOL_RESULT_TAIL_CHARS:]
             cut = len(result_summary) - len(head) - len(tail)
-            result_summary = (
-                f"{head}\n[... {cut} characters cut -- print only the values "
-                f"you need ...]\n{tail}"
-            )
+            # PATCH 49 (review): the "print less" advice only fits a call
+            # that worked; a failure's long text is a traceback or error.
+            advice = " -- print only the values you need" if success else ""
+            result_summary = f"{head}\n[... {cut} characters cut{advice} ...]\n{tail}"
         if self.pending_tool_name_correction:
             result_summary = f"{self.pending_tool_name_correction}\n{result_summary}"
             self.pending_tool_name_correction = None
