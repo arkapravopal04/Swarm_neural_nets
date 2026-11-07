@@ -597,6 +597,10 @@ class Agent:
                     "previous thoughts. Your ONLY job now is to combine those "
                     "results for your parent and state plainly what they did "
                     "not cover. " + tail)
+        # PATCH 39: a failed subtask a later sibling redid is not missing --
+        # telling the root "1 replaced ... state which did not complete"
+        # invited it to report the redone part as undone.
+        children = [c for c in children if c.get("status") != "replaced"]
         completed = sum(1 for c in children if c.get("status") == "completed")
         others = {}
         for c in children:

@@ -147,7 +147,9 @@ def dedupe_and_cap(text, max_chars: int = 500):
     """
     if not text:
         return text
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    # PATCH 38: abbreviation-aware, so the 300-char "[Project goal]" ghost
+    # line and the judge's project_goal keep "Rs. 9,000" whole.
+    sentences = split_sentences(text) or [text.strip()]
     deduped = []
     for s in sentences:
         if not deduped or s.strip() != deduped[-1].strip():
@@ -164,8 +166,19 @@ def _split_keeping_separators(text):
     paragraph. The last sentence's separator is "".
     """
     parts = re.split(r'(?<=[.!?])(\s+)', text.strip())
-    return [(parts[i], parts[i + 1] if i + 1 < len(parts) else "")
-            for i in range(0, len(parts), 2)]
+    pairs = [(parts[i], parts[i + 1] if i + 1 < len(parts) else "")
+             for i in range(0, len(parts), 2)]
+    # PATCH 38: "Rs. 9,000" is one sentence here too. This split feeds the
+    # 300-char goal cap (ghost "[Project goal]" line, the judge's
+    # project_goal), which cut a raw-text goal to "...set a fee of Rs.".
+    merged = []
+    for sentence, sep in pairs:
+        if merged and _abbreviation_joins(merged[-1][0], sentence):
+            prev, prev_sep = merged[-1]
+            merged[-1] = (prev + prev_sep + sentence, sep)
+        else:
+            merged.append((sentence, sep))
+    return merged
 
 
 def dedupe_global_and_cap(text, max_chars: int = 400, keep_line_breaks: bool = False):
@@ -784,6 +797,66 @@ def dedupe_list_exact(items):
     return deduped
 
 
+# PATCH 38. Words whose trailing period is part of the word, not the end of
+# a sentence. Run 17's root REPORT was cut at "coverage of Rs." -- twice --
+# and the judge rejected both for leaving out the fee. Lowercased, without
+# the final period. "etc." is left out on purpose: it usually DOES end the
+# sentence it closes.
+SENTENCE_ABBREVIATIONS = frozenset({
+    "rs", "e.g", "i.e", "vs", "dr", "mr", "mrs", "ms",
+})
+# Words that are an abbreviation in "No. 4" / "approx. 750" but also end real
+# sentences ("The answer is no.", "Water for 30 min."). Joined to what follows
+# only when that starts with a digit or a lowercase letter.
+SENTENCE_ABBREVIATIONS_IF_CONTINUED = frozenset({
+    "no", "nos", "approx", "st", "fig", "est", "min", "max", "avg", "dept",
+})
+
+
+def _abbreviation_word(piece):
+    """The last word of `piece` without brackets/quotes and its final
+    period, lowercased, when `piece` ends on '.'; else None."""
+    piece = str(piece).rstrip()
+    if not piece.endswith("."):
+        return None
+    words = piece.split()
+    if not words:
+        return None
+    return words[-1].lstrip("([{\"'").rstrip(".").lower()
+
+
+def _abbreviation_joins(before, after) -> bool:
+    """PATCH 38. True when the period ending `before` belongs to an
+    abbreviation, so `before` and `after` are one sentence."""
+    word = _abbreviation_word(before)
+    if word is None:
+        return False
+    if word in SENTENCE_ABBREVIATIONS:
+        return True
+    if word in SENTENCE_ABBREVIATIONS_IF_CONTINUED:
+        nxt = str(after).lstrip()[:1]
+        return bool(nxt) and (nxt.isdigit() or nxt.islower())
+    return False
+
+
+def split_sentences(text) -> list:
+    """`text` split into sentences on '.', '!' or '?' followed by
+    whitespace, except after an abbreviation (PATCH 38): "Rs. 750 per
+    plot." stays one sentence."""
+    if not text:
+        return []
+    pieces = re.split(r'(?<=[.!?])\s+', str(text).strip())
+    sentences = []
+    for piece in pieces:
+        if not piece.strip():
+            continue
+        if sentences and _abbreviation_joins(sentences[-1], piece):
+            sentences[-1] = f"{sentences[-1]} {piece}"
+        else:
+            sentences.append(piece)
+    return sentences
+
+
 def trim_to_sentences(text, max_sentences: int = 3, max_words: int = 60, marker: bool = True):
     """
     Hard-trims free text to the first few whole sentences.
@@ -816,7 +889,7 @@ def trim_to_sentences(text, max_sentences: int = 3, max_words: int = 60, marker:
     if not text:
         return text
     stripped = str(text).strip()
-    sentences = [s for s in re.split(r'(?<=[.!?])\s+', stripped) if s.strip()]
+    sentences = split_sentences(stripped)
     if not sentences:
         return stripped
 
@@ -869,6 +942,7 @@ def first_clause(text, max_chars: int = 120):
 # A sentence terminator, plus any closing quotes/brackets that belong with
 # it -- so 'he said "stop."' walks back to the quote, not to the period.
 _SENTENCE_END_RE = re.compile(r'[.!?]["\'\)\]]*')
+_SENTENCE_END_AT_END_RE = re.compile(r'[.!?]["\'\)\]]*$')
 
 def drop_incomplete_tail(text):
     """
@@ -907,9 +981,26 @@ def drop_incomplete_tail(text):
     if not stripped:
         return text
 
+    # Already ends on a terminator: unchanged, whatever the last word is
+    # ("Water for 30 min." is a finished sentence).
+    if _SENTENCE_END_AT_END_RE.search(stripped):
+        return text
+
     last_end = None
     for match in _SENTENCE_END_RE.finditer(stripped):
-        last_end = match.end()
+        end = match.end()
+        # PATCH 38. Not a sentence end: a period followed straight away by a
+        # lowercase letter -- the inner periods of "e.g." and "i.e." -- or
+        # one closing an abbreviation: walking back to "Rs." would leave
+        # "...covered at Rs." as the answer's last words. Anything else keeps
+        # the old behaviour, so a "recall=0.97" status tail still walks back
+        # to "0." and the status-tail cutter after it still sees and counts
+        # the tail (synthesizer's status_tail ledger row).
+        if end < len(stripped) and stripped[end].islower():
+            continue
+        if _abbreviation_joins(stripped[:end], stripped[end:]):
+            continue
+        last_end = end
 
     if last_end is None or last_end == len(stripped):
         return text
@@ -2157,7 +2248,10 @@ def goal_clauses(goal):
         return []
     whole = str(goal).strip().rstrip(".!?;: ").strip()
     clauses = []
-    for part in _CLAUSE_SPLIT_RE.split(str(goal)):
+    # PATCH 38: split sentences abbreviation-aware ("covering Rs. 9,000" is
+    # one clause), then at ';'.
+    parts = [p for sentence in split_sentences(goal) for p in sentence.split(";")]
+    for part in parts:
         part = part.strip().rstrip(".!?;: ").strip()
         if len(part.split()) >= GOAL_CLAUSE_MIN_WORDS:
             clauses.append(part)
@@ -3013,18 +3107,54 @@ def ask_coverage(asks, target):
     return out
 
 
+# PATCH 40. A goal clause sharing less than this fraction of its content
+# stems with the request is a part the user never asked for. Run 17's three
+# invented clauses ("Make sure it all fits into your budget plan document",
+# "Fix any conflicts during meetings...", "Write this down clearly now")
+# scored 0.0; its real clauses, garbled or not, scored 0.32-0.60.
+GOAL_ADDED_CLAUSE_MAX = 0.2
+
+
+def added_goal_clauses(raw_text, goal):
+    """The clauses of `goal` that are not grounded in the request, as
+    [(clause, fraction)]. Clauses under ASK_MIN_STEMS content stems are not
+    judged, like ask_coverage.
+
+    A one-clause goal is not judged: the goal prompt asks for one
+    sentence, and a faithful one-sentence paraphrase in synonyms ("Settle
+    the monthly route dispute with a voting method" for "which trail
+    should we do?") can share no stems with the request. An added part
+    arrives as an extra clause, as run 17's three did."""
+    clauses = goal_clauses(goal)
+    if len(clauses) < 2:
+        return []
+    have = content_stems(raw_text)
+    added = []
+    for clause in clauses:
+        stems = content_stems(clause)
+        if len(stems) < ASK_MIN_STEMS:
+            continue
+        fraction = len(stems & have) / len(stems)
+        if fraction < GOAL_ADDED_CLAUSE_MAX:
+            added.append((clause, fraction))
+    return added
+
+
 def goal_fidelity(raw_text, goal):
     """The whole PATCH 22 goal check, as a dict:
-    {ok, extra, missing, uncovered, coverage}. `ok` is False on any extra
-    figure, any missing figure, or any uncovered ask."""
+    {ok, extra, missing, uncovered, added, coverage}. `ok` is False on any
+    extra figure, any missing figure, any uncovered ask, or (PATCH 40) any
+    goal clause the request does not ground."""
     extra, missing = figure_fidelity(raw_text, goal, require_all=True)
     coverage = ask_coverage(request_asks(raw_text), goal)
     uncovered = [ask for ask, _, covered in coverage if not covered]
+    added = [clause for clause, _ in added_goal_clauses(raw_text, goal)]
     return {
-        "ok": not extra and not missing and not uncovered,
+        "ok": not extra and not missing and not uncovered and not added,
         "extra": extra,
         "missing": missing,
         "uncovered": uncovered,
+        "added": added,
         "coverage": coverage,
     }
 

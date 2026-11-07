@@ -392,7 +392,12 @@ Output:"""
         # TaskNode.description the judge prints) and goal_vector (the
         # tier-2 target) are guaranteed to agree on the same string.
         cleaned_goal = dedupe_global_and_cap(goal_sentence, max_chars=400)
-        if goal_sentence and len(cleaned_goal) < 0.7 * len(goal_sentence):
+        # PATCH 40: read by _faithful_goal, which fails a degenerate draw --
+        # run 17's goal passed fidelity with 58% of it deduped away and three
+        # parts the user never asked for in what was left.
+        self._last_goal_degenerate = bool(
+            goal_sentence and len(cleaned_goal) < 0.7 * len(goal_sentence))
+        if self._last_goal_degenerate:
             print(
                 f"[Problem_Phaser] WARNING: goal generation looked degenerate -- "
                 f"dedupe removed {100 * (1 - len(cleaned_goal) / len(goal_sentence)):.0f}% "
@@ -423,21 +428,27 @@ Output:"""
         """
         attempts = []
         for attempt in range(1, self.GOAL_FIDELITY_ATTEMPTS + 1):
+            self._last_goal_degenerate = False
             candidate = draw()
             check = goal_fidelity(raw_text, candidate)
-            attempts.append({"goal": candidate, **{k: check[k] for k in
-                             ("extra", "missing", "uncovered")}})
+            degenerate = bool(getattr(self, "_last_goal_degenerate", False))
+            ok = check["ok"] and not degenerate
+            attempts.append({"goal": candidate, "degenerate": degenerate,
+                             **{k: check[k] for k in
+                                ("extra", "missing", "uncovered", "added")}})
             print(f"[Problem_Phaser] goal fidelity attempt {attempt}: "
-                  f"{'PASS' if check['ok'] else 'FAIL'}"
-                  + ("" if check["ok"] else
+                  f"{'PASS' if ok else 'FAIL'}"
+                  + ("" if ok else
                      f" -- figures not in the request: {check['extra']}; "
                      f"request figures missing: {check['missing']}; "
-                     f"parts not covered: {check['uncovered']}")
+                     f"parts not covered: {check['uncovered']}; "
+                     f"parts not in the request: {check['added']}"
+                     + ("; degenerate draw" if degenerate else ""))
                   + f" :: {candidate[:160]!r}")
             for ask, fraction, covered in check["coverage"]:
                 print(f"    [goal fidelity] part {fraction:.2f} "
                       f"{'covered' if covered else 'MISSING'}: {ask[:100]!r}")
-            if check["ok"]:
+            if ok:
                 return candidate, {"outcome": "pass" if attempt == 1 else "pass_on_retry",
                                    "attempts": attempts}
 

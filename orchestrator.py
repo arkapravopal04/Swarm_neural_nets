@@ -38,6 +38,7 @@ from agent_node import (
 )
 from tools import ToolRegistry
 from text_utils import (
+    content_stems,
     normalize_identifier,
     normalize_words,
     trim_to_sentences,
@@ -889,7 +890,19 @@ class Orchestrator:
                     # The ceiling keeps pricing the batch this task already
                     # paid for; only admission re-plans from k=0.
                     reservation.k_peak = max(reservation.k_peak, reservation.k)
-                reservation.k, reservation.spawned = 0, False  # it plans again
+                kept = self._kept_children_count(task_id)
+                if kept:
+                    # PATCH 39: every existing subtask completed (or was
+                    # redone), so this respawn REPORTs the roll-up -- it
+                    # inherits has_spawned below -- and never plans again.
+                    # Priced as spawned with k=0: no SPAWN, and the child
+                    # injections are debited at spawn. A k=1 plan plus a
+                    # child it can never spawn, or RESERVE_PER_CHILD for
+                    # every kept child, got the respawn refused late in a
+                    # run and abandoned the root.
+                    reservation.k, reservation.spawned = 0, True
+                else:
+                    reservation.k, reservation.spawned = 0, False  # it plans again
             reservation.sunk = self.colony.task_energy_spent.get(task_id, 0)
             if not self._admits():
                 # Enough numbers to tell real exhaustion (spent + attempt
@@ -915,7 +928,7 @@ class Orchestrator:
         if ghost_context is None and self.spec:
             overall_goal = self.spec.get("goal") or self.spec.get("raw_text")
             if overall_goal:
-                overall_goal = _dedupe_repeated_sentences(overall_goal, max_chars=300)
+                overall_goal = self._goal_line(overall_goal)
                 ghost_context = f"[Project goal] {overall_goal}"
 
         parent_node = self.colony.get_agent(parent_id) if parent_id else None
@@ -968,7 +981,63 @@ class Orchestrator:
                 lambda tid=task_id: self._direct_child_statuses(tid))
             self.live_agents[agent_id] = live_agent
 
+        if role == "decomposer":
+            self._inherit_existing_children(agent_id, task_id, new_agent)
+
         return agent_id
+
+    def _existing_children(self, task_id):
+        """Direct and borrowed (PATCH 35) subtasks of task_id."""
+        children = list(self.task_graph.direct_children(task_id))
+        children += [self.task_graph.tasks[t]
+                     for t in self.borrowed_tasks.get(task_id, [])
+                     if t in self.task_graph.tasks]
+        return children
+
+    def _kept_children_count(self, task_id):
+        """PATCH 39. How many subtasks a decomposer respawn on task_id keeps
+        without re-planning: all of them when every one completed, else 0
+        (a failed one may be SPAWNed again, so the respawn is priced as
+        planning)."""
+        rows = self._direct_child_statuses(task_id)
+        if rows and all(r["status"] in ("completed", "replaced") for r in rows):
+            return sum(1 for r in rows if r["status"] == "completed")
+        return 0
+
+    def _inherit_existing_children(self, agent_id, task_id, node):
+        """PATCH 39. A decomposer spawned on a task that already has
+        subtasks -- a respawn after its REPORT was rejected -- starts as one
+        that has spawned, with its completed subtasks' results in its notes.
+
+        has_spawned lives on the agent node and was never carried over, so
+        run 17's respawned root got the SPAWN/DIE menu
+        (_decomposer_awaiting_first_spawn) with four completed subtasks on
+        its task, re-planned all four, and spent ~300 energy redoing them.
+        With has_spawned set, PATCH 36's rule gives it REPORT/DIE when every
+        subtask completed, so the respawn re-writes the roll-up instead."""
+        children = self._existing_children(task_id)
+        if not children:
+            return
+        node.has_spawned = True
+        completed = [c for c in children if c.status == 2 and c.result]
+        live_agent = self.live_agents.get(agent_id)
+        injected = 0
+        if live_agent is not None:
+            for child in completed:
+                result_str = self._scrub_result(
+                    str(child.result).strip(), "parent_injection",
+                    task_id=child.task_id)
+                if len(result_str) > 400:
+                    result_str = result_str[:400] + "..."
+                text = f"\n[CHILD RESULT - {child.task_id}]: {result_str}\n"
+                live_agent.thought_process += text
+                self.colony.debit_energy(agent_id, max(1, len(text) // 100),
+                                         category="injection")
+                injected += 1
+        self.colony.record_verdict("decomposer_respawn_inherited")
+        print(f"  [respawn-inherit] {agent_id} on {task_id}: {len(children)} "
+              f"existing subtask(s), {len(completed)} completed -- starts as "
+              f"having spawned; {injected} result(s) injected.")
 
     _SUBTASK_KEY_SYNONYMS = {
         "depends_on": "dependencies",
@@ -1334,7 +1403,7 @@ class Orchestrator:
         if role != "decomposer" and not requirements:
             goal_referent = (self.spec.get("goal") or self.spec.get("raw_text")) if self.spec else None
             if goal_referent:
-                goal_referent = _dedupe_repeated_sentences(str(goal_referent), max_chars=300)
+                goal_referent = self._goal_line(goal_referent)
                 self.colony.record_verdict("goal_referent_attached")
 
         parent_node = self.colony.get_agent(parent_id) if parent_id else None
@@ -1386,7 +1455,33 @@ class Orchestrator:
         goal_text = self.spec.get("goal") or self.spec.get("raw_text")
         if not goal_text:
             return None
-        return _dedupe_repeated_sentences(str(goal_text), max_chars=300)
+        return self._goal_line(goal_text)
+
+    # PATCH 40. The cap on the goal line every agent's ghost context and the
+    # judge's project_goal carry. 300 was set for one-sentence phaser goals;
+    # PATCH 40 falls back to the user's request text more often, and a
+    # request-sized goal has to fit whole.
+    GOAL_LINE_MAX_CHARS = 600
+
+    def _goal_line(self, goal_text) -> str:
+        """The goal for a prompt line: repeated sentences collapsed (what the
+        cap was guarding against -- a phaser goal looping on itself), then
+        capped at GOAL_LINE_MAX_CHARS. When whole-sentence capping would
+        keep under half the budget -- a short opening sentence followed by
+        one long sentence holding every ask, which _join_within_budget drops
+        whole -- it is cut at a word boundary instead, so the asks survive."""
+        text = str(goal_text)
+        cap = self.GOAL_LINE_MAX_CHARS
+        deduped = _dedupe_repeated_sentences(text, max_chars=len(text) + 1)
+        if len(deduped) <= cap:
+            return deduped
+        capped = _dedupe_repeated_sentences(text, max_chars=cap)
+        # Within budget and keeping at least half of it: whole sentences.
+        # Over budget means one first sentence longer than the cap, which
+        # _join_within_budget keeps whole; cut that at a word too.
+        if cap // 2 <= len(capped) <= cap + len("..."):
+            return capped
+        return deduped[:cap].rsplit(" ", 1)[0].rstrip(",;:") + "..."
 
     def _print_clause_reference_comparison(self, samples) -> None:
         """PATCH 17 ledger section. Whole-goal and max-over-clauses scored on
@@ -1553,7 +1648,7 @@ class Orchestrator:
         plus whatever its prerequisites have produced so far."""
         goal_text = (self.spec.get("goal") or self.spec.get("raw_text")) if self.spec else None
         if goal_text:
-            goal_text = _dedupe_repeated_sentences(goal_text, max_chars=300)
+            goal_text = self._goal_line(goal_text)
         goal_line = (
             f"[Project goal -- for background only, NOT your task's scope: "
             f"your own task and constraints above are the ONLY things you "
@@ -2243,11 +2338,16 @@ class Orchestrator:
             for i, attempt in enumerate(goal["attempts"], 1):
                 problems = [f"figures not in request {attempt['extra']}" if attempt["extra"] else "",
                             f"request figures missing {attempt['missing']}" if attempt["missing"] else "",
-                            f"{len(attempt['uncovered'])} part(s) not covered" if attempt["uncovered"] else ""]
+                            f"{len(attempt['uncovered'])} part(s) not covered" if attempt["uncovered"] else "",
+                            f"{len(attempt.get('added') or [])} part(s) not in the request (PATCH 40)"
+                            if attempt.get("added") else "",
+                            "degenerate draw (PATCH 40)" if attempt.get("degenerate") else ""]
                 problems = "; ".join(p for p in problems if p) or "ok"
                 print(f"      draw {i}: {problems}")
                 for ask in attempt["uncovered"]:
                     print(f"        missing part: {ask[:90]!r}")
+                for clause in attempt.get("added") or []:
+                    print(f"        added part  : {clause[:90]!r}")
         constraints = spec.get("constraint_fidelity")
         if constraints:
             print(f"    constraints : {len(constraints['dropped'])} dropped for "
@@ -3220,7 +3320,71 @@ class Orchestrator:
                          "label": child.label,
                          "excerpt": excerpt,
                          "reused": child.parent_task_id != task_id})
+        self._mark_replaced_children(rows)
         return rows
+
+    # PATCH 39. A failed subtask counts as redone when a LATER completed
+    # sibling has the same descriptive label (single letters like "a" are
+    # reused across batches and do not count), or nearly the same wording:
+    # this overlap AND at least REPLACED_CHILD_MIN_SHARED shared stems. At
+    # 0.5, "fee per plot" vs "fee per member" and "summer" vs "winter
+    # watering duty" matched -- different parts the decomposer still owed.
+    REPLACED_CHILD_MIN_OVERLAP = 0.8
+    REPLACED_CHILD_MIN_SHARED = 3
+    REPLACED_CHILD_MIN_LABEL_CHARS = 3
+    _FAILED_CHILD_LABELS = ("failed", "abandoned", "not started")
+
+    def _mark_replaced_children(self, rows):
+        """Relabels, in place, a failed row whose part a later completed
+        sibling covered as status "replaced". Without this a decomposer that
+        re-SPAWNed an abandoned part and got it done still listed the dead
+        original as failed: PATCH 36 kept SPAWN on its menu, and a respawn
+        of it was priced as planning (PATCH 39)."""
+        for i, row in enumerate(rows):
+            if row["status"] not in self._FAILED_CHILD_LABELS:
+                continue
+            label = str(row.get("label") or "").strip().lower()
+            stems = content_stems(row["task"])
+            for later in rows[i + 1:]:
+                if later["status"] != "completed":
+                    continue
+                later_label = str(later.get("label") or "").strip().lower()
+                if (len(label) >= self.REPLACED_CHILD_MIN_LABEL_CHARS
+                        and label == later_label):
+                    row["status"] = "replaced"
+                    break
+                later_stems = content_stems(later["task"])
+                shared = len(stems & later_stems)
+                if (stems and later_stems
+                        and shared >= self.REPLACED_CHILD_MIN_SHARED
+                        and shared / min(len(stems), len(later_stems))
+                        >= self.REPLACED_CHILD_MIN_OVERLAP):
+                    row["status"] = "replaced"
+                    break
+
+    # PATCH 38. The pre-judge trim for an executor's REPORT: one answer.
+    REPORT_TRIM_SENTENCES = 3
+    REPORT_TRIM_WORDS = 60
+    # A decomposer's REPORT is a roll-up: one sentence per direct subtask,
+    # plus one, at this many words each.
+    ROLLUP_TRIM_WORDS_PER_SENTENCE = 25
+    # Upper bound, so a task with many re-spawned children cannot hand the
+    # judge an essay.
+    ROLLUP_TRIM_MAX_SENTENCES = 8
+
+    def _report_trim_budget(self, agent_id, task_id):
+        """(max_sentences, max_words) for the pre-judge trim. Run 17's root
+        covered all four parts in four sentences; the flat 3-sentence cap
+        dropped the fourth before the judge read it."""
+        node = self.colony.get_agent(agent_id) if agent_id else None
+        if node is None or getattr(node, "role", None) != "decomposer":
+            return self.REPORT_TRIM_SENTENCES, self.REPORT_TRIM_WORDS
+        children = sum(1 for r in self._direct_child_statuses(task_id)
+                       if r["status"] != "replaced")
+        sentences = min(self.ROLLUP_TRIM_MAX_SENTENCES,
+                        max(self.REPORT_TRIM_SENTENCES, children + 1))
+        return sentences, max(self.REPORT_TRIM_WORDS,
+                              sentences * self.ROLLUP_TRIM_WORDS_PER_SENTENCE)
 
     def handle_completion(self, event: Event):
         """PROMOTE: Routes completed results to parents, unblocks tasks, or triggers synthesizer."""
@@ -3321,8 +3485,9 @@ class Orchestrator:
                 print(f"  [report-trim] {agent_id} REPORT dropped a degenerate "
                       f"tail ({len(completed)} -> {len(untailed)} chars).")
                 completed = untailed
-            trimmed = trim_to_sentences(completed, max_sentences=3,
-                                        max_words=60, marker=False)
+            max_sentences, max_words = self._report_trim_budget(agent_id, task_id)
+            trimmed = trim_to_sentences(completed, max_sentences=max_sentences,
+                                        max_words=max_words, marker=False)
             if trimmed != str(result):
                 print(f"  [report-trim] {agent_id} REPORT trimmed "
                       f"{len(str(result))} -> {len(trimmed)} chars before judging.")
@@ -5220,7 +5385,8 @@ class Orchestrator:
                                ("SPAWN closed (no energy)", "spawn_closed_no_energy"),
                                ("SPAWN refused, no subtask completed",
                                 "spawn_refused_no_completed_child"),
-                               ("overflow dropped, parent retired", "overflow_dropped_parent_retired")):
+                               ("overflow dropped, parent retired", "overflow_dropped_parent_retired"),
+                               ("decomposer respawn kept subtasks", "decomposer_respawn_inherited")):
                 print(f"    {label:<35}: {verdicts.get(key, 0)}")
 
             live_count = getattr(self, "_live_agents_at_terminate", len(self.live_agents))
