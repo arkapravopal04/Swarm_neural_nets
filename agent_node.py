@@ -1077,6 +1077,40 @@ class Agent:
             "there. Your task below is the part of it you answer.\n\n"
         )
 
+    _EARLIER_ATTEMPTS_HEADER = (
+        "[EARLIER ATTEMPTS AT THIS TASK FAILED -- do not repeat these]\n")
+
+    def _ghost_context_str(self):
+        """
+        PATCH 44 (part 2). The ghost context as prompt text, for the thinking
+        seed and the decide prompt both.
+
+        A respawned agent's ghost_context is a dict (ColonyState.
+        extract_agent_ghost): "base_context" (the project-goal line and the
+        prerequisite results the task was first given), "earlier_failures"
+        (oldest first) and "fail_reason" (why the previous agent died), plus
+        last_task / energy_spent / role, which are never shown. Printed as
+        f"Ghost Context: {dict}" it was a raw Python repr with newlines shown
+        as backslash-n and energy_spent visible. A plain string renders
+        exactly as before.
+        """
+        value = self.ghost_context
+        if not value:
+            return ""
+        if not isinstance(value, dict):
+            return f"Ghost Context: {value}\n"
+        parts = []
+        base = value.get("base_context")
+        if base:
+            parts.append(f"{base}\n")
+        reasons = [str(r) for r in (value.get("earlier_failures") or []) if r]
+        if value.get("fail_reason"):
+            reasons.append(str(value["fail_reason"]))
+        if reasons:
+            parts.append(self._EARLIER_ATTEMPTS_HEADER
+                         + "".join(f"- {r}\n" for r in reasons))
+        return "".join(parts)
+
     def _build_thinking_seed(self, requirements=None, available_tools=None):
         if requirements is None:
             requirements = self.requirements or []
@@ -1133,7 +1167,7 @@ class Agent:
             )
         else:
             actions_str = "Real actions that exist for your role: THINK, TOOL, REPORT, DIE (no others exist).\n"
-        ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
+        ghost_str = self._ghost_context_str()  # PATCH 44
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
         # more line of the agent's own commentary, especially with the
@@ -1164,7 +1198,7 @@ class Agent:
         if requirements is None:
             requirements = self.requirements or []
 
-        ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
+        ghost_str = self._ghost_context_str()  # PATCH 44
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
         # more line of the agent's own commentary, especially with the
