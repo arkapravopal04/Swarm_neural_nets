@@ -2065,6 +2065,13 @@ Your next action:"""
     # changes between attempt 1 and attempt 15 of the same deterministically
     # blocked call; two is enough to establish the agent is repeating it.
     MAX_DISABLED_TOOL_ATTEMPTS = 2
+    # PATCH 49. Ceiling on one tool result as it enters this agent's
+    # context (receive_tool_result): longer results keep the first
+    # TOOL_RESULT_HEAD_CHARS and the last TOOL_RESULT_TAIL_CHARS around a
+    # "characters cut" marker.
+    TOOL_RESULT_MAX_CHARS = 1500
+    TOOL_RESULT_HEAD_CHARS = 1000
+    TOOL_RESULT_TAIL_CHARS = 400
 
     @staticmethod
     def _normalize_args_for_signature(value):
@@ -2396,6 +2403,19 @@ Your next action:"""
         place that learns whether a call actually worked.
         """
         result_summary = str(result_summary)
+        # PATCH 49. Cap before anything stores it: run_code can return up to
+        # 1 MB of stdout, and this string is re-printed (via last_tool_result
+        # and thought_process) in every later think seed and decide() prompt.
+        # Head + tail, so both the first values and a trailing error or
+        # final print survive.
+        if len(result_summary) > self.TOOL_RESULT_MAX_CHARS:
+            head = result_summary[:self.TOOL_RESULT_HEAD_CHARS]
+            tail = result_summary[-self.TOOL_RESULT_TAIL_CHARS:]
+            cut = len(result_summary) - len(head) - len(tail)
+            result_summary = (
+                f"{head}\n[... {cut} characters cut -- print only the values "
+                f"you need ...]\n{tail}"
+            )
         if self.pending_tool_name_correction:
             result_summary = f"{self.pending_tool_name_correction}\n{result_summary}"
             self.pending_tool_name_correction = None
