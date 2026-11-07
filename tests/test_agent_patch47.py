@@ -52,9 +52,81 @@ def test_decomposer_report_does_not_stop_on_blank_line():
 
 
 def test_second_block_opening_stops():
-    assert _stops("ACTION: REPORT\nPAYLOAD: The answer is 5.\n\nACTION")
     assert _stops("ACTION: REPORT\nPAYLOAD: The answer is 5.\n\nACTION:")
-    assert _stops("ACTION: REPORT\nPAYLOAD: Part A done.\n\nACTION", role="decomposer")
+    assert _stops("ACTION: REPORT\nPAYLOAD: The answer is 5.\n\nACTION: ")
+    assert _stops("ACTION: REPORT\nPAYLOAD: Part A done.\n\nACTION:", role="decomposer")
+    # Review fix: the colon is required, so a bare "ACTION" (which may be the
+    # start of "ACTION ITEMS") does not stop on its own.
+    assert not _stops("ACTION: REPORT\nPAYLOAD: Part A done.\n\nACTION", role="decomposer")
+
+
+# ---------------------------------------------------------------- review fixes
+
+def _first_stop(text, role=None):
+    """Feed every character prefix to the stop, as generation would; return
+    the prefix it stops at (the whole text if it never does)."""
+    for i in range(1, len(text) + 1):
+        if _stops(text[:i], role=role):
+            return text[:i]
+    return text
+
+
+ITEMS = "A done. B done.\n\nACTION ITEMS:\n- Alice books room.\n- Bob sends deck."
+
+
+def test_action_items_heading_never_stops_generation():
+    text = "ACTION: REPORT\nPAYLOAD: " + ITEMS
+    heading = text.index("\n\nACTION ITEMS") + 3
+    # From the heading on, no prefix stops. (The blank line before it is the
+    # ordinary finished-REPORT stop, unchanged by PATCH 47.)
+    for i in range(heading, len(text) + 1):
+        assert not _stops(text[:i]), repr(text[:i])
+
+
+def test_decide_keeps_action_items():
+    agent = _with_reply(_agent(), "ACTION: REPORT\nPAYLOAD: " + ITEMS)
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "REPORT"
+    assert "ACTION ITEMS:" in payload
+    assert "Alice books room." in payload and "Bob sends deck." in payload
+
+
+def test_action_plan_line_kept_whole():
+    text = "ACTION: REPORT\nPAYLOAD: Root cause is X.\nACTION PLAN: patch Y."
+    assert _first_stop(text) == text
+    agent = _with_reply(_agent(), text)
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "REPORT"
+    assert "Root cause is X." in payload and "ACTION PLAN: patch Y." in payload
+
+
+def test_decomposer_actions_taken_not_stopped():
+    text = "ACTION: REPORT\nPAYLOAD: A done.\n\nACTIONS TAKEN: restarted Y."
+    assert _first_stop(text, role="decomposer") == text
+    agent = _with_reply(_agent("decomposer", has_spawned=True), text)
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "REPORT"
+    assert "ACTIONS TAKEN: restarted Y." in payload
+
+
+def test_unbalanced_spawn_then_second_spawn_runs_the_second():
+    text = ('ACTION: SPAWN\nPAYLOAD: {"role": "executor", "task": "compute x"\n\n'
+            'ACTION: SPAWN\nPAYLOAD: {"role":"executor","task":"y"}')
+    stopped = _first_stop(text)
+    # The "ACTION:" stub inside an open JSON payload does not stop it early.
+    assert stopped == text
+    agent = _with_reply(_agent("decomposer"), stopped)
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "SPAWN"
+    assert payload == {"role": "executor", "task": "y"}
+    assert "TRUNCATED" not in (agent.fail_reason or "")
+
+
+def test_last_line_rule_for_sentence_end():
+    # A decimal point on the last line counts as a sentence end.
+    assert _stops("ACTION: REPORT\nPAYLOAD: x = 3.5\n\n")
+    # A full stop on an EARLIER line does not make an unfinished last line done.
+    assert not _stops("ACTION: REPORT\nPAYLOAD: Done.\nOption B\n\n")
 
 
 def test_stub_without_a_complete_block_does_not_stop():

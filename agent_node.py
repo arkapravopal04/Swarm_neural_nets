@@ -66,8 +66,10 @@ _BARE_ACTION_RE = re.compile(
 )
 _PAYLOAD_RE = re.compile(r"PAYLOAD:\s*(.*)", re.DOTALL | re.IGNORECASE)
 # PATCH 47. Where a plain-text payload ends if the model opened another
-# block after it: a line starting with an uppercase "ACTION" label.
-_NEXT_ACTION_LINE_RE = re.compile(r"\n[ \t>*_#-]*ACTION\b")
+# block after it: a line starting with an uppercase "ACTION:" label, or a
+# bare "ACTION" at the very end. The colon is required otherwise, so prose
+# headings such as "ACTION ITEMS:" or "ACTION PLAN:" stay in the payload.
+_NEXT_ACTION_LINE_RE = re.compile(r"\n[ \t>*_#-]*ACTION[ \t]*(?::|\s*$)")
 
 
 def _last_action_match(text):
@@ -252,10 +254,11 @@ class _ActionPayloadStop(StoppingCriteria):
     # reads it. The budget is a ceiling on generation, not on what is kept.
     REPORT_MAX_NEW_TOKENS = 200
 
-    # PATCH 47. A trailing line that opens a new "ACTION" label (no action
-    # word yet). Case-sensitive on purpose: prose "action" inside a payload
-    # is not a new block.
-    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION\s*:?\s*$")
+    # PATCH 47. A trailing line that opens a new "ACTION:" label (no action
+    # word yet). Case-sensitive, and the colon is required: prose "action"
+    # and headings such as "ACTION ITEMS" / "ACTION PLAN" / "ACTIONS TAKEN"
+    # inside a payload are not a new block.
+    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION[ \t]*:[ \t]*$")
 
     def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10,
                  report_max_new_tokens=None, role=None):
@@ -312,16 +315,6 @@ class _ActionPayloadStop(StoppingCriteria):
         if not payload_raw:
             return False
 
-        # PATCH 47. The model has started a SECOND block ("...\n\nACTION")
-        # after a complete one: stop now. A bare "ACTION" stub has no action
-        # word, so it does not match _ACTION_LINE_RE and action_match is
-        # still the complete earlier block; decide() cuts the stub off.
-        stub = self._TRAILING_ACTION_STUB_RE.search(text)
-        if stub is not None:
-            before_stub = text[payload_match.start(1):stub.start()].strip()
-            if before_stub:
-                return True
-
         if payload_raw.startswith("{"):
             # JSON-shaped payload (SPAWN/TOOL) -- only complete once the
             # object actually balances; mirrors decide()'s own parser so
@@ -333,19 +326,31 @@ class _ActionPayloadStop(StoppingCriteria):
         # model considers this done" (matches how format_example_str's own
         # examples are paragraph-separated).
         #
+        # PATCH 47. The model has started a SECOND block ("...\n\nACTION:")
+        # after a complete plain-text one: stop now. A bare "ACTION:" stub
+        # has no action word, so it does not match _ACTION_LINE_RE and
+        # action_match is still the complete earlier block; decide() cuts
+        # the stub off. Plain-text payloads only -- a JSON payload is
+        # governed by extract_balanced_object above.
+        stub = self._TRAILING_ACTION_STUB_RE.search(text)
+        if stub is not None:
+            before_stub = text[payload_match.start(1):stub.start()].strip()
+            if before_stub:
+                return True
+
         # PATCH 47. Not for a REPORT that is plainly unfinished: a lead-in
-        # ("Here are the results:" + blank line) or a body with no sentence
-        # end yet. A decomposer's roll-up runs to the REPORT cap or EOS --
-        # it is several paragraphs by design. THINK and DIE keep the
+        # ("Here are the results:" + blank line) or a last line with no
+        # sentence end yet. A decomposer's roll-up runs to the REPORT cap or
+        # EOS -- it is several paragraphs by design. THINK and DIE keep the
         # blank-line stop unchanged.
         if action == "REPORT":
             if self.role == "decomposer":
                 return False
-            body = payload_raw.rstrip()
-            last_line = body.splitlines()[-1].strip() if body else ""
+            lines = [ln.strip() for ln in payload_raw.splitlines() if ln.strip()]
+            last_line = lines[-1] if lines else ""
             if last_line.endswith(":"):
                 return False
-            if not re.search(r"[.!?]", body):
+            if not re.search(r"[.!?]", last_line):
                 return False
         return text.endswith("\n\n")
 
