@@ -65,6 +65,9 @@ _BARE_ACTION_RE = re.compile(
     r"^[ \t]*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECASE | re.MULTILINE
 )
 _PAYLOAD_RE = re.compile(r"PAYLOAD:\s*(.*)", re.DOTALL | re.IGNORECASE)
+# PATCH 47. Where a plain-text payload ends if the model opened another
+# block after it: a line starting with an uppercase "ACTION" label.
+_NEXT_ACTION_LINE_RE = re.compile(r"\n[ \t>*_#-]*ACTION\b")
 
 
 def _last_action_match(text):
@@ -249,9 +252,17 @@ class _ActionPayloadStop(StoppingCriteria):
     # reads it. The budget is a ceiling on generation, not on what is kept.
     REPORT_MAX_NEW_TOKENS = 200
 
+    # PATCH 47. A trailing line that opens a new "ACTION" label (no action
+    # word yet). Case-sensitive on purpose: prose "action" inside a payload
+    # is not a new block.
+    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION\s*:?\s*$")
+
     def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10,
-                 report_max_new_tokens=None):
+                 report_max_new_tokens=None, role=None):
         self.tokenizer = tokenizer
+        # PATCH 47: a decomposer's REPORT (the roll-up) ends on the cap or
+        # EOS only, never on a blank line.
+        self.role = role
         self.prompt_len = prompt_len
         self.extract_balanced_object = extract_balanced_object
         self.min_new_tokens = min_new_tokens
@@ -301,6 +312,16 @@ class _ActionPayloadStop(StoppingCriteria):
         if not payload_raw:
             return False
 
+        # PATCH 47. The model has started a SECOND block ("...\n\nACTION")
+        # after a complete one: stop now. A bare "ACTION" stub has no action
+        # word, so it does not match _ACTION_LINE_RE and action_match is
+        # still the complete earlier block; decide() cuts the stub off.
+        stub = self._TRAILING_ACTION_STUB_RE.search(text)
+        if stub is not None:
+            before_stub = text[payload_match.start(1):stub.start()].strip()
+            if before_stub:
+                return True
+
         if payload_raw.startswith("{"):
             # JSON-shaped payload (SPAWN/TOOL) -- only complete once the
             # object actually balances; mirrors decide()'s own parser so
@@ -311,6 +332,21 @@ class _ActionPayloadStop(StoppingCriteria):
         # wait for, so a blank line after real content is treated as "the
         # model considers this done" (matches how format_example_str's own
         # examples are paragraph-separated).
+        #
+        # PATCH 47. Not for a REPORT that is plainly unfinished: a lead-in
+        # ("Here are the results:" + blank line) or a body with no sentence
+        # end yet. A decomposer's roll-up runs to the REPORT cap or EOS --
+        # it is several paragraphs by design. THINK and DIE keep the
+        # blank-line stop unchanged.
+        if action == "REPORT":
+            if self.role == "decomposer":
+                return False
+            body = payload_raw.rstrip()
+            last_line = body.splitlines()[-1].strip() if body else ""
+            if last_line.endswith(":"):
+                return False
+            if not re.search(r"[.!?]", body):
+                return False
         return text.endswith("\n\n")
 
 
@@ -1739,7 +1775,9 @@ Your next action:"""
         # input_ids each call), so the same instance is reused across the
         # retry loop below.
         stopping_criteria = StoppingCriteriaList([
-            _ActionPayloadStop(self.tokeniser, prompt_len, self._extract_first_balanced_object)
+            # PATCH 47: role, so a decomposer's roll-up is not cut at a blank line.
+            _ActionPayloadStop(self.tokeniser, prompt_len, self._extract_first_balanced_object,
+                               role=self.role)
         ])
 
         generated_text = None
@@ -1958,6 +1996,11 @@ Your next action:"""
                 # tail that _looks_degenerate now also flags upstream --
                 # both are needed, since the flag only triggers a retry and
                 # a retry can come back with filler of its own.
+                #
+                # PATCH 47: the stop criterion now ends generation when the
+                # model opens a second block ("\n\nACTION"); that stub, and
+                # anything after it, is not part of this payload.
+                payload_raw = _NEXT_ACTION_LINE_RE.split(payload_raw, maxsplit=1)[0].rstrip()
                 payload = _dedupe_repeated_sentences(
                     trim_closer_tail(payload_raw), max_chars=2000
                 )
