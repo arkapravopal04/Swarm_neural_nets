@@ -452,6 +452,10 @@ class Agent:
         # available_tools=[] argument actually block TOOL at execute() time
         # instead of only changing prompt wording -- see request_tool().
         self._run_available_tools = None
+        # PATCH 45. What think()'s KV cache last saw of the information that
+        # can change between cycles (_think_context_snapshot). None until the
+        # first seed.
+        self._think_context_key = None
 
     @property
     def agent_id(self):
@@ -1412,6 +1416,47 @@ Your next action:"""
         return prompt
     
 
+    def _think_context_snapshot(self):
+        """PATCH 45. The parts of the thinking seed that can change after it
+        was fed to the KV cache: (fail_reason, last_tool_result,
+        repr(ghost_context), child-status block). Compared by think() each
+        continued cycle."""
+        child_block = (self._child_status_block(self._direct_child_statuses())
+                       if self.role == "decomposer" else "")
+        return (self.fail_reason, self.last_tool_result,
+                repr(self.ghost_context), child_block)
+
+    def _think_context_update(self, snap):
+        """PATCH 45. (text to feed think()'s KV cache, [names of the changed
+        parts]) for the parts of `snap` that differ from what the cache last
+        saw and are non-empty now. ("", []) when nothing worth adding --
+        e.g. only fail_reason was cleared."""
+        prev = self._think_context_key or (None, None, None, None)
+        fail_reason, tool_result, ghost_repr, child_block = snap
+        body = []
+        changed = []
+        if fail_reason != prev[0] and fail_reason:
+            # Same wording as _build_prompt / _build_thinking_seed.
+            body.append(
+                f"[VERDICT FROM REVIEWER -- this is not your reasoning, it is a "
+                f"ruling on your last attempt]\n{fail_reason}\n[END VERDICT]\n")
+            changed.append("fail_reason")
+        if tool_result != prev[1] and tool_result:
+            body.append(f"Result of your most recent TOOL call:\n{tool_result}\n")
+            changed.append("last_tool_result")
+        if ghost_repr != prev[2]:
+            ghost_str = self._ghost_context_str()
+            if ghost_str:
+                body.append(ghost_str)
+                changed.append("ghost_context")
+        if child_block != prev[3] and child_block:
+            body.append(child_block)
+            changed.append("child_status")
+        if not body:
+            return "", []
+        return ("\n\n[NEW INFORMATION since your last thoughts]\n" + "".join(body)
+                + "[END NEW INFORMATION]\nContinue thinking with this in mind:\n"), changed
+
     def think(self, available_roles=None, available_tools=None, requirements=None):
         """
         See class-level docstring/comments in the previous revision for the
@@ -1426,12 +1471,32 @@ Your next action:"""
             input_ids = inputs["input_ids"]
             self._total_generated = 0  # fresh reasoning chain -- reset lifetime counter
             self._think_recent_ids.clear()  # ...and the repetition window it shares a context with
+            # PATCH 45: what this seed showed, so later cycles can tell what changed.
+            self._think_context_key = self._think_context_snapshot()
 
         else:
             if self.last_token_id is not None:
                 input_ids = torch.tensor([[self.last_token_id]], device=self.model.device)
             else:
                 raise ValueError("KV_Cache is present, but missing last_token_id to continue generation.")
+            # PATCH 45. The cache only ever saw the seed. A tool result, a
+            # reviewer verdict, a child status or a threaded dependency result
+            # that arrived since is fed in here, after last_token_id (sampled
+            # last cycle but never fed to the model, so it goes first).
+            # Prompt-side only: not added to thought_process, not counted in
+            # _total_generated or the repetition window.
+            snap = self._think_context_snapshot()
+            if snap != self._think_context_key:
+                update_text, changed = self._think_context_update(snap)
+                if update_text:
+                    delta = self.tokeniser(update_text, return_tensors="pt",
+                                           add_special_tokens=False)
+                    delta_ids = delta["input_ids"].to(self.model.device)
+                    input_ids = torch.cat([input_ids, delta_ids], dim=1)
+                    print(f"  [think() context update] agent={self.agent_id} "
+                          f"role={self.role} +{delta_ids.shape[1]} tokens "
+                          f"(changed: {', '.join(changed)})")
+                self._think_context_key = snap
 
         hit_token_ceiling = False
         hit_degenerate = False
