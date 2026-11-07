@@ -117,7 +117,9 @@ def test_request_tool_stores_and_sends_canonical_name():
         ("**run_code**", "run_code"),
         ("run code", "run_code"),
         ("Run_Code", "run_code"),
-        ("read_file", "safe_read_file"),
+        # PATCH 50: only run_code and verify_math are advertised to agents.
+        ("verify math", "verify_math"),   # a mangled advertised tool still resolves
+        ("read_file", "read_file"),       # PATCH 50: no longer advertised, so it must NOT be "repaired" onto run_code or verify_math
     ],
 )
 def test_mangled_names_resolve_to_the_right_tool(typed, canonical):
