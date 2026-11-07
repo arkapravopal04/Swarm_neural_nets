@@ -887,14 +887,15 @@ class Agent:
         # lines of exact-key JSON for tools the agent is not permitted to
         # call -- it is both the largest tool-shaped block in the prompt
         # and an implicit claim that calling them is on the table.
+        # PATCH 50: run_code and verify_math only. The file tools
+        # (safe_read_file, write_file, query_dataframe) are off the menu
+        # (ToolRegistry.list_tools) because they cannot work in a run, so
+        # they are not advertised here either.
         tool_arg_reference = "" if tools_blocked or not self._role_may_tool else (
             "Tool argument reference (use the EXACT keys shown for each "
             "tool -- they are NOT interchangeable):\n"
             '- run_code: {"tool_name": "run_code", "args": {"code_string": "..."}}\n'
             '- verify_math: {"tool_name": "verify_math", "args": {"expression": "...", "mode": "computational"}}\n'
-            '- safe_read_file: {"tool_name": "safe_read_file", "args": {"filepath": "..."}}\n'
-            '- write_file: {"tool_name": "write_file", "args": {"filepath": "...", "content": "..."}}\n'
-            '- query_dataframe: {"tool_name": "query_dataframe", "args": {"filepath": "...", "action": "summary"}}\n'
         )
 
         # SPAWN examples go to decomposers only. A SPAWN from any other role
@@ -2458,6 +2459,21 @@ Your next action:"""
         # MAX_DISABLED_TOOL_ATTEMPTS identical-in-kind blocks instead of
         # letting the agent grind all the way to the per-agent tool cap
         # re-discovering the same "no tools available" fact each time.
+        # PATCH 50: split. Only an EMPTY available set means "tools are
+        # disabled for this run" (and counts toward closing TOOL). A name
+        # outside a non-empty set is a wrong choice of tool: say which tools
+        # exist, and leave TOOL open -- before, two such calls closed TOOL
+        # entirely, run_code included.
+        if (self._run_available_tools is not None and len(self._run_available_tools) > 0
+                and tool_name not in self._run_available_tools):
+            self.fail_reason = (
+                f"Tool '{tool_name}' is not available. Available tools: "
+                f"{list(self._run_available_tools)}. Use one of those, or REPORT."
+            )
+            print(f"  [request_tool() BLOCKED - not an available tool] {tool_name} "
+                  f"(available: {list(self._run_available_tools)})")
+            return
+
         if self._run_available_tools is not None and tool_name not in self._run_available_tools:
             self.disabled_tool_attempts += 1
             if self.disabled_tool_attempts >= self.MAX_DISABLED_TOOL_ATTEMPTS:
