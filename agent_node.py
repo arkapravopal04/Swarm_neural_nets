@@ -28,12 +28,8 @@ from text_utils import (
     trim_closer_tail,
     without_decision_records,
 )
-from text_utils import normalize_words
-try:
-    # PATCH 51 (review): the residue rule shared with is_exemplar_echo.
-    from text_utils import EXEMPLAR_ONLY_MAX_EXTRA_WORDS as _EXEMPLAR_ONLY_MAX_EXTRA_WORDS
-except ImportError:
-    _EXEMPLAR_ONLY_MAX_EXTRA_WORDS = 3
+# PATCH 51 (review): the residue rule shared with is_exemplar_echo.
+from text_utils import EXEMPLAR_ONLY_MAX_EXTRA_WORDS, normalize_words
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList
 import ast
@@ -214,11 +210,25 @@ EXEMPLAR_REPORT_TEXTS = (_EX_WORKED_REPORT,)
 def _exemplar_pattern(example):
     """PATCH 51 (review). A copy of `example` as a REPORT may carry it:
     any case, any whitespace between its words, its final punctuation
-    optional, wrapped in quotes or not."""
+    optional, on word boundaries ("...the secondary school" is not a copy),
+    and wrapped in a MATCHING pair of quotes or none -- a lone quote mark
+    next to it belongs to the agent's own text ('"Plan B"', "'A'")."""
     body = example.rstrip(".!?")
     words = r"\s+".join(re.escape(w) for w in body.split())
-    return re.compile(r"[\"'“‘]?\s*" + words + r"[.!?]?\s*[\"'”’]?",
-                      re.IGNORECASE)
+    core = r"(?<!\w)" + words + r"(?!\w)[.!?]?"
+    quoted = [r'"\s*' + core + r'\s*"', r"'\s*" + core + r"\s*'",
+              "\u201c\\s*" + core + "\\s*\u201d", "\u2018\\s*" + core + "\\s*\u2019"]
+    return re.compile("(?:" + "|".join(quoted + [core]) + ")", re.IGNORECASE)
+
+
+def _is_example_fragment(text, example):
+    """PATCH 51 (review). True when `text`, word-normalized, is a run of
+    consecutive words from `example` -- the cut-off tail of a looped copy."""
+    left = normalize_words(text).split()
+    words = normalize_words(example).split()
+    if not left or len(left) > len(words):
+        return False
+    return any(words[i:i + len(left)] == left for i in range(len(words) - len(left) + 1))
 
 
 _EXEMPLAR_REPORT_PATTERNS = tuple(_exemplar_pattern(ex) for ex in EXEMPLAR_REPORT_TEXTS)
@@ -2216,7 +2226,8 @@ Your next action:"""
         text_utils.degeneracy_cut cuts from the example to the END -- the
         real answer went with it. Each copy of an EXEMPLAR_REPORT_TEXTS string
         is removed here -- case-insensitive, final punctuation optional, any
-        whitespace between its words, together with quotes wrapped round it.
+        whitespace between its words, on word boundaries, together with a
+        matching pair of quotes wrapped round it (_exemplar_pattern).
 
         The text is returned UNCHANGED (so the orchestrator's whole-echo
         reject still fires) when what is left is a label or a word or two:
@@ -2234,7 +2245,10 @@ Your next action:"""
         stripped = re.sub(r" *\n *", "\n", stripped)
         stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
         if (not re.search(r"[A-Za-z0-9]", stripped)
-                or len(normalize_words(stripped).split()) <= _EXEMPLAR_ONLY_MAX_EXTRA_WORDS):
+                or len(normalize_words(stripped).split()) <= EXEMPLAR_ONLY_MAX_EXTRA_WORDS
+                # A looped copy cut off mid-way: what is left is still the
+                # example, only shorter.
+                or any(_is_example_fragment(stripped, ex) for ex in EXEMPLAR_REPORT_TEXTS)):
             return text
         print(f"  [decide() EXEMPLAR ECHO] removed a copy of the prompt's worked "
               f"REPORT; kept {len(stripped)} chars of the agent's own text.")

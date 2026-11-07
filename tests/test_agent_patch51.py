@@ -89,3 +89,34 @@ def test_quoted_copy_leaves_no_empty_quotes():
     assert '""' not in out
     out = Agent._strip_exemplar_echo("\u201c" + EX + "\u201d " + ANSWER)
     assert out == ANSWER
+
+
+# -------------------------------------------------- review fixes, third round
+
+def test_cut_off_looped_example_is_still_an_echo():
+    text = " ".join([EX] * 11) + " Both options meet every constraint, and the second costs"
+    assert Agent._strip_exemplar_echo(text) == text
+
+
+def test_two_copies_then_a_real_answer_is_stripped_to_the_answer():
+    assert Agent._strip_exemplar_echo(EX + " " + EX + " " + ANSWER) == ANSWER
+
+
+def test_lone_quotes_next_to_the_copy_are_kept():
+    out = Agent._strip_exemplar_echo(EX + ' "Plan B" is cheaper because it costs 40 less.')
+    assert out == '"Plan B" is cheaper because it costs 40 less.'
+    out = Agent._strip_exemplar_echo(
+        "The option labelled 'A' " + EX + " Then option A wins on cost and time.")
+    assert out == "The option labelled 'A' Then option A wins on cost and time."
+
+
+def test_longer_word_after_the_example_is_not_a_copy():
+    text = ("Both options meet every constraint, and the second costs less, so "
+            "choose the secondary school route for 42 pupils.")
+    assert Agent._strip_exemplar_echo(text) == text
+
+
+def test_residue_limit_comes_from_text_utils():
+    import agent_node
+    import text_utils
+    assert agent_node.EXEMPLAR_ONLY_MAX_EXTRA_WORDS is text_utils.EXEMPLAR_ONLY_MAX_EXTRA_WORDS
