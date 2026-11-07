@@ -176,6 +176,37 @@ def test_verify_math_false_identity(_sympy):
     assert result["data"].startswith("FALSE")
 
 
+def test_verify_math_two_plus_two_is_five_reports_the_gap(_sympy):
+    result = ToolRegistry.verify_math("2+2=5")
+    assert result["data"].startswith("FALSE: the sides differ by -1")
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["cos(pi/7)-cos(2*pi/7)+cos(3*pi/7) = 1/2", "0.1+0.2=0.3"],
+)
+def test_verify_math_numeric_identity_is_true(_sympy, expression):
+    result = ToolRegistry.verify_math(expression)
+    assert result["status"] == "success"
+    assert result["data"].startswith("TRUE: both sides are equal numerically")
+
+
+def test_verify_math_close_constant_is_false_with_gap(_sympy):
+    data = ToolRegistry.verify_math("pi = 3.14159")["data"]
+    assert data.startswith("FALSE")
+    assert "e-6" in data or "0.0000026" in data
+
+
+def test_verify_math_one_third_is_not_0_3333(_sympy):
+    assert ToolRegistry.verify_math("1/3 = 0.3333")["data"].startswith("FALSE")
+
+
+def test_verify_math_trig_solutions_are_flagged(_sympy):
+    data = ToolRegistry.verify_math("sin(x)=0")["data"]
+    assert data.startswith("solutions:")
+    assert "principal solutions only" in data
+
+
 def test_verify_math_inequality_takes_old_path(_sympy):
     result = ToolRegistry.verify_math("x <= 3")
     assert result["status"] in {"success", "error"}

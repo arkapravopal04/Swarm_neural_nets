@@ -1461,6 +1461,12 @@ class ToolRegistry:
             # otherwise the solutions. Zero or several split points keep the
             # old sympify path. Everything still runs inside the sandbox; the
             # expression is still embedded with repr().
+            # PATCH 54 (review): a constant difference simplify() cannot
+            # reduce to 0 is checked numerically (30 digits, 1e-9 relative)
+            # before FALSE is reported, so true trig identities and float
+            # round-off ("0.1+0.2=0.3") are not called FALSE; FALSE now
+            # prints the numeric gap. Solutions of trig equations are flagged
+            # as principal values only.
             code_string = (
                 "import re\n"
                 "import sympy\n"
@@ -1484,9 +1490,28 @@ class ToolRegistry:
                 "    if _d == 0:\n"
                 "        print('TRUE: both sides are equal')\n"
                 "    elif not _d.free_symbols:\n"
-                "        print(f'FALSE: the sides differ by {_d}')\n"
+                "        _msg = f'FALSE: the sides differ by {_d}'\n"
+                "        try:\n"
+                "            _n = _d.evalf(30)\n"
+                "            _a = abs(_n)\n"
+                "            if _a.is_Number:\n"
+                "                _scale = max(1, abs(sympy.sympify(_lhs).evalf(30)),\n"
+                "                             abs(sympy.sympify(_rhs).evalf(30)))\n"
+                "                if _a <= 1e-9 * _scale:\n"
+                "                    _msg = ('TRUE: both sides are equal numerically (difference '\n"
+                "                            'below 1e-9 relative); sympy could not prove it symbolically')\n"
+                "                else:\n"
+                "                    _msg = f'FALSE: the sides differ by {_n.evalf(6)}'\n"
+                "                    if not _d.is_Number:\n"
+                "                        _msg += f' (exactly {_d})'\n"
+                "        except Exception:\n"
+                "            pass\n"
+                "        print(_msg)\n"
                 "    else:\n"
-                "        print(f'solutions: {sympy.solve(_d)}')\n"
+                "        _sol = f'solutions: {sympy.solve(_d)}'\n"
+                "        if _d.has(sympy.sin, sympy.cos, sympy.tan, sympy.sec, sympy.csc, sympy.cot):\n"
+                "            _sol += ' (principal solutions only -- periodic functions have infinitely many)'\n"
+                "        print(_sol)\n"
                 "else:\n"
                 "    _simplified = sympy.simplify(sympy.sympify(_expr))\n"
                 "    print(str(_simplified))\n"
