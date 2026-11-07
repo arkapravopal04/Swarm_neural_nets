@@ -1,4 +1,4 @@
-"""PATCH 44 (part 2): the ghost context renders as text, not a dict repr."""
+"""PATCH 55: the ghost context renders as text, not a dict repr."""
 import os
 import sys
 
@@ -56,10 +56,30 @@ def test_old_shape_dict_renders_its_fail_reason():
     assert "- R0" in prompt and "last_task" not in prompt
 
 
-def test_dict_without_reasons_or_base_renders_nothing():
+def test_reasonless_respawn_dict_renders_the_placeholder():
+    # PATCH 55: a non-empty dict ghost is a respawn; a death with no reason
+    # is shown at once rather than rendering nothing.
     agent = _agent({"last_task": "t", "energy_spent": 3, "role": "executor",
                     "base_context": None, "earlier_failures": [], "fail_reason": None})
-    assert agent._ghost_context_str() == ""
+    assert agent._ghost_context_str() == (
+        "[EARLIER ATTEMPTS AT THIS TASK FAILED -- do not repeat these]\n"
+        "- previous attempt ended without a stated reason\n")
+
+
+def test_dependent_task_reasonless_death_keeps_base_and_placeholder():
+    dep = "[Project goal] G\nShared state: X=5"
+    agent = _agent({"base_context": dep, "earlier_failures": [], "fail_reason": None})
+    text = agent._ghost_context_str()
+    assert text.startswith(dep + "\n[EARLIER ATTEMPTS")
+    assert "- previous attempt ended without a stated reason\n" in text
+    prompt = agent._build_prompt(available_tools=[], requirements=[])
+    assert "- previous attempt ended without a stated reason" in prompt
+
+
+def test_reasonless_latest_after_earlier_failures():
+    agent = _agent({"earlier_failures": ["R1"], "fail_reason": None})
+    lines = [ln for ln in agent._ghost_context_str().splitlines() if ln.startswith("- ")]
+    assert lines == ["- R1", "- previous attempt ended without a stated reason"]
 
 
 # ---------------------------------------------------------------- review fixes

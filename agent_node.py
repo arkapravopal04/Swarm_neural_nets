@@ -1168,13 +1168,15 @@ class Agent:
 
     _EARLIER_ATTEMPTS_HEADER = (
         "[EARLIER ATTEMPTS AT THIS TASK FAILED -- do not repeat these]\n")
-    # PATCH 44 (review): per-reason ceiling, same figure ColonyState uses
+    # PATCH 55 (review): per-reason ceiling, same figure ColonyState uses
     # for earlier_failures.
     GHOST_REASON_MAX_CHARS = 300
+    # PATCH 55: the latest reason when a respawn's predecessor left none.
+    _NO_STATED_REASON = "previous attempt ended without a stated reason"
 
     def _ghost_context_str(self):
         """
-        PATCH 44 (part 2). The ghost context as prompt text, for the thinking
+        PATCH 55. The ghost context as prompt text, for the thinking
         seed and the decide prompt both.
 
         A respawned agent's ghost_context is a dict (ColonyState.
@@ -1194,12 +1196,17 @@ class Agent:
         parts = []
         base = value.get("base_context")
         if base:
-            # PATCH 44 (review): no blank line between base and the header.
+            # PATCH 55 (review): no blank line between base and the header.
             parts.append(str(base).rstrip("\n") + "\n")
         raw = [r for r in (value.get("earlier_failures") or []) if r]
         if value.get("fail_reason"):
             raw.append(value["fail_reason"])
-        # PATCH 44 (review): every reason -- the current fail_reason too --
+        else:
+            # PATCH 55: a dict ghost always means a respawn, so the previous
+            # attempt died even when it left no reason -- say so now rather
+            # than one respawn later (ColonyState's placeholder text).
+            raw.append(self._NO_STATED_REASON)
+        # PATCH 55 (review): every reason -- the current fail_reason too --
         # capped like ColonyState caps earlier_failures, then hard-cut, and
         # flattened to one line so an embedded "[END VERDICT]" or newline
         # cannot break out of its bullet.
@@ -1272,7 +1279,7 @@ class Agent:
             )
         else:
             actions_str = "Real actions that exist for your role: THINK, TOOL, REPORT, DIE (no others exist).\n"
-        ghost_str = self._ghost_context_str()  # PATCH 44
+        ghost_str = self._ghost_context_str()  # PATCH 55
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
         # more line of the agent's own commentary, especially with the
@@ -1303,7 +1310,7 @@ class Agent:
         if requirements is None:
             requirements = self.requirements or []
 
-        ghost_str = self._ghost_context_str()  # PATCH 44
+        ghost_str = self._ghost_context_str()  # PATCH 55
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
         # more line of the agent's own commentary, especially with the
