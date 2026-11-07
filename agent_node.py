@@ -356,7 +356,12 @@ class Agent:
     THINK_DEGEN_MIN_TOKENS = 48
 
     MAX_TOTAL_THINK_TOKENS = 4096
-    THINK_CYCLES_BEFORE_DECIDE = 1
+    # PATCH 46. Was 1: think() returned "THINK" on an agent's first cycle, so
+    # the first run() skipped decide() and spent a whole tick (one extra
+    # think generation, ~2-5 energy, counted toward MAX_NON_TERMINAL_CYCLES)
+    # before the agent could act. At 0 think() always returns FORCE_DECIDE,
+    # so every run() is think -> decide.
+    THINK_CYCLES_BEFORE_DECIDE = 0
 
     # Hard ceiling on run() cycles that end without finishing or handing off.
     # Every run() past the first spends a full think() generation AND a
@@ -370,11 +375,15 @@ class Agent:
     # `awaiting` unset -- not only THINK. A SPAWN or TOOL the agent itself
     # rejects (malformed JSON, missing keys) returns without setting
     # `awaiting`, so the next tick is another think()+decide() on the same
-    # task: the same loop, and counting THINK alone never saw it. Includes
-    # think()'s automatic first cycle, so 4 means three more chosen by
-    # decide(). Once reached, run() skips think() and decide() is offered
-    # only final_actions.
-    MAX_NON_TERMINAL_CYCLES = 4
+    # task: the same loop, and counting THINK alone never saw it. Once
+    # reached, run() skips think() and decide() is offered only
+    # final_actions.
+    #
+    # PATCH 46: 4 -> 3. There is no automatic first THINK cycle any more
+    # (THINK_CYCLES_BEFORE_DECIDE = 0), so every counted cycle was chosen by
+    # decide(). 3 keeps the worst case (3 thinks, 4 decides) below the old
+    # one (4 thinks, 4 decides).
+    MAX_NON_TERMINAL_CYCLES = 3
 
     def __init__(self, tokeniser, model, message: Messenger, node: AgentNode,
                  KV_Cache=None, last_hidden_state=None):
