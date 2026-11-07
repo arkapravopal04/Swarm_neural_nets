@@ -1461,12 +1461,14 @@ class ToolRegistry:
             # otherwise the solutions. Zero or several split points keep the
             # old sympify path. Everything still runs inside the sandbox; the
             # expression is still embedded with repr().
-            # PATCH 54 (review): a constant difference simplify() cannot
-            # reduce to 0 is checked numerically (30 digits, 1e-9 relative)
-            # before FALSE is reported, so true trig identities and float
-            # round-off ("0.1+0.2=0.3") are not called FALSE; FALSE now
-            # prints the numeric gap. Solutions of trig equations are flagged
-            # as principal values only.
+            # PATCH 54 (review): a nonzero constant difference is classified
+            # in order: a side or the gap infinite/undefined -> UNDEFINED; an
+            # exact rational gap -> FALSE "by exactly" (no tolerance for exact
+            # arithmetic, so 10**20+1 = 10**20 stays FALSE); otherwise (Floats
+            # or irrational constants simplify() could not reduce) a 30-digit
+            # check with a true 1e-9 relative tolerance (no floor), so trig
+            # identities and float round-off are not called FALSE. Solutions
+            # of trig equations are flagged as principal values only.
             code_string = (
                 "import re\n"
                 "import sympy\n"
@@ -1492,14 +1494,18 @@ class ToolRegistry:
                 "    elif not _d.free_symbols:\n"
                 "        _msg = f'FALSE: the sides differ by {_d}'\n"
                 "        try:\n"
+                "            _L = sympy.sympify(_lhs).evalf(30)\n"
+                "            _R = sympy.sympify(_rhs).evalf(30)\n"
                 "            _n = _d.evalf(30)\n"
-                "            _a = abs(_n)\n"
-                "            if _a.is_Number:\n"
-                "                _scale = max(1, abs(sympy.sympify(_lhs).evalf(30)),\n"
-                "                             abs(sympy.sympify(_rhs).evalf(30)))\n"
-                "                if _a <= 1e-9 * _scale:\n"
-                "                    _msg = ('TRUE: both sides are equal numerically (difference '\n"
-                "                            'below 1e-9 relative); sympy could not prove it symbolically')\n"
+                "            if any(_v.is_finite is not True for _v in (_L, _R, _n)):\n"
+                "                _msg = 'UNDEFINED: cannot compare -- a side is infinite or undefined'\n"
+                "            elif _d.is_Rational:\n"
+                "                _msg = f'FALSE: the sides differ by exactly {_d}'\n"
+                "            else:\n"
+                "                _tol = 1e-9 * max(abs(_L), abs(_R))\n"
+                "                if abs(_n) <= _tol:\n"
+                "                    _msg = ('TRUE: both sides are equal to within 1e-9 relative; '\n"
+                "                            'sympy could not prove it exactly')\n"
                 "                else:\n"
                 "                    _msg = f'FALSE: the sides differ by {_n.evalf(6)}'\n"
                 "                    if not _d.is_Number:\n"

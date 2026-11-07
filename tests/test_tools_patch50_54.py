@@ -178,7 +178,33 @@ def test_verify_math_false_identity(_sympy):
 
 def test_verify_math_two_plus_two_is_five_reports_the_gap(_sympy):
     result = ToolRegistry.verify_math("2+2=5")
-    assert result["data"].startswith("FALSE: the sides differ by -1")
+    assert result["data"] == "FALSE: the sides differ by exactly -1"
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["10**20 + 1 = 10**20", "2**64 = 18446744073709551617"],
+)
+def test_verify_math_exact_rational_gap_is_false(_sympy, expression):
+    data = ToolRegistry.verify_math(expression)["data"]
+    assert data.startswith("FALSE: the sides differ by exactly")
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["1/0 = 1", "zoo = 1", "oo = 1", "oo = oo", "nan = nan"],
+)
+def test_verify_math_infinite_or_undefined_side(_sympy, expression):
+    data = ToolRegistry.verify_math(expression)["data"]
+    assert data.startswith("UNDEFINED")
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["1e-20 = 0", "pi = 355/113", "I = 1"],
+)
+def test_verify_math_small_or_close_gap_is_false(_sympy, expression):
+    assert ToolRegistry.verify_math(expression)["data"].startswith("FALSE")
 
 
 @pytest.mark.parametrize(
@@ -188,7 +214,12 @@ def test_verify_math_two_plus_two_is_five_reports_the_gap(_sympy):
 def test_verify_math_numeric_identity_is_true(_sympy, expression):
     result = ToolRegistry.verify_math(expression)
     assert result["status"] == "success"
-    assert result["data"].startswith("TRUE: both sides are equal numerically")
+    assert result["data"].startswith("TRUE: both sides are equal to within 1e-9 relative")
+
+
+@pytest.mark.parametrize("expression", ["I**2 = -1", "exp(I*pi) = -1"])
+def test_verify_math_complex_identity_is_true(_sympy, expression):
+    assert ToolRegistry.verify_math(expression)["data"].startswith("TRUE")
 
 
 def test_verify_math_close_constant_is_false_with_gap(_sympy):
