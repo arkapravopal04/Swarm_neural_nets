@@ -789,23 +789,22 @@ class Agent:
                 'ACTION: REPORT\n'
                 'PAYLOAD: ' + _EX_WORKED_REPORT
             ),
+            # PATCH 51. Was ACTION: TOOL with run_code print('hello'): an
+            # executor's only worked example taught a pointless tool call,
+            # against its own role rule ("If the task did not ask for a
+            # program, answer in plain sentences -- no code"). The same
+            # worked REPORT as the verifier now; how to call a tool stays in
+            # the tool argument reference below. (This also retires the old
+            # "swap the TOOL example out when tools are blocked" branch --
+            # no example is a TOOL any more.)
             "executor": (
-                'ACTION: TOOL\n'
-                'PAYLOAD: {"tool_name": "run_code", "args": {"code_string": "print(\'hello\')"}}'
+                'ACTION: REPORT\n'
+                'PAYLOAD: ' + _EX_WORKED_REPORT
             ),
         }
         tools_blocked = self._tools_blocked(available_tools)
 
         positive = examples.get(self.role, examples["executor"])
-        if tools_blocked and positive.startswith("ACTION: TOOL"):
-            # Showing a TOOL example while TOOL is refused is the single
-            # strongest nudge back into the loop we are trying to break.
-            # Widened from (circuit_open or disabled_closed) to the shared
-            # gate: with tools disabled for the run, EVERY executor was
-            # still being shown a run_code call as its one worked example
-            # of a valid response, which is why so many of them opened
-            # with one.
-            positive = examples["verifier"]
 
         if final_only:
             # Cycle cap reached with a REPORT/DIE menu, so the only worked
