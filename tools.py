@@ -216,6 +216,14 @@ class TracebackSummarizer:
         map onto anything it wrote, which is worse than no number at all.
         Frames that resolve above the agent's code (a crash inside a preamble)
         keep their absolute number and are labelled as sandbox-internal.
+
+        PATCH 53: (a) with a traceback present, the exception line is the last
+        unindented line that is not traceback scaffolding, colon or not -- a
+        bare `AssertionError` / `ValueError` used to be skipped, leaving
+        "CRASH VERDICT: Traceback (most recent call last):". (b) Every frame
+        is recorded; the location reported is the agent's own last frame (the
+        sandbox script), with the file the error was actually raised in
+        appended, instead of only the deepest (often library) frame.
         """
         if not raw_stderr:
             return ""
@@ -223,24 +231,23 @@ class TracebackSummarizer:
         lines = raw_stderr.strip().split('\n')
         exception_detail = "Unknown Exception"
 
-        last_file_context = "Unknown Line"
-        last_executed_code = ""
+        # PATCH 53: every frame as [file_name, line_no, func_name, executed_code].
+        frames = []
+        saw_traceback = False
 
         for line in lines:
             line_stripped = line.strip()
+
+            if line_stripped == "Traceback (most recent call last):":
+                saw_traceback = True
 
             if 'File "' in line and 'line' in line:
                 try:
                     parts = line_stripped.split(',')
                     file_name = os.path.basename(parts[0].split('"')[1])
                     line_no = parts[1].strip()
-                    if line_offset and file_name == SANDBOX_SCRIPT_NAME:
-                        line_no = TracebackSummarizer._rebase_line_number(
-                            line_no, line_offset
-                        )
                     func_name = parts[2].strip() if len(parts) > 2 else ""
-                    last_file_context = f"[{file_name} -> {line_no} {func_name}]"
-                    last_executed_code = ""
+                    frames.append([file_name, line_no, func_name, ""])
                 except Exception:
                     pass
 
@@ -250,12 +257,52 @@ class TracebackSummarizer:
             # "Executed Code: '^'", i.e. with the one piece of information it
             # needed to fix the call stripped out.
             elif line.startswith("    ") and not set(line_stripped) <= set("^~ "):
-                last_executed_code = f" Executed Code: '{line_stripped}'"
+                # PATCH 53: the snippet belongs to the frame it is printed under.
+                if frames:
+                    frames[-1][3] = f" Executed Code: '{line_stripped}'"
 
             elif ":" in line and not line.startswith(" "):
+                # PATCH 53: kept only for stderr with no traceback at all (no
+                # header, no frame); with a traceback the rule below decides.
                 exception_detail = line_stripped
 
-        offending_line = last_file_context + last_executed_code
+        # PATCH 53: the last unindented, non-scaffolding line is the exception.
+        if saw_traceback or frames:
+            scaffolding = (
+                "During handling of the above exception",
+                "The above exception was the direct cause",
+                'File "',
+            )
+            for line in reversed(lines):
+                if not line.strip() or line[0].isspace():
+                    continue
+                stripped = line.strip()
+                if stripped == "Traceback (most recent call last):":
+                    continue
+                if stripped.startswith(scaffolding):
+                    continue
+                exception_detail = stripped
+                break
+
+        # PATCH 53: report the agent's own last frame; name the deeper file
+        # the error was raised in. No own frame -> deepest frame as before.
+        offending_line = "Unknown Line"
+        if frames:
+            own = None
+            for frame in reversed(frames):
+                if frame[0] == SANDBOX_SCRIPT_NAME:
+                    own = frame
+                    break
+            deepest = frames[-1]
+            reported = own if own is not None else deepest
+            file_name, line_no, func_name, executed_code = reported
+            if line_offset and file_name == SANDBOX_SCRIPT_NAME:
+                line_no = TracebackSummarizer._rebase_line_number(
+                    line_no, line_offset
+                )
+            offending_line = f"[{file_name} -> {line_no} {func_name}]" + executed_code
+            if own is not None and deepest is not own:
+                offending_line += f" (raised inside {deepest[0]})"
         summary_lines = []
 
         if exception_detail != "Unknown Exception":
@@ -749,6 +796,13 @@ except Exception:
 # dispatch gate now read from this single source of truth instead.
 TOOL_ALLOWLIST = ("run_code", "safe_read_file", "write_file", "verify_math", "query_dataframe")
 
+# PATCH 50: the tools actually offered to agents (list_tools()). The other
+# three stay in TOOL_ALLOWLIST so execute() still dispatches them for tests and
+# direct callers, but no agent is offered a tool that can only fail: nothing
+# ever populates SAFE_READ_ROOT (safe_read_file/query_dataframe), nothing ever
+# reads SAFE_WRITE_ROOT (write_file), and run_code's sandbox sees neither.
+ADVERTISED_TOOLS = ("run_code", "verify_math")
+
 # Handler parameters the orchestrator injects with trusted values and that an
 # agent may never set for itself. See ToolRegistry.execute().
 INJECTED_PARAMS = frozenset({"domain", "agent_id"})
@@ -762,7 +816,8 @@ class ToolRegistry:
 
     @classmethod
     def list_tools(cls) -> list:
-        return list(TOOL_ALLOWLIST)
+        # PATCH 50: advertise only the tools that can do useful work.
+        return list(ADVERTISED_TOOLS)
 
     @staticmethod
     def execute(tool_name: str, args: Dict[str, Any], domain: str = "General Discourse", agent_id: str = None) -> Dict[str, Any]:
@@ -1365,11 +1420,43 @@ class ToolRegistry:
         acceptable given the alternative is an unsandboxed eval path.
         """
         if mode == "computational":
+            # PATCH 54: sympify() rejects "=", so "2+2=4" or "x**2 - 4 = 0" --
+            # the most natural thing to hand a verifier -- used to fail. The
+            # script now splits on one top-level "==" (else one bare "=", not
+            # part of <=, >=, !=) and compares the sides: TRUE when they are
+            # equal, FALSE with the difference when it is a nonzero constant,
+            # otherwise the solutions. Zero or several split points keep the
+            # old sympify path. Everything still runs inside the sandbox; the
+            # expression is still embedded with repr().
             code_string = (
+                "import re\n"
                 "import sympy\n"
-                f"_expr = sympy.sympify({expression!r})\n"
-                "_simplified = sympy.simplify(_expr)\n"
-                "print(str(_simplified))\n"
+                f"_expr = {expression!r}\n"
+                "def _top_level(pos):\n"
+                "    depth = 0\n"
+                "    for ch in _expr[:pos]:\n"
+                "        if ch in '([{':\n"
+                "            depth += 1\n"
+                "        elif ch in ')]}':\n"
+                "            depth -= 1\n"
+                "    return depth == 0\n"
+                "_splits = [(m.start(), 2) for m in re.finditer(r'==', _expr) if _top_level(m.start())]\n"
+                "if not _splits:\n"
+                "    _splits = [(m.start(), 1) for m in re.finditer(r'(?<![<>!=])=(?!=)', _expr)\n"
+                "               if _top_level(m.start())]\n"
+                "if len(_splits) == 1:\n"
+                "    _pos, _width = _splits[0]\n"
+                "    _lhs, _rhs = _expr[:_pos], _expr[_pos + _width:]\n"
+                "    _d = sympy.simplify(sympy.sympify(_lhs) - sympy.sympify(_rhs))\n"
+                "    if _d == 0:\n"
+                "        print('TRUE: both sides are equal')\n"
+                "    elif not _d.free_symbols:\n"
+                "        print(f'FALSE: the sides differ by {_d}')\n"
+                "    else:\n"
+                "        print(f'solutions: {sympy.solve(_d)}')\n"
+                "else:\n"
+                "    _simplified = sympy.simplify(sympy.sympify(_expr))\n"
+                "    print(str(_simplified))\n"
             )
             sandbox_result = ToolRegistry.run_code(code_string, domain=domain, timeout=10)
             if sandbox_result.get("status") == "success":
