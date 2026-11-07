@@ -173,3 +173,13 @@ def test_decide_passes_role_to_stop_criterion():
     agent.model.generate = generate
     agent.decide(available_tools=[], requirements=[])
     assert seen and seen[0].role == "decomposer"
+
+
+def test_bold_action_label_before_colon_ends_the_block():
+    text = "ACTION: REPORT\nPAYLOAD: Option B\n\n**ACTION**:"
+    assert _stops(text)
+    assert _first_stop(text) == text
+    agent = _with_reply(_agent(), text)
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "REPORT"
+    assert payload == "Option B"

@@ -82,7 +82,9 @@ _PAYLOAD_LABEL_RE = re.compile(r"PAYLOAD[*_`]*\s*:", re.IGNORECASE)
 # block after it: a line starting with an uppercase "ACTION:" label, or a
 # bare "ACTION" at the very end. The colon is required otherwise, so prose
 # headings such as "ACTION ITEMS:" or "ACTION PLAN:" stay in the payload.
-_NEXT_ACTION_LINE_RE = re.compile(r"\n[ \t>*_#-]*ACTION[ \t]*(?::|\s*$)")
+# PATCH 47 (review): emphasis between ACTION and the colon ("**ACTION**:")
+# still ends a block.
+_NEXT_ACTION_LINE_RE = re.compile(r"\n[ \t>*_#-]*ACTION[*_`]*[ \t]*(?::|\s*$)")
 
 
 def _last_action_match(text):
@@ -271,7 +273,8 @@ class _ActionPayloadStop(StoppingCriteria):
     # word yet). Case-sensitive, and the colon is required: prose "action"
     # and headings such as "ACTION ITEMS" / "ACTION PLAN" / "ACTIONS TAKEN"
     # inside a payload are not a new block.
-    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION[ \t]*:[ \t]*$")
+    # PATCH 47 (review): "**ACTION**:" too -- emphasis before the colon.
+    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION[*_`]*[ \t]*:[ \t]*$")
 
     def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10,
                  report_max_new_tokens=None, role=None):
