@@ -5,6 +5,8 @@ general tree with hashing ids
 from dataclasses import dataclass, field 
 import time
 
+from text_utils import dedupe_and_cap as _dedupe_and_cap  # PATCH 44
+
 @dataclass
 class AgentNode:
     agent_id: str
@@ -158,29 +160,54 @@ class ColonyState:
     def extract_agent_ghost(self, agent_id: str) -> dict:
         """Extracts context, memory, and failure reason before agent death.
 
-        NOTE (flagged, not patched): this captures last_task, energy_spent,
-        role, and fail_reason -- but not the agent's own ghost_context. If
-        an agent that already had a ghost context (e.g. a second-generation
-        respawn) dies again, that earlier context is dropped rather than
-        carried forward or merged with the new fail_reason -- each death
-        only ever hands the next respawn ITS OWN immediate failure reason,
-        never the accumulated history across multiple respawns of the same
-        task. Left as-is for now (matches the "Phase 1 honesty" scoping
-        used elsewhere), but worth revisiting if repeated respawns on a
-        stubborn task look like each one has amnesia about the ones before
-        it. A fix would look like:
-            "ghost_context": agent.ghost_context,
-        added to the returned dict, with the caller (orchestrator._kill_and_respawn)
-        deciding how to merge it with the new fail_reason rather than overwrite.
+        PATCH 44 (1/2): a respawn now carries the background it needs.
+          "base_context"     -- the dying agent's string ghost (project goal
+                                line + prerequisite results / shared state),
+                                or the base_context its own ghost dict carried;
+                                None if there was none.
+          "earlier_failures" -- reasons earlier agents on this task died,
+                                oldest first, each capped to 300 chars via
+                                text_utils.dedupe_and_cap, at most 3 kept.
+                                Excludes this agent's own fail_reason, which
+                                stays in "fail_reason".
+        last_task / energy_spent / role are kept for compatibility only.
+        The prompt renders this dict via Agent._ghost_context_str in
+        agent_node.py (PATCH 44 part 2).
         """
         agent = self.agents.get(agent_id)
         if not agent:
             return {}
+        # PATCH 44: carry the base ghost context and failure history forward.
+        prev = agent.ghost_context
+        if isinstance(prev, str) and prev.strip():
+            base_context = prev
+        elif isinstance(prev, dict):
+            base_context = prev.get("base_context")
+        else:
+            base_context = None
+        if isinstance(prev, dict):
+            items = list(prev.get("earlier_failures") or [])
+            if prev.get("fail_reason"):
+                items.append(prev["fail_reason"])
+        else:
+            items = []
+        capped = []
+        for x in items:
+            c = _dedupe_and_cap(str(x), max_chars=300)
+            # PATCH 44: dedupe_and_cap keeps a single over-long sentence
+            # whole (soft cap); hard-cap that case so the ~300 limit holds.
+            if c and len(c) > 300:
+                c = c[:297].rstrip() + "..."
+            if c and c.strip():
+                capped.append(c)
+        earlier_failures = capped[-3:]
         return {
             "last_task": agent.task,
             "energy_spent": agent.energy_spent,
             "role": agent.role,
             "fail_reason": agent.fail_reason,
+            "base_context": base_context,
+            "earlier_failures": earlier_failures,
         }
 
     def unregister_agent(self, agent_id: str):
