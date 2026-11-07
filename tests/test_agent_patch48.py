@@ -115,3 +115,36 @@ def test_unlabelled_spawn_object_from_executor_is_still_think():
     reply = '{"subtasks":[{"role":"executor","task":"t1","dependencies":[]}]}'
     _, action, _ = _decide(reply)
     assert action == "THINK"
+
+
+# ------------------------------------------------- review fixes, second round
+
+def _report_payload(reply):
+    _, action, payload = _decide(reply)
+    assert action == "REPORT", (reply, action)
+    return payload
+
+
+def test_emphasis_opening_the_payload_is_kept():
+    assert _report_payload("ACTION: REPORT\nPAYLOAD: *Option B* is best.") == "*Option B* is best."
+    assert _report_payload("ACTION: REPORT\nPAYLOAD: _x_ = 3") == "_x_ = 3"
+    assert _report_payload("ACTION: REPORT\nPAYLOAD: `x = 3`") == "`x = 3`"
+    assert _report_payload("ACTION: REPORT\nPAYLOAD: **Answer:** 5") == "**Answer:** 5"
+
+
+def test_bullets_opening_the_payload_are_kept():
+    payload = _report_payload("ACTION: REPORT\nPAYLOAD: * item one\n* item two")
+    assert "* item one" in payload and "* item two" in payload
+
+
+def test_no_payload_body_keeps_its_opening_asterisk():
+    assert _report_payload("ACTION: REPORT\n*Option B* is best.") == "*Option B* is best."
+
+
+def test_bold_labels_still_stripped():
+    assert _report_payload("**ACTION:** REPORT\n**PAYLOAD:** The answer is 5.") == "The answer is 5."
+    assert _report_payload("**ACTION: REPORT**\nThe answer is 5.") == "The answer is 5."
+
+
+def test_backtick_label_parses():
+    assert _report_payload("`ACTION:` REPORT\nThe answer is 5.") == "The answer is 5."

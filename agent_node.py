@@ -59,9 +59,10 @@ from collections import deque
 # PATCH 48 (review): markdown emphasis around the colon is tolerated --
 # "**ACTION:** REPORT" and "**ACTION**: REPORT" used to match nothing (the
 # "**" after the colon is not a letter), so a bold-labelled answer fell
-# through to the no-ACTION path.
+# through to the no-ACTION path. A backtick may open the line too
+# ("`ACTION:` REPORT").
 _ACTION_LINE_RE = re.compile(
-    r"^[ \t>*_#-]*ACTION[*_`]*\s*:[*_`\s]*"
+    r"^[ \t>*_#`-]*ACTION[*_`]*\s*:[*_`\s]*"
     r"(?:(?:ACTION|PAYLOAD)\b[*_`]*\s*:?[*_`\s]*)*([A-Za-z]+)",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -70,9 +71,12 @@ _ACTION_TOKENS = ("THINK", "SPAWN", "TOOL", "REPORT", "DIE")
 _BARE_ACTION_RE = re.compile(
     r"^[ \t]*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECASE | re.MULTILINE
 )
-# PATCH 48 (review): "**PAYLOAD:** x" / "**PAYLOAD**: x" -- emphasis
-# characters around the colon are not part of the payload.
-_PAYLOAD_RE = re.compile(r"PAYLOAD[*_`]*\s*:[*_`\s]*(.*)", re.DOTALL | re.IGNORECASE)
+# PATCH 48 (review): "**PAYLOAD:** x" / "**PAYLOAD**: x" -- emphasis that
+# sits right against the label (and is followed by whitespace) is not part
+# of the payload. Emphasis that opens the payload itself ("*Option B* is
+# best", "`x = 3`", "* item") is kept.
+_PAYLOAD_RE = re.compile(r"PAYLOAD[*_`]*\s*:(?:[*_`]+(?=\s))?\s*(.*)",
+                         re.DOTALL | re.IGNORECASE)
 _PAYLOAD_LABEL_RE = re.compile(r"PAYLOAD[*_`]*\s*:", re.IGNORECASE)
 # PATCH 47. Where a plain-text payload ends if the model opened another
 # block after it: a line starting with an uppercase "ACTION:" label, or a
@@ -2099,8 +2103,10 @@ Your next action:"""
                 # the chosen ACTION line is the body.
                 body = strip_scaffolding_lines(
                     strip_special_tokens(generated_text[action_match.end():])).strip()
-                # PATCH 48 (review): the closing "**" of "**ACTION: REPORT**".
-                body = body.lstrip("*_`").strip()
+                # PATCH 48 (review): the closing "**" of "**ACTION: REPORT**"
+                # -- only a run of emphasis standing on its own, so a body
+                # that opens with "*Option B*" keeps its asterisk.
+                body = re.sub(r"^[*_`]+(?=\s|$)", "", body).strip()
                 if body:
                     payload = _dedupe_repeated_sentences(
                         trim_closer_tail(body), max_chars=2000)
