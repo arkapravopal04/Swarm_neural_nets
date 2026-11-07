@@ -1891,6 +1891,27 @@ Your next action:"""
                         f"cycle) rather than REPORT (ends the task on a parse "
                         f"failure)."
                     )
+        else:
+            # PATCH 48 (a). No ACTION: line and no bare keyword. `action`
+            # used to stay at its "REPORT" default here, so free-form text
+            # was submitted as the answer and ended the task -- the one
+            # parse failure that did not degrade to THINK like the others.
+            if not generated_text.strip():
+                # Empty generation keeps REPORT -> EMPTY_DECISION_PLACEHOLDER
+                # below (orchestrator identity-compares it, Patch 11).
+                pass
+            elif self.role != "decomposer" and _payload_match_for(generated_text, None):
+                # "PAYLOAD: answer" with no ACTION line: still a REPORT.
+                pass
+            else:
+                action = "THINK"
+                self.fail_reason = (
+                    "No ACTION: line was found in your last response, so "
+                    "nothing was done. Reply with exactly one ACTION: line "
+                    "followed by one PAYLOAD: line."
+                )
+                print(f"  [decide() NO ACTION] agent={self.agent_id} role={self.role} "
+                      f"-- unlabelled text treated as THINK, not REPORT.")
 
         # Past the tool cap a TOOL (from habit, or copied from earlier
         # context) is turned into a REPORT here, before the payload parser:
@@ -2006,7 +2027,31 @@ Your next action:"""
                 )
 
         if not payload and not (isinstance(payload, dict)):
-            if generated_text.strip():
+            if (generated_text.strip() and action_match is not None
+                    and action in ("REPORT", "THINK", "DIE")):
+                # PATCH 48 (b). A labelled plain-text action with no PAYLOAD:
+                # used to take the WHOLE generation as its payload -- the
+                # "ACTION: REPORT" line and any abandoned draft above it
+                # included -- and scrub_result does not remove label lines,
+                # so they reached the judge and the parent. Only what follows
+                # the chosen ACTION line is the body.
+                body = strip_scaffolding_lines(
+                    strip_special_tokens(generated_text[action_match.end():])).strip()
+                if body:
+                    payload = _dedupe_repeated_sentences(
+                        trim_closer_tail(body), max_chars=2000)
+                elif action == "REPORT":
+                    action = "THINK"
+                    self.fail_reason = (
+                        "Your REPORT had no content after the ACTION line. "
+                        "Put the answer after PAYLOAD:."
+                    )
+                    payload = generated_text.strip()
+                    print(f"  [decide() EMPTY REPORT] agent={self.agent_id} "
+                          f"-- no body after 'ACTION: REPORT'; treated as THINK.")
+                else:
+                    payload = generated_text.strip()
+            elif generated_text.strip():
                 payload = generated_text.strip()
                 if action in ("SPAWN", "TOOL"):
                     # FIX (SPAWN/TOOL -> REPORT mislabel): this used to
