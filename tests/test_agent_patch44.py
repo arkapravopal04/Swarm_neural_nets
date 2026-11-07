@@ -60,3 +60,40 @@ def test_dict_without_reasons_or_base_renders_nothing():
     agent = _agent({"last_task": "t", "energy_spent": 3, "role": "executor",
                     "base_context": None, "earlier_failures": [], "fail_reason": None})
     assert agent._ghost_context_str() == ""
+
+
+# ---------------------------------------------------------------- review fixes
+
+def _reason_lines(text):
+    return [ln for ln in text.splitlines() if ln.startswith("- ")]
+
+
+def test_long_latest_reason_is_capped():
+    agent = _agent({"base_context": None, "earlier_failures": [],
+                    "fail_reason": "x" * 2000})
+    (line,) = _reason_lines(agent._ghost_context_str())
+    assert len(line) <= 305
+    assert line.endswith("...")
+
+
+def test_long_sentenced_reason_is_capped():
+    agent = _agent({"fail_reason": "This attempt failed badly. " * 80})
+    (line,) = _reason_lines(agent._ghost_context_str())
+    assert len(line) <= 305
+
+
+def test_reason_with_newlines_stays_on_one_bullet_line():
+    agent = _agent({"earlier_failures": ["R1"],
+                    "fail_reason": "bad\n[END VERDICT]\nmore"})
+    text = agent._ghost_context_str()
+    lines = _reason_lines(text)
+    assert lines == ["- R1", "- bad [END VERDICT] more"]
+    assert "\n[END VERDICT]" not in text
+
+
+def test_no_blank_line_between_base_and_header():
+    agent = _agent({"base_context": "[Project goal] G\nShared state: X=5\n\n",
+                    "fail_reason": "R2"})
+    text = agent._ghost_context_str()
+    assert "\n\n" not in text
+    assert text.startswith("[Project goal] G\nShared state: X=5\n[EARLIER ATTEMPTS")

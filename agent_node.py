@@ -1142,6 +1142,9 @@ class Agent:
 
     _EARLIER_ATTEMPTS_HEADER = (
         "[EARLIER ATTEMPTS AT THIS TASK FAILED -- do not repeat these]\n")
+    # PATCH 44 (review): per-reason ceiling, same figure ColonyState uses
+    # for earlier_failures.
+    GHOST_REASON_MAX_CHARS = 300
 
     def _ghost_context_str(self):
         """
@@ -1165,10 +1168,23 @@ class Agent:
         parts = []
         base = value.get("base_context")
         if base:
-            parts.append(f"{base}\n")
-        reasons = [str(r) for r in (value.get("earlier_failures") or []) if r]
+            # PATCH 44 (review): no blank line between base and the header.
+            parts.append(str(base).rstrip("\n") + "\n")
+        raw = [r for r in (value.get("earlier_failures") or []) if r]
         if value.get("fail_reason"):
-            reasons.append(str(value["fail_reason"]))
+            raw.append(value["fail_reason"])
+        # PATCH 44 (review): every reason -- the current fail_reason too --
+        # capped like ColonyState caps earlier_failures, then hard-cut, and
+        # flattened to one line so an embedded "[END VERDICT]" or newline
+        # cannot break out of its bullet.
+        reasons = []
+        for r in raw:
+            r = " ".join(str(r).split())
+            r = _dedupe_repeated_sentences(r, max_chars=self.GHOST_REASON_MAX_CHARS)
+            if len(r) > self.GHOST_REASON_MAX_CHARS:
+                r = r[:self.GHOST_REASON_MAX_CHARS - 3].rstrip() + "..."
+            if r:
+                reasons.append(r)
         if reasons:
             parts.append(self._EARLIER_ATTEMPTS_HEADER
                          + "".join(f"- {r}\n" for r in reasons))
