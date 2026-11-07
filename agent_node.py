@@ -302,8 +302,9 @@ class _ActionPayloadStop(StoppingCriteria):
     # word yet). Case-sensitive, and the colon is required: prose "action"
     # and headings such as "ACTION ITEMS" / "ACTION PLAN" / "ACTIONS TAKEN"
     # inside a payload are not a new block.
-    # PATCH 47 (review): "**ACTION**:" too -- emphasis before the colon.
-    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION[*_`]*[ \t]*:[ \t]*$")
+    # PATCH 47 (review): "**ACTION**:" and "**ACTION:**" too -- emphasis
+    # before or after the colon.
+    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION[*_`]*[ \t]*:[*_` \t]*$")
 
     def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10,
                  report_max_new_tokens=None, role=None):

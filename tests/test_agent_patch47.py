@@ -183,3 +183,12 @@ def test_bold_action_label_before_colon_ends_the_block():
     action, payload = agent.decide(available_tools=[], requirements=[])
     assert action == "REPORT"
     assert payload == "Option B"
+
+
+def test_bold_action_label_after_colon_ends_the_block():
+    text = "ACTION: REPORT\nPAYLOAD: Option B\n\n**ACTION:**"
+    assert _stops(text)
+    agent = _with_reply(_agent(), text)
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "REPORT"
+    assert payload == "Option B"
