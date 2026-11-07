@@ -167,7 +167,11 @@ class ColonyState:
                                 None if there was none.
           "earlier_failures" -- reasons earlier agents on this task died,
                                 oldest first, each capped to 300 chars via
-                                text_utils.dedupe_and_cap, at most 3 kept.
+                                text_utils.dedupe_and_cap, at most 3 kept,
+                                each flattened to one line. An attempt that
+                                ended with no fail_reason is recorded as
+                                "previous attempt ended without a stated
+                                reason".
                                 Excludes this agent's own fail_reason, which
                                 stays in "fail_reason".
         last_task / energy_spent / role are kept for compatibility only.
@@ -187,13 +191,19 @@ class ColonyState:
             base_context = None
         if isinstance(prev, dict):
             items = list(prev.get("earlier_failures") or [])
-            if prev.get("fail_reason"):
-                items.append(prev["fail_reason"])
+            # PATCH 44 (review): prev being a dict means the dying agent was
+            # itself a respawn, so a previous attempt did end -- record it
+            # even when it died without a stated reason (e.g. watchdog kill).
+            prev_reason = prev.get("fail_reason")
+            prev_reason = " ".join(str(prev_reason).split()) if prev_reason else ""
+            items.append(prev_reason or "previous attempt ended without a stated reason")
         else:
             items = []
         capped = []
         for x in items:
-            c = _dedupe_and_cap(str(x), max_chars=300)
+            # PATCH 44 (review): flatten to one line so a reason containing
+            # newlines cannot break the rendered bullet list.
+            c = _dedupe_and_cap(" ".join(str(x).split()), max_chars=300)
             # PATCH 44: dedupe_and_cap keeps a single over-long sentence
             # whole (soft cap); hard-cap that case so the ~300 limit holds.
             if c and len(c) > 300:

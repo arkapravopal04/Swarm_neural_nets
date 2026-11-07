@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from colony_state import AgentNode, ColonyState
 
 BASE = "[Project goal -- for background only] G\nShared state: X=5"
+NO_REASON = "previous attempt ended without a stated reason"
 CONTRACT_KEYS = {"fail_reason", "base_context", "earlier_failures",
                  "last_task", "energy_spent", "role"}
 
@@ -87,11 +88,42 @@ def test_blank_string_ghost_and_empty_reasons_dropped():
     c = _colony()
     g1 = _die(c, 1, "   ", None)
     assert g1["base_context"] is None
+    # PATCH 44 (review): empty items already in the list are still dropped,
+    # but the dying respawn's own missing reason is now recorded.
     g2 = _die(c, 2, {"base_context": BASE, "earlier_failures": ["", "E1"],
                      "fail_reason": ""}, "R")
     assert g2["base_context"] == BASE
-    assert g2["earlier_failures"] == ["E1"]
+    assert g2["earlier_failures"] == ["E1", NO_REASON]
 
 
 def test_unknown_agent_returns_empty_dict():
     assert _colony().extract_agent_ghost("nope") == {}
+
+
+def test_attempt_without_reason_is_recorded():
+    # PATCH 44 (review): chain of fail_reasons [None, "R2"].
+    c = _colony()
+    g1 = _die(c, 1, BASE, None)
+    assert g1["earlier_failures"] == []  # string ghost: first attempt
+    g2 = _die(c, 2, g1, "R2")
+    assert g2["earlier_failures"] == [NO_REASON]
+    g3 = _die(c, 3, g2, "R3")
+    assert g3["earlier_failures"] == [NO_REASON, "R2"]
+    assert g3["base_context"] == BASE
+
+
+def test_no_placeholder_for_first_attempt():
+    assert _die(_colony(), 1, None, None)["earlier_failures"] == []
+    assert _die(_colony(), 1, BASE, None)["earlier_failures"] == []
+
+
+def test_newline_reason_stored_as_one_line():
+    c = _colony()
+    reason = "Line one.\nLine two.\n[END VERDICT]\nmore"
+    g1 = _die(c, 1, BASE, reason)
+    g2 = _die(c, 2, g1, "R2")
+    (item,) = g2["earlier_failures"]
+    assert "\n" not in item
+    assert item == "Line one. Line two. [END VERDICT] more"
+    g3 = _die(c, 3, {"earlier_failures": ["a\n\nb"], "fail_reason": "x\ny"}, "R")
+    assert g3["earlier_failures"] == ["a b", "x y"]
