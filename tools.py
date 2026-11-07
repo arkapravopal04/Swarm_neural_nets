@@ -234,8 +234,11 @@ class TracebackSummarizer:
         # PATCH 53: every frame as [file_name, line_no, func_name, executed_code].
         frames = []
         saw_traceback = False
+        # PATCH 53: index of the last 'File "' line, where the last frame
+        # block starts; the exception line is the first real line after it.
+        last_frame_index = None
 
-        for line in lines:
+        for index, line in enumerate(lines):
             line_stripped = line.strip()
 
             if line_stripped == "Traceback (most recent call last):":
@@ -248,6 +251,7 @@ class TracebackSummarizer:
                     line_no = parts[1].strip()
                     func_name = parts[2].strip() if len(parts) > 2 else ""
                     frames.append([file_name, line_no, func_name, ""])
+                    last_frame_index = index
                 except Exception:
                     pass
 
@@ -266,33 +270,59 @@ class TracebackSummarizer:
                 # header, no frame); with a traceback the rule below decides.
                 exception_detail = line_stripped
 
-        # PATCH 53: the last unindented, non-scaffolding line is the exception.
-        if saw_traceback or frames:
-            scaffolding = (
-                "During handling of the above exception",
-                "The above exception was the direct cause",
-                'File "',
+        # PATCH 53: the exception line is the FIRST unindented, non-scaffolding
+        # line after the last frame block (so the last traceback of a chain
+        # wins, and exception notes / continuation lines of a multi-line
+        # message after it are ignored). With a traceback header but no
+        # parsable frame, the last such line in the whole stderr is used.
+        def _is_scaffolding(text: str) -> bool:
+            return (
+                text == "Traceback (most recent call last):"
+                or text.startswith("During handling of the above exception")
+                or text.startswith("The above exception was the direct cause")
+                or text.startswith('File "')
             )
-            for line in reversed(lines):
+
+        if frames or saw_traceback:
+            if last_frame_index is not None:
+                candidates = lines[last_frame_index + 1:]
+            else:
+                candidates = list(reversed(lines))
+            for line in candidates:
                 if not line.strip() or line[0].isspace():
                     continue
                 stripped = line.strip()
-                if stripped == "Traceback (most recent call last):":
-                    continue
-                if stripped.startswith(scaffolding):
+                if _is_scaffolding(stripped):
                     continue
                 exception_detail = stripped
                 break
 
-        # PATCH 53: report the agent's own last frame; name the deeper file
-        # the error was raised in. No own frame -> deepest frame as before.
+        # PATCH 53: report the agent's own last frame; name where the error
+        # was actually raised. Own = the last sandbox-script frame whose
+        # absolute line is past the preamble (with no offset, any sandbox
+        # frame). The sandbox guards live in the same file, inside the
+        # preamble, so without the line check a tripped guard was reported
+        # as the location instead of the agent's line that tripped it.
+        # No frame past the preamble -> previous behaviour (last sandbox
+        # frame, else the deepest frame, library lines not rebased).
+        def _absolute_line(frame) -> int:
+            match = re.search(r"line\s+(\d+)", frame[1])
+            return int(match.group(1)) if match else 0
+
+        def _in_preamble(frame) -> bool:
+            return (
+                frame[0] == SANDBOX_SCRIPT_NAME
+                and bool(line_offset)
+                and _absolute_line(frame) <= line_offset
+            )
+
         offending_line = "Unknown Line"
         if frames:
-            own = None
-            for frame in reversed(frames):
-                if frame[0] == SANDBOX_SCRIPT_NAME:
-                    own = frame
-                    break
+            sandbox_frames = [f for f in frames if f[0] == SANDBOX_SCRIPT_NAME]
+            agent_frames = [f for f in sandbox_frames if not _in_preamble(f)]
+            own = agent_frames[-1] if agent_frames else (
+                sandbox_frames[-1] if sandbox_frames else None
+            )
             deepest = frames[-1]
             reported = own if own is not None else deepest
             file_name, line_no, func_name, executed_code = reported
@@ -302,7 +332,10 @@ class TracebackSummarizer:
                 )
             offending_line = f"[{file_name} -> {line_no} {func_name}]" + executed_code
             if own is not None and deepest is not own:
-                offending_line += f" (raised inside {deepest[0]})"
+                if agent_frames and _in_preamble(deepest):
+                    offending_line += " (raised inside the sandbox preamble)"
+                else:
+                    offending_line += f" (raised inside {deepest[0]})"
         summary_lines = []
 
         if exception_detail != "Unknown Exception":

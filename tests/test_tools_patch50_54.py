@@ -80,6 +80,70 @@ def test_no_traceback_keeps_raw_fallback():
     assert TracebackSummarizer.summarize("\n\n") == "Process terminated without error output."
 
 
+def test_exception_note_is_not_the_verdict():
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/x/sandbox_executor.py", line 214, in <module>\n'
+        "    raise e\n"
+        "ValueError: base msg\n"
+        "hint here\n"
+    )
+    summary = TracebackSummarizer.summarize(stderr, line_offset=210)
+    assert "CRASH VERDICT: ValueError: base msg |" in summary
+    assert "hint here" not in summary
+
+
+def test_run_code_exception_note_is_not_the_verdict():
+    result = ToolRegistry.run_code(
+        "e = ValueError('base msg')\ne.add_note('hint here')\nraise e"
+    )
+    assert result["status"] == "error"
+    assert "CRASH VERDICT: ValueError: base msg" in result["message"]
+    assert "hint here" not in result["message"]
+
+
+def test_multi_line_message_keeps_the_first_line():
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/x/sandbox_executor.py", line 214, in <module>\n'
+        "    raise ValueError('line one\\nline two')\n"
+        "ValueError: line one\n"
+        "line two\n"
+    )
+    summary = TracebackSummarizer.summarize(stderr, line_offset=210)
+    verdict = summary.split(" | ")[0]
+    assert verdict == "CRASH VERDICT: ValueError: line one"
+
+
+def test_chained_keyerror_reports_the_final_exception():
+    stderr = (
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/x/sandbox_executor.py", line 214, in <module>\n'
+        "    d['k']\n"
+        "KeyError: 'k'\n"
+        "\n"
+        "During handling of the above exception, another exception occurred:\n"
+        "\n"
+        "Traceback (most recent call last):\n"
+        '  File "/tmp/x/sandbox_executor.py", line 216, in <module>\n'
+        "    raise RuntimeError('missing')\n"
+        "RuntimeError: missing\n"
+    )
+    summary = TracebackSummarizer.summarize(stderr, line_offset=210)
+    assert "CRASH VERDICT: RuntimeError: missing |" in summary
+    assert "KeyError" not in summary
+
+
+def test_sandbox_guard_reports_the_agents_line():
+    result = ToolRegistry.run_code("x = 1\nopen('C:/Windows/win.ini').read()")
+    assert result["status"] == "error"
+    message = result["message"]
+    assert "PermissionError" in message
+    assert "line 2 of your code" in message
+    assert "raised inside the sandbox preamble" in message
+    assert "_secure_path_check" not in message
+
+
 def test_run_code_bare_assert_names_the_error():
     result = ToolRegistry.run_code("assert 1 == 2")
     assert result["status"] == "error"
