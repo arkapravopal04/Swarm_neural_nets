@@ -61,3 +61,31 @@ def test_report_that_is_only_the_example_is_left_for_the_echo_reject():
 def test_report_without_the_example_is_untouched():
     text = "Line one.\n\n- item   a\n- item b"
     assert Agent._strip_exemplar_echo(text) == text
+
+
+# ------------------------------------------------- review fixes, second round
+
+EX = _EX_WORKED_REPORT
+ANSWER = "The answer is 42 because the parts sum to 42."
+
+
+def test_example_plus_a_label_or_word_is_left_for_the_echo_reject():
+    for text in ("REPORT: " + EX, EX + " Done.", "Answer: " + EX):
+        assert Agent._strip_exemplar_echo(text) == text, text
+
+
+def test_lowercased_copy_is_stripped():
+    assert Agent._strip_exemplar_echo(EX.lower() + " " + ANSWER) == ANSWER
+
+
+def test_copy_without_final_full_stop_is_stripped():
+    assert Agent._strip_exemplar_echo(EX[:-1] + "\nThe answer is 42 because ...") == \
+        "The answer is 42 because ..."
+
+
+def test_quoted_copy_leaves_no_empty_quotes():
+    out = Agent._strip_exemplar_echo('"' + EX + '" ' + ANSWER)
+    assert out == ANSWER
+    assert '""' not in out
+    out = Agent._strip_exemplar_echo("\u201c" + EX + "\u201d " + ANSWER)
+    assert out == ANSWER

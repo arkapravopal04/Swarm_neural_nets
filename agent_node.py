@@ -28,6 +28,12 @@ from text_utils import (
     trim_closer_tail,
     without_decision_records,
 )
+from text_utils import normalize_words
+try:
+    # PATCH 51 (review): the residue rule shared with is_exemplar_echo.
+    from text_utils import EXEMPLAR_ONLY_MAX_EXTRA_WORDS as _EXEMPLAR_ONLY_MAX_EXTRA_WORDS
+except ImportError:
+    _EXEMPLAR_ONLY_MAX_EXTRA_WORDS = 3
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList
 import ast
@@ -203,6 +209,19 @@ EXEMPLAR_SUBTASK_DESCRIPTIONS = (
 _EX_WORKED_REPORT = ("Both options meet every constraint, and the second costs "
                      "less, so choose the second.")
 EXEMPLAR_REPORT_TEXTS = (_EX_WORKED_REPORT,)
+
+
+def _exemplar_pattern(example):
+    """PATCH 51 (review). A copy of `example` as a REPORT may carry it:
+    any case, any whitespace between its words, its final punctuation
+    optional, wrapped in quotes or not."""
+    body = example.rstrip(".!?")
+    words = r"\s+".join(re.escape(w) for w in body.split())
+    return re.compile(r"[\"'“‘]?\s*" + words + r"[.!?]?\s*[\"'”’]?",
+                      re.IGNORECASE)
+
+
+_EXEMPLAR_REPORT_PATTERNS = tuple(_exemplar_pattern(ex) for ex in EXEMPLAR_REPORT_TEXTS)
 
 # PATCH 11. What decide() substitutes when generation came back empty and no
 # action could be recovered from it. Hoisted out of decide()'s body into a
@@ -2188,20 +2207,27 @@ Your next action:"""
         worked example. A REPORT that copies it and then answers ("<example
         sentence> The answer is 42 because ...") reached promotion, where
         text_utils.degeneracy_cut cuts from the example to the END -- the
-        real answer went with it. Each exact copy of an EXEMPLAR_REPORT_TEXTS
-        string is removed here. If nothing is left, the text is returned
-        unchanged, so the orchestrator's whole-echo reject still fires.
-        Text with no copy in it is returned untouched.
+        real answer went with it. Each copy of an EXEMPLAR_REPORT_TEXTS string
+        is removed here -- case-insensitive, final punctuation optional, any
+        whitespace between its words, together with quotes wrapped round it.
+
+        The text is returned UNCHANGED (so the orchestrator's whole-echo
+        reject still fires) when what is left is a label or a word or two:
+        at most EXEMPLAR_ONLY_MAX_EXTRA_WORDS normalized words, the same
+        residue rule text_utils.is_exemplar_echo uses, or nothing
+        alphanumeric. Text with no copy in it is returned untouched.
         """
-        if not any(ex in text for ex in EXEMPLAR_REPORT_TEXTS):
+        stripped, hits = text, 0
+        for pattern in _EXEMPLAR_REPORT_PATTERNS:
+            stripped, n = pattern.subn(" ", stripped)
+            hits += n
+        if not hits:
             return text
-        stripped = text
-        for ex in EXEMPLAR_REPORT_TEXTS:
-            stripped = stripped.replace(ex, "")
         stripped = re.sub(r"[ \t]+", " ", stripped)
         stripped = re.sub(r" *\n *", "\n", stripped)
         stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
-        if not stripped:
+        if (not re.search(r"[A-Za-z0-9]", stripped)
+                or len(normalize_words(stripped).split()) <= _EXEMPLAR_ONLY_MAX_EXTRA_WORDS):
             return text
         print(f"  [decide() EXEMPLAR ECHO] removed a copy of the prompt's worked "
               f"REPORT; kept {len(stripped)} chars of the agent's own text.")
