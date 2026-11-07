@@ -2129,6 +2129,9 @@ Your next action:"""
             else:
                 payload = EMPTY_DECISION_PLACEHOLDER
 
+        if action == "REPORT" and isinstance(payload, str):
+            payload = self._strip_exemplar_echo(payload)
+
         self.cap_coerced_last_run = False
         if self.final_only:
             final = self.final_actions
@@ -2137,6 +2140,32 @@ Your next action:"""
                 self.cap_coerced_last_run = True
 
         return action, payload
+
+    @staticmethod
+    def _strip_exemplar_echo(text):
+        """
+        PATCH 51 (review). Every executor now sees _EX_WORKED_REPORT as its
+        worked example. A REPORT that copies it and then answers ("<example
+        sentence> The answer is 42 because ...") reached promotion, where
+        text_utils.degeneracy_cut cuts from the example to the END -- the
+        real answer went with it. Each exact copy of an EXEMPLAR_REPORT_TEXTS
+        string is removed here. If nothing is left, the text is returned
+        unchanged, so the orchestrator's whole-echo reject still fires.
+        Text with no copy in it is returned untouched.
+        """
+        if not any(ex in text for ex in EXEMPLAR_REPORT_TEXTS):
+            return text
+        stripped = text
+        for ex in EXEMPLAR_REPORT_TEXTS:
+            stripped = stripped.replace(ex, "")
+        stripped = re.sub(r"[ \t]+", " ", stripped)
+        stripped = re.sub(r" *\n *", "\n", stripped)
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+        if not stripped:
+            return text
+        print(f"  [decide() EXEMPLAR ECHO] removed a copy of the prompt's worked "
+              f"REPORT; kept {len(stripped)} chars of the agent's own text.")
+        return stripped
 
     @staticmethod
     def _is_spawn_payload(payload):

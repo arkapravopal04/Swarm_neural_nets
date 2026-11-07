@@ -35,3 +35,29 @@ def test_executor_example_is_the_worked_report_without_tools():
 
 def test_exemplar_report_texts_unchanged():
     assert agent_node.EXEMPLAR_REPORT_TEXTS == (_EX_WORKED_REPORT,)
+
+
+# ---------------------------------------------------------------- review fix
+
+from test_think_cap import _with_reply
+
+
+def test_report_copying_the_example_then_answering_keeps_the_answer():
+    agent = _with_reply(_agent(), f"ACTION: REPORT\nPAYLOAD: {_EX_WORKED_REPORT} "
+                                  "The answer is 42 because 6 times 7 is 42.")
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "REPORT"
+    assert _EX_WORKED_REPORT not in payload
+    assert payload == "The answer is 42 because 6 times 7 is 42."
+
+
+def test_report_that_is_only_the_example_is_left_for_the_echo_reject():
+    agent = _with_reply(_agent(), f"ACTION: REPORT\nPAYLOAD: {_EX_WORKED_REPORT}")
+    action, payload = agent.decide(available_tools=[], requirements=[])
+    assert action == "REPORT"
+    assert payload == _EX_WORKED_REPORT
+
+
+def test_report_without_the_example_is_untouched():
+    text = "Line one.\n\n- item   a\n- item b"
+    assert Agent._strip_exemplar_echo(text) == text
