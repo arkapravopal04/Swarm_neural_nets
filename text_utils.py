@@ -3185,15 +3185,29 @@ def _ask_clauses(sentence):
     return out
 
 
-def ask_coverage(asks, target):
+def ask_coverage(asks, target, distinctive=False):
     """[(ask, fraction covered, covered)] for each checkable ask against
-    `target`. Asks under ASK_MIN_STEMS content stems are left out."""
+    `target`. Asks under ASK_MIN_STEMS content stems are left out.
+
+    PATCH 44 (pre-flight): distinctive=True scores each ask on the stems no
+    OTHER ask in `asks` shares (falling back to all its stems when fewer
+    than ASK_MIN_STEMS are left). In the garden request "decide" and "plot"
+    open two parts, so "Decide what happens to members who stop tending
+    their plot" read as covering "decide how to allocate plots fairly"
+    (2 of 4 stems) and a plan with no allocation item passed the root
+    coverage check. Its distinctive stems are "alloc" and "fair"."""
     have = content_stems(target)
+    all_stems = [content_stems(ask) for ask in asks]
     out = []
-    for ask in asks:
-        stems = content_stems(ask)
+    for i, ask in enumerate(asks):
+        stems = all_stems[i]
         if len(stems) < ASK_MIN_STEMS:
             continue
+        if distinctive:
+            shared = set().union(*(s for j, s in enumerate(all_stems) if j != i))
+            own = stems - shared
+            if len(own) >= ASK_MIN_STEMS:
+                stems = own
         fraction = len(stems & have) / len(stems)
         out.append((ask, fraction, fraction >= ASK_COVERAGE_MIN))
     return out

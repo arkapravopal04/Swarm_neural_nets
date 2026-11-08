@@ -688,3 +688,27 @@ def test_batch_without_dependencies_never_depends_on_itself():
     by_desc = {n.description: n for n in children}
     first = by_desc.get(RUN18_BATCH[0])
     assert first is not None and not first.dependencies   # nothing before it but the part
+
+
+# PATCH 44 (pre-flight). Stems that open several request parts ("decide",
+# "plot") do not cover a part on their own.
+SHARED_STEM_BATCH = [
+    "Work out the yearly fee per member so the 9,000 rupees of costs are covered.",
+    "Split watering duty across the summer months among plot holders.",
+    "Decide what happens to members who stop tending their plot.",
+]
+
+
+def test_shared_stems_do_not_cover_the_allocation_part():
+    orch = _root_orch()
+    out = orch._fill_uncovered_asks("r", _prep(SHARED_STEM_BATCH), {})
+    assert [d for _, d, _ in out] == ["Decide how to allocate plots fairly."] + SHARED_STEM_BATCH
+
+
+def test_distinctive_coverage_still_reads_a_reworded_allocation_item():
+    asks = request_asks(REQUEST)
+    for item in ("Run a lottery to allocate the plots.",
+                 "Assign the 12 plots among the 20 members in a fair way."):
+        assert ask_coverage(asks, item, distinctive=True)[0][2] is True
+    # goal fidelity keeps whole-ask stems
+    assert ask_coverage(asks, SHARED_STEM_BATCH[2])[0][2] is True

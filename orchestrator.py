@@ -619,8 +619,8 @@ class Orchestrator:
         every agent whose task is currently running.
         """
         available_roles = ["decomposer", "executor", "verifier"]
-        # Tools enabled: every tool in tools.TOOL_ALLOWLIST (run_code,
-        # safe_read_file, write_file, verify_math, query_dataframe).
+        # Tools offered: tools.ADVERTISED_TOOLS (run_code, verify_math) --
+        # PATCH 50 took the file tools off the menu.
         available_tools = ToolRegistry.list_tools()
 
         for agent_id, live_agent in list(self.live_agents.items()):
@@ -2762,7 +2762,7 @@ class Orchestrator:
                   for kw in self.pending_overflow.get(parent_id, [])]
         covered_by_any = {}
         for text in texts:
-            for ask, _, covered in ask_coverage(asks, text):
+            for ask, _, covered in ask_coverage(asks, text, distinctive=True):
                 covered_by_any[ask] = covered_by_any.get(ask, False) or covered
         added = []
         for i, ask in enumerate(asks):
