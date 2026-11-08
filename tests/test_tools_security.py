@@ -409,11 +409,11 @@ def test_write_file_agent_id_fallback_to_anon(isolated_roots):
 
 def test_list_tools_matches_allowlist():
     """list_tools() is the explicit allowlist, not dir()-based introspection:
-    a new public helper on ToolRegistry must NOT become agent-callable."""
-    assert ToolRegistry.list_tools() == list(tools.TOOL_ALLOWLIST)
-    assert set(ToolRegistry.list_tools()) == {
-        "run_code", "safe_read_file", "write_file", "verify_math", "query_dataframe",
-    }
+    a new public helper on ToolRegistry must NOT become agent-callable.
+    PATCH 50: only the tools that can do useful work are advertised; the
+    file tools stay dispatchable through execute() but are not offered."""
+    assert set(ToolRegistry.list_tools()) == {"run_code", "verify_math"}
+    assert set(ToolRegistry.list_tools()) <= set(tools.TOOL_ALLOWLIST)
 
 
 def test_list_tools_ignores_new_public_helper(monkeypatch):

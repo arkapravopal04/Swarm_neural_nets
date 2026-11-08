@@ -112,12 +112,75 @@ class TaskGraph:
             if parent_task:
                 parent_task.dependents.append(task.task_id)
             else:
+                # PATCH 52: the target is linked back when it is added
+                # (see the back-link step below), so this is no longer a
+                # dead end -- just a forward reference.
                 print(
-                    f"WARNING: Task '{task.task_id}' depends on unknown "
-                    f"task_id '{parent_id}' -- this dependency will never "
-                    f"resolve and '{task.task_id}' may never become ready."
+                    f"WARNING: Task '{task.task_id}' depends on task_id "
+                    f"'{parent_id}', which is not added yet -- '{task.task_id}' "
+                    f"waits on it and will be linked when it is added."
                 )
 
+        # PATCH 52, step 4 (runs first so a task never loops onto itself):
+        # a task that lists itself as a dependency can never start. Drop the
+        # self-reference (every occurrence) and recount in_degree the same way
+        # the top of add_task does.
+        if task.task_id in task.dependencies:
+            task.dependencies = [d for d in task.dependencies if d != task.task_id]
+            task.dependents = [d for d in task.dependents if d != task.task_id]
+            task.in_degree = sum(
+                1 for dep_id in task.dependencies
+                if self.tasks.get(dep_id) is None or self.tasks[dep_id].status not in (2, 3)
+            )
+            print(
+                f"WARNING: Task '{task.task_id}' listed itself as a dependency "
+                f"-- that self-dependency was dropped."
+            )
+
+        # PATCH 52, step 1 -- back-link. Any task `w` added EARLIER that
+        # listed this task as a dependency before it existed counted it as
+        # unfinished (in_degree +1 per listing) but could not register in
+        # this task's `dependents`, so complete_task would never reach it.
+        # Link it now. Duplicate listings get one `dependents` entry each,
+        # matching what the dependency loop above does for a known target.
+        back_linked = []
+        for w in list(self.tasks.values()):
+            if w is task or task.task_id not in w.dependencies:
+                continue
+            if w.task_id in task.dependents:
+                continue
+            n = w.dependencies.count(task.task_id)
+            if task.status in (2, 3):
+                # Added already closed (defensive): w's wait is over.
+                self._lower_in_degree(w, n)
+                self._release(w)
+            else:
+                # w's in_degree already counts these listings.
+                task.dependents.extend([w.task_id] * n)
+                back_linked.append(w.task_id)
+
+        # PATCH 52, step 3 -- break cycles deterministically. If an earlier
+        # task w can reach this task by following `dependents`, the link
+        # "w waits on this task" closes a loop in which nothing can ever
+        # start. Rule: the task that was added first keeps running; its wait
+        # on the later one is dropped.
+        for w_id in back_linked:
+            w = self.tasks.get(w_id)
+            if w is None or not self._reaches(w_id, task.task_id):
+                continue
+            n = w.dependencies.count(task.task_id)
+            w.dependencies = [d for d in w.dependencies if d != task.task_id]
+            task.dependents = [d for d in task.dependents if d != w_id]
+            self._lower_in_degree(w, n)
+            self._release(w)
+            print(
+                f"WARNING: Task '{w_id}' and task '{task.task_id}' waited on "
+                f"each other (dependency cycle) -- '{w_id}' (added first) no "
+                f"longer waits for '{task.task_id}'."
+            )
+
+        # PATCH 52, step 5: kept as a final safety net -- after the fixes
+        # above it should never fire.
         # Lightweight cycle check: walk dependents from this task and see if we
         # ever loop back to task.task_id. A cyclic graph means in_degree can
         # never reach 0 for something in the cycle, which would hang the colony
@@ -141,6 +204,41 @@ class TaskGraph:
         if not task_id:
             return []
         return [t for t in self.tasks.values() if t.parent_task_id == task_id]
+
+    def _reaches(self, from_id: str, to_id: str) -> bool:
+        """PATCH 52: True if `to_id` is reachable from `from_id` by following
+        `dependents` edges (BFS, visited set)."""
+        visited = set()
+        start = self.tasks.get(from_id)
+        queue = list(start.dependents) if start else []
+        while queue:
+            current = queue.pop(0)
+            if current == to_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            current_task = self.tasks.get(current)
+            if current_task:
+                queue.extend(current_task.dependents)
+        return False
+
+    def _lower_in_degree(self, t: TaskNode, n: int = 1):
+        """PATCH 52: lower t.in_degree by n, never below 0."""
+        t.in_degree -= n
+        if t.in_degree < 0:
+            print(
+                f"WARNING: Task '{t.task_id}' in_degree would have gone below 0 "
+                f"({t.in_degree}) -- clamped to 0."
+            )
+            t.in_degree = 0
+
+    def _release(self, t: TaskNode):
+        """PATCH 52: same rule as complete_task -- a task whose last
+        dependency just cleared and that already has an agent starts running.
+        A task with no agent stays pending; get_ready_tasks picks it up."""
+        if t.in_degree == 0 and t.status == 0 and t.agent_id is not None:
+            t.status = 1
 
     def _creates_cycle(self, start_id: str) -> bool:
         """BFS over dependents from start_id; True if we loop back to start_id."""
