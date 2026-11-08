@@ -3084,13 +3084,105 @@ def request_asks(text):
             continue
         is_item = bool(_LIST_ITEM_RE.match(line))
         body = _LIST_ITEM_RE.sub("", line) if is_item else line
-        for sentence in re.split(r"(?<=[.!?])\s+", body):
+        # PATCH 44: abbreviation-aware ("Rs. 9,000", "e.g."), so a clause is
+        # never cut into "Set a yearly fee so that the Rs."
+        for sentence in split_sentences(body):
             sentence = sentence.strip()
             if not sentence:
                 continue
-            if is_item or sentence.endswith("?") or _ASK_OPENER_RE.match(sentence):
+            if is_item:
+                asks.append(sentence)
+                continue
+            clauses = _ask_clauses(sentence)
+            whole_is_ask = bool(sentence.endswith("?")
+                                or _ASK_OPENER_RE.match(_strip_lead_in(sentence)))
+            if len(clauses) >= 2 or (clauses and (not whole_is_ask
+                                                   or _is_meta_ask(sentence))):
+                asks.extend(clauses)
+            elif whole_is_ask and not _is_meta_ask(sentence):
                 asks.append(sentence)
     return list(dict.fromkeys(asks))
+
+
+# PATCH 44. A one-sentence request lists its asks as clauses: "A community
+# garden has 12 plots and 20 members who want one, decide how to allocate
+# plots fairly, set a yearly fee ..., split watering duty ..., and decide
+# what to do with members who stop tending their plot." opens with context,
+# so the sentence rule found NO ask in it and every "parts not covered: []"
+# in runs 10-18 was empty by construction. Split at ", " / ", and " / "; "
+# / " and <ask verb>"; keep the clauses that open with an ask verb. A comma
+# needs whitespace after it, so "9,000" is never cut.
+_ASK_CLAUSE_SPLIT_RE = re.compile(
+    r",\s+(?:and\s+)?|;\s+|\s+and\s+(?=(?:"
+    + "|".join(v.replace(" ", r"\s+") for v in _ASK_VERBS + ("show", "justify"))
+    + r")\b)",
+    re.IGNORECASE,
+)
+
+
+# A lead-in before the ask verb: "Help me decide ...", "I want to plan ...".
+_ASK_LEAD_IN_RE = re.compile(
+    r"^(?:(?:please|then)\s+|(?:can|could|would)\s+you\s+|help\s+(?:me|us)\s+(?:to\s+)?"
+    r"|(?:i|we)\s+(?:want|need|would\s+like|'d\s+like)\s+(?:you\s+)?to\s+)+",
+    re.IGNORECASE,
+)
+# An ask verb used as a noun: "plan is to rotate hosts", "list of 12
+# families", "set aside 9,000".
+_ASK_VERB_AS_NOUN_RE = re.compile(r"^\w+(?:\s+\w+)?\s+(?:is|are|was|were|of|aside)\b",
+                                  re.IGNORECASE)
+# A follow-on question clause: "..., and what food should we bring?"
+_WH_CLAUSE_RE = re.compile(
+    r"^(?:how|what|who|whom|which|when|where|why|whether|should|can|could|"
+    r"would|is|are|do|does)\b", re.IGNORECASE)
+# An instruction about the ANSWER rather than a part of the problem:
+# "explain your reasoning", "list your assumptions", "give a reason".
+_META_ASK_RE = re.compile(
+    r"\byour\s+(?:reasoning|reasons?|answer|answers|assumptions?|working|"
+    r"steps|sources|thinking|thought\s+process|logic|calculations?)\b"
+    r"|^(?:please\s+)?(?:explain|justify|show)\s+(?:why|how\s+you|yourself)\b"
+    r"|^(?:please\s+)?(?:give|list|state|show|explain|provide)\s+(?:a\s+|the\s+|any\s+)?"
+    r"(?:reasons?|reasoning|rationale|assumptions?|working|steps|sources|justification)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_lead_in(clause):
+    return _ASK_LEAD_IN_RE.sub("", clause.strip(), count=1)
+
+
+def _is_meta_ask(clause):
+    return bool(_META_ASK_RE.search(_strip_lead_in(clause)))
+
+
+def _ask_clauses(sentence):
+    """PATCH 44. The asks among one sentence's clauses, in order.
+
+    A clause opening with an ask verb (after a lead-in such as "Help me"
+    or "then") is an ask. A question clause ("what food should we bring?")
+    after the first ask is an ask of its own. Any other clause is context
+    or a modifier ("taking into account seniority, need, ...") and is left
+    out: folded into its ask it made the ask so long that a faithful goal
+    covered under a third of its stems. An instruction about the answer
+    ("explain your reasoning") is not a part of the problem and is dropped."""
+    out = []
+    started = after_meta = False
+    for raw in _ASK_CLAUSE_SPLIT_RE.split(sentence):
+        clause = raw.strip().rstrip(".!;:,").strip()
+        if not clause:
+            continue
+        body = _strip_lead_in(clause)
+        if _ASK_OPENER_RE.match(body) and not _ASK_VERB_AS_NOUN_RE.match(body):
+            started = True
+            after_meta = _is_meta_ask(body)
+            if not after_meta:
+                out.append(body)
+            continue
+        if not started:
+            continue
+        if clause.endswith("?") or _WH_CLAUSE_RE.match(clause):
+            after_meta = False
+            out.append(clause)
+    return out
 
 
 def ask_coverage(asks, target):

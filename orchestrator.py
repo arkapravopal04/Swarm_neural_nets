@@ -38,6 +38,8 @@ from agent_node import (
 )
 from tools import ToolRegistry
 from text_utils import (
+    ask_coverage,
+    request_asks,
     content_stems,
     normalize_identifier,
     normalize_words,
@@ -349,6 +351,12 @@ class Orchestrator:
         # Used to short-circuit an agent that answers a WARN by resubmitting
         # the identical string (see handle_completion's warn branch).
         self.last_warned_report: Dict[str, str] = {}
+        # PATCH 41. task_id -> WARNs drawn by every attempt on that task, so
+        # the judge's one-WARN-then-critique rule survives a respawn.
+        self.task_warn_counts: Dict[str, int] = {}
+        # PATCH 42 (measure-only). (cosine, new task, closest completed
+        # sibling, description) for each subtask spawned beside finished ones.
+        self.sibling_redo_samples: list = []
 
         # High-water mark of len(self.live_agents), sampled once per tick.
         self.peak_live_agents = 0
@@ -2667,6 +2675,17 @@ class Orchestrator:
 
             found = self._find_duplicate_task(description, embedding, spawner_task_id)
             if found is None:
+                pasted = self._sibling_result_paste(description, spawner_task_id)
+                if pasted is not None:
+                    # PATCH 42: a subtask written as a copy of a completed
+                    # sibling's REPORT re-asks for an answer already given.
+                    self.colony.record_verdict("spawn_dedup_pasted_result")
+                    print(f"  [spawn-dedup] {parent_id}: subtask \"{description[:60]}\" "
+                          f"copies completed sibling {pasted}'s result "
+                          f"(PATCH 42) -- linked as a dependency, not spawned.")
+                    found = (pasted, None)
+            if found is None:
+                self._measure_sibling_redo(description, embedding, spawner_task_id, task_id)
                 kept.append((sub, description, task_id))
                 continue
 
@@ -2679,12 +2698,224 @@ class Orchestrator:
             self._gate_description_embeddings.pop(task_id, None)
             reused_ids.add(match_id)
             self._reuse_existing_task(parent_id, spawner_task_id, match_id)
+            if score is None:
+                continue  # PATCH 42 paste: already counted and printed above
             self.colony.record_verdict(f"spawn_dedup_{where}")
             print(f"  [spawn-dedup] {parent_id}: subtask \"{description[:60]}\" "
                   f"duplicates {where} task {match_id} "
                   f"(\"{match_node.description[:60]}\", score {score:.2f}) -- "
                   f"linked as a dependency, not spawned.")
         return kept, reused_ids
+
+    # PATCH 44. A plan item at least this close (MiniLM cosine) to a request
+    # part covers it even when the words differ. Not measured on a run yet:
+    # every [request-coverage] line prints the closest cosine so run 19 can
+    # set it.
+    ASK_EMBED_COVERED = 0.55
+
+    def _closest_plan_item_cosine(self, ask, prepared):
+        """PATCH 44. Highest cosine between `ask` and a batch item or an
+        existing root child, or None without an embedder."""
+        if self.embed_model is None:
+            return None
+        ask_vec = self._embed_description(ask)
+        if ask_vec is None:
+            return None
+        vectors = []
+        for _, description, task_id in prepared:
+            vec = self._gate_description_embeddings.get(task_id)
+            if vec is None:
+                vec = self._embed_description(description)
+            vectors.append(vec)
+        vectors += [n.description_embedding for n in self.task_graph.tasks.values()
+                    if n.parent_task_id == self.root_task_id]
+        scores = [c for c in (_cosine(ask_vec, v) for v in vectors) if c is not None]
+        return max(scores) if scores else None
+
+    def _fill_uncovered_asks(self, parent_id, prepared, label_to_id):
+        """PATCH 44. When the ROOT decomposer SPAWNs, every part of the user's
+        request (request_asks) must be covered by this batch or by a subtask
+        the root already has (pending, running or completed). A part that is
+        not -- under ASK_COVERAGE_MIN of its content stems in any of that
+        text -- is appended as a subtask in the user's own words.
+
+        Run 18's first batch covered fee, watering and inactive members but
+        not "decide how to allocate plots fairly" (0.25 of its stems; run
+        17's batch covered it at 0.75). The decomposer only reached it in a
+        second SPAWN, which also redid finished work. A failed or abandoned
+        subtask still counts as covering its part: retrying it is the
+        decomposer's call, not this check's."""
+        spawner = self.colony.get_agent(parent_id) if parent_id else None
+        if (spawner is None or getattr(spawner, "role", None) != "decomposer"
+                or not self.root_task_id
+                or getattr(spawner, "task_id", None) != self.root_task_id
+                or not self.spec):
+            return prepared
+        asks = request_asks(self.spec.get("raw_text") or "")
+        if not asks:
+            return prepared
+        texts = [description for _, description, _ in prepared]
+        texts += [n.description for n in self.task_graph.tasks.values()
+                  if n.parent_task_id == self.root_task_id
+                  and n.status in (0, 1, 2, 3) and n.description]
+        texts += [str(kw.get("description") or "")
+                  for kw in self.pending_overflow.get(parent_id, [])]
+        covered_by_any = {}
+        for text in texts:
+            for ask, _, covered in ask_coverage(asks, text):
+                covered_by_any[ask] = covered_by_any.get(ask, False) or covered
+        added = []
+        for i, ask in enumerate(asks):
+            if ask not in covered_by_any or covered_by_any[ask]:
+                continue  # unscorable (too few stems) or already covered
+            # The stem match is lexical, so a paraphrase ("Work out what each
+            # member should pay annually to break even" for the fee part)
+            # reads as uncovered. When the embedder is up, a batch item or
+            # root child this close to the part covers it.
+            best = self._closest_plan_item_cosine(ask, prepared)
+            if best is not None and best >= self.ASK_EMBED_COVERED:
+                self.colony.record_verdict("root_request_part_paraphrased")
+                print(f"  [request-coverage] part {ask[:60]!r} reads as uncovered "
+                      f"by words but a plan item is {best:.3f} close by "
+                      f"embedding -- not added (PATCH 44).")
+                continue
+            if best is not None:
+                print(f"  [request-coverage] part {ask[:60]!r}: closest plan item "
+                      f"cosine {best:.3f} (< {self.ASK_EMBED_COVERED}).")
+            description = ask[0].upper() + ask[1:]
+            if not description.endswith((".", "?", "!")):
+                description += "."
+            task_id = self._generate_task_id()
+            label = f"request_part_{i + 1}"
+            sub = {"label": label, "role": self._enforce_child_role("executor", parent_id),
+                   "task": description, "dependencies": [], "_request_part": True}
+            label_to_id[label] = task_id
+            added.append((sub, description, task_id))
+        # The user's parts go FIRST: admission cuts a batch from its tail
+        # and the fan-out cap queues from it, so the decomposer's own items,
+        # not the request's, are the ones deferred or dropped.
+        prepared = [entry for entry in added] + list(prepared)
+        added = [description for _, description, _ in added]
+        for description in added:
+            self.colony.record_verdict("root_request_part_added")
+            print(f"  [request-coverage] root SPAWN left a part of the request "
+                  f"uncovered -- added it as a subtask (PATCH 44): {description!r}")
+        if asks:
+            self.colony.record_verdict("root_spawn_coverage_checked")
+        return prepared
+
+    # PATCH 42. A run of this many consecutive words (normalize_words) shared
+    # with a completed sibling's result marks a subtask as that result pasted
+    # back in. Run 18's task_eb1804be opened with 8 words verbatim from
+    # task_1e843b47's accepted REPORT ("annual operational costs are rs 9 000
+    # divided"); a task description that merely reuses the request's figures
+    # shares far shorter runs.
+    PASTED_RESULT_RUN_WORDS = 8
+
+    def _completed_siblings(self, spawner_task_id):
+        """Completed direct children of spawner_task_id (PATCH 42)."""
+        if not spawner_task_id:
+            return []
+        return [n for n in self.task_graph.tasks.values()
+                if n.parent_task_id == spawner_task_id and n.status == 2]
+
+    # PATCH 42. A description word inside a run of this many words that the
+    # request, the goal or the spawner's own task also states is an echo of
+    # the user's words, and no 8-word run counted as pasted may contain one.
+    PASTE_ECHO_RUN_WORDS = 5
+    # PATCH 42. How many words may precede the copied run.
+    PASTE_MAX_LEAD_WORDS = 2
+
+    @staticmethod
+    def _paste_words(text):
+        """normalize_words, with digit groups rejoined ("9 000" -> "9000") so
+        "9,000" and "9000" read as one figure (PATCH 42)."""
+        norm = normalize_words(text)
+        norm = re.sub(r"(?<![0-9])(\d{1,3})((?: \d{3})+)(?![0-9])",
+                      lambda m: m.group(1) + m.group(2).replace(" ", ""), norm)
+        return norm.split()
+
+    def _sibling_result_paste(self, description, spawner_task_id):
+        """PATCH 42. The completed sibling whose result this subtask
+        description copies (a PASTED_RESULT_RUN_WORDS-word run in common that
+        holds no word echoed from the request), or None."""
+        n, k = self.PASTED_RESULT_RUN_WORDS, self.PASTE_ECHO_RUN_WORDS
+        words = self._paste_words(description)
+        if len(words) < n:
+            return None
+        # Every agent's prompt carries the request verbatim, so results and
+        # subtasks restate it ("With 12 plots and 20 members who want one,
+        # ..."). Words of the description inside any k-word run the request,
+        # the goal or the spawner's task also states are masked; a pasted
+        # answer is a run of n UNMASKED words. Masking words rather than
+        # dropping whole n-word runs means one shared lead word ("With",
+        # "Given") cannot carry an echoed clause past the filter.
+        echoes = []
+        if self.spec:
+            echoes += [self.spec.get("raw_text"), self.spec.get("goal")]
+        spawner_task = self.task_graph.tasks.get(spawner_task_id) if spawner_task_id else None
+        if spawner_task is not None:
+            echoes.append(spawner_task.description)
+        echo_runs = set()
+        for text in echoes:
+            if text:
+                ew = self._paste_words(text)
+                echo_runs |= {" ".join(ew[i:i + k]) for i in range(len(ew) - k + 1)}
+        masked = [False] * len(words)
+        for i in range(len(words) - k + 1):
+            if " ".join(words[i:i + k]) in echo_runs:
+                for j in range(i, i + k):
+                    masked[j] = True
+        # The copied run must OPEN the description (allowing a lead word or
+        # two -- "The", "Note:"), as run 18's paste did. A subtask that quotes
+        # a sibling's finding as its input ("Using the finding that ...,
+        # draw up a payment calendar") is new work and must be spawned.
+        # Only UNMASKED words count against the lead: results routinely open
+        # by restating the request ("With 12 plots and 20 members who want
+        # one, members who stop tending their plot for 4 weeks get ...").
+        starts, unmasked_before = [], 0
+        for i in range(len(words) - n + 1):
+            if unmasked_before > self.PASTE_MAX_LEAD_WORDS:
+                break
+            starts.append(i)
+            unmasked_before += 0 if masked[i] else 1
+        shingles = {" ".join(words[i:i + n]) for i in starts
+                    if not any(masked[i:i + n])}
+        if not shingles:
+            return None
+        for sibling in self._completed_siblings(spawner_task_id):
+            result = " ".join(self._paste_words(sibling.result))
+            if not result:
+                continue
+            padded = f" {result} "
+            if any(f" {sh} " in padded for sh in shingles):
+                return sibling.task_id
+        return None
+
+    def _measure_sibling_redo(self, description, embedding, spawner_task_id,
+                              new_task_id):
+        """PATCH 42 (measure-only). For a subtask spawned beside completed
+        siblings, the cosine to the closest one. Run 18 re-planned the
+        watering schedule (task_301a2f63) beside the completed task_441938b0
+        in wording no stem or text rule catches, and run 18 gives no cosine to
+        set a drop threshold from -- so this run collects the distribution."""
+        siblings = self._completed_siblings(spawner_task_id)
+        if not siblings or embedding is None:
+            return
+        best = None
+        for sibling in siblings:
+            cos = _cosine(embedding, sibling.description_embedding)
+            if cos is not None and (best is None or cos > best[0]):
+                best = (cos, sibling.task_id, sibling.description)
+        if best is None:
+            return
+        if not hasattr(self, "sibling_redo_samples"):
+            self.sibling_redo_samples = []
+        self.sibling_redo_samples.append(
+            (round(float(best[0]), 3), new_task_id, best[1], description[:60]))
+        print(f"  [sibling-redo] {new_task_id} closest completed sibling "
+              f"{best[1]} cosine={best[0]:.3f} (measure-only): "
+              f"{description[:60]!r} vs {str(best[2])[:60]!r}")
 
     def _notify_borrowers(self, task_id: str, result) -> None:
         """A borrowed task closed: hand its result to every spawner that
@@ -2970,6 +3201,12 @@ class Orchestrator:
                 prepared = [entry for i, entry in enumerate(prepared)
                             if i not in set(drifted)]
 
+            # PATCH 44. The root's plan must cover every part of the request.
+            # After the gates (they never drop a request part added here) and
+            # before the duplicate check and admission (an added part is
+            # deduped, priced and fan-out queued like any other subtask).
+            prepared = self._fill_uncovered_asks(parent_id, prepared, label_to_id)
+
             # PATCH 35. Duplicate check, after the gates (a dropped subtask
             # never links anything) and BEFORE admission and the fan-out cap
             # (a duplicate reserves no budget and takes no fan-out slot). A
@@ -3025,7 +3262,17 @@ class Orchestrator:
                         f"falling back to sequential-default (depends on "
                         f"the previous subtask in this batch)."
                     )
-                    deps_raw = [str(i - 1)]
+                    # PATCH 44: the previous DECOMPOSER item in the final
+                    # batch, by task id. The positional label str(i - 1)
+                    # names the decomposer's ORIGINAL position, which no
+                    # longer lines up once a request part is put first or a
+                    # gate dropped an earlier item -- it then named the task
+                    # itself and left it pending forever.
+                    prev = next((tid for s, _, tid in reversed(prepared[:i])
+                                 if not s.get("_request_part")), None)
+                    if prev is not None:
+                        label_to_id.setdefault(prev, prev)
+                    deps_raw = [prev] if prev is not None else []
                 else:
                     deps_raw = []
 
@@ -3701,7 +3948,15 @@ class Orchestrator:
                     output_embedding = self.embed_model.encode(str(result), convert_to_numpy=True)
                 except Exception as e:
                     print(f"Warning: failed to embed output for judging: {e}")
-            verdict = self.judge.decide(
+            # PATCH 41. A byte-identical REPORT after a WARN never reaches
+            # the critique: with one WARN per task it would otherwise be
+            # escalated and could be promoted unchanged. Handed to the WARN
+            # branch below, whose short-circuit respawns it as before.
+            previous_warned = self.last_warned_report.get(agent_id)
+            verdict = ({"verdict": "warn", "tier": 2, "resubmission": True,
+                        "reason": "identical REPORT resubmitted after a WARN"}
+                       if previous_warned is not None and previous_warned == str(result)
+                       else None) or self.judge.decide(
                 agent_node,
                 output=result,
                 output_type="text",
@@ -3726,7 +3981,23 @@ class Orchestrator:
                 # reached, and gates nothing.
                 project_goal=self._project_goal_text(),
                 goal_embedding=self.colony.goal_embedding,
+                # PATCH 41. WARNs this task drew on EARLIER agents; the
+                # judge adds the current agent's own warning_count.
+                prior_warnings=max(0, getattr(self, "task_warn_counts", {}).get(task_id, 0)
+                                   - int(getattr(agent_node, "warning_count", 0) or 0)),
             )
+
+            if verdict.get("escalated"):
+                self.last_warned_report.pop(agent_id, None)
+                accepted = verdict.get("verdict") == "promote"
+                self.colony.record_verdict("warn_escalated")
+                self.colony.record_verdict("warn_escalated_accept" if accepted
+                                           else "warn_escalated_reject")
+                sim = verdict.get("similarity")
+                print(f"  [warn-escalate] {agent_id}/{task_id}: similarity "
+                      f"{sim:.3f} after an earlier WARN on this task -- sent to "
+                      f"the deep critique instead of warning again "
+                      f"({'accepted' if accepted else 'rejected'}).")
 
             if verdict.get("tier") == 3:
                 critique_cost = max(1, len(str(verdict.get("reason", ""))) // 100)
@@ -3745,8 +4016,15 @@ class Orchestrator:
                 )
 
         if verdict["verdict"] == "warn":
-            print(f"Judge WARN on {agent_id}/{task_id}: {verdict['reason']}")
-            self.colony.record_verdict("judge_warn")
+            if verdict.get("resubmission"):
+                print(f"  [resubmission] {agent_id}/{task_id}: {verdict['reason']} "
+                      f"-- not judged (PATCH 41).")
+            else:
+                print(f"Judge WARN on {agent_id}/{task_id}: {verdict['reason']}")
+            if not verdict.get("resubmission"):  # PATCH 41: not a new WARN
+                self.colony.record_verdict("judge_warn")
+                counts = self.__dict__.setdefault("task_warn_counts", {})
+                counts[task_id] = counts.get(task_id, 0) + 1
 
             # A WARN is a non-terminal cycle by the same definition the agent
             # already applies to THINK: nothing finished and it is going back
@@ -5164,6 +5442,10 @@ class Orchestrator:
             print(f"    judge WARNs issued      : {warns}")
             print(f"    warn loops cut at the cap: "
                   f"{verdicts.get('warn_cycle_cap_respawn', 0)}")
+            print(f"    WARNs escalated to critique (PATCH 41): "
+                  f"{verdicts.get('warn_escalated', 0)}  (accepted "
+                  f"{verdicts.get('warn_escalated_accept', 0)}, rejected "
+                  f"{verdicts.get('warn_escalated_reject', 0)})")
 
             print(chr(10) + "  SOFTWARE FRAMING (code-shaped work on a non-software request)")
             if not self._software_framing_guard_active:
@@ -5388,6 +5670,31 @@ class Orchestrator:
                                ("overflow dropped, parent retired", "overflow_dropped_parent_retired"),
                                ("decomposer respawn kept subtasks", "decomposer_respawn_inherited")):
                 print(f"    {label:<35}: {verdicts.get(key, 0)}")
+
+            # PATCH 44. Request parts the root's plan left out.
+            parts = request_asks((self.spec or {}).get("raw_text") or "")
+            print(f"\n  REQUEST PARTS (PATCH 44): {len(parts)} in the request")
+            for part in parts:
+                print(f"      - {part[:90]!r}")
+            print(f"    root SPAWNs checked      : "
+                  f"{verdicts.get('root_spawn_coverage_checked', 0)}")
+            print(f"    parts added to the plan  : "
+                  f"{verdicts.get('root_request_part_added', 0)}")
+            print(f"    skipped, a paraphrase    : "
+                  f"{verdicts.get('root_request_part_paraphrased', 0)}")
+
+            # PATCH 42. Subtasks a decomposer re-planned beside finished ones.
+            print("\n  SIBLING REDOS (PATCH 42)")
+            print(f"    duplicates linked (text/cosine)  : "
+                  f"{verdicts.get('spawn_dedup_completed', 0)} completed, "
+                  f"{verdicts.get('spawn_dedup_live', 0)} live")
+            print(f"    pasted a sibling's result, linked: "
+                  f"{verdicts.get('spawn_dedup_pasted_result', 0)}")
+            samples = sorted(getattr(self, "sibling_redo_samples", []), reverse=True)
+            print(f"    spawned beside completed siblings: {len(samples)} "
+                  f"(measure-only cosine to the closest one)")
+            for cos, new_id, sib_id, desc in samples[:8]:
+                print(f"      {cos:.3f}  {new_id} ~ {sib_id}  {desc!r}")
 
             live_count = getattr(self, "_live_agents_at_terminate", len(self.live_agents))
             print(f"\n  live_agents at terminate : {live_count}")

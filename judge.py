@@ -44,6 +44,10 @@ SEMANTIC_EXECUTE_THRESHOLD = 0.3   # at or below this -> execute, too far gone
 # entirely on the next tier 2 pass and execute regardless of current score.
 MAX_WARNINGS = 3
 
+# PATCH 41: WARNs a task may draw (across all its attempts) before a further
+# low-similarity REPORT goes to the tier-3 critique instead of another WARN.
+WARN_ESCALATE_AFTER = 1
+
 # --- Tier 1 empty-answer detection ------------------------------------------
 # A single-line REPORT matching either pattern is a label, not an answer --
 # an ATX markdown heading ("## Summary") or a line wrapped entirely in bold
@@ -389,6 +393,7 @@ class Judge:
         needs_deep_check: bool = False,
         goal_embedding=None,
         project_goal=None,
+        prior_warnings: int = 0,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
@@ -457,6 +462,7 @@ class Judge:
         goal_note = (f" [project-goal similarity={goal_similarity:.3f}, "
                      f"not gated]" if goal_similarity is not None else "")
 
+        escalated = False
         if agent.role == "decomposer":
             similarity = None
         elif output_embedding is None or target_embedding is None:
@@ -484,7 +490,19 @@ class Judge:
                     "tier": 2,
                 }
 
-            if similarity <= SEMANTIC_WARN_THRESHOLD:
+            # PATCH 41. One WARN per task, then the deep critique decides.
+            # Runs 17 and 18 warned on-topic prose answers at 0.35-0.58 again
+            # and again (19 WARNs, 5 agents cycled out, one task abandoned at
+            # 118 energy in run 18) -- a topic score cannot tell a revised
+            # answer from a reworded one. prior_warnings carries WARNs earlier
+            # attempts on the same task drew, so a respawn does not restart
+            # the loop. Only a call that may run tier 3 escalates; the
+            # SEMANTIC_EXECUTE_THRESHOLD floor above still applies first.
+            if (similarity <= SEMANTIC_WARN_THRESHOLD and needs_deep_check
+                    and agent.warning_count + max(0, prior_warnings)
+                    >= WARN_ESCALATE_AFTER):
+                escalated = True
+            elif similarity <= SEMANTIC_WARN_THRESHOLD:
                 agent.warning_count += 1
                 # N2b: target_embedding is now this agent's OWN task (its
                 # subtask's description embedding, or the colony goal only
@@ -516,6 +534,8 @@ class Judge:
         critique = self.deep_critique(output, getattr(agent, "task", None),
                                       project_goal=project_goal)
         if critique["verdict"] == "reject":
-            return {"verdict": "execute", "reason": critique["reasoning"], "tier": 3}
+            return {"verdict": "execute", "reason": critique["reasoning"], "tier": 3,
+                    "escalated": escalated, "similarity": similarity}
 
-        return {"verdict": "promote", "reason": critique["reasoning"], "tier": 3}
+        return {"verdict": "promote", "reason": critique["reasoning"], "tier": 3,
+                "escalated": escalated, "similarity": similarity}

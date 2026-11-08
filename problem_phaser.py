@@ -784,10 +784,46 @@ Output:"""
         if np.all(spec["context_vector"] == 0):
             return 1.0 
 
-        similarity = self._cosine_sim(spec["goal_vector"], spec["context_vector"])
-        similarity = max(0.0, min(1.0, similarity)) 
+        drafts = self._fallback_goal_drafts(spec)
+        if drafts:
+            # PATCH 43 (budget). The goal fell back to the user's own text,
+            # which sits closer to the background context than any model-
+            # written goal does -- run 18's gap fell from run 17's 1.28x to
+            # 1.15x on the same request and the budget from 484 to 398, which
+            # is about what run 18 ran out short by. The gap measures how far
+            # the problem is from its context, not which string stood in for
+            # the goal, so it is taken from the drafts the phaser wrote.
+            try:
+                vectors = self.embed_model.encode(drafts, convert_to_numpy=True)
+                gaps = [self._gap_from(v, spec["context_vector"]) for v in vectors]
+                gap = float(np.mean(gaps))
+                fallback_gap = self._gap_from(spec["goal_vector"], spec["context_vector"])
+                print(f"[Problem_Phaser] semantic gap from {len(drafts)} goal "
+                      f"draft(s) (goal fell back to the request): {gap:.2f}x "
+                      f"(the request text alone would give {fallback_gap:.2f}x)")
+                spec["semantic_gap_source"] = "goal_drafts"
+                return gap
+            except Exception as e:
+                print(f"[Problem_Phaser] WARNING: draft gap failed ({e}); "
+                      f"using the request text.")
+        return self._gap_from(spec["goal_vector"], spec["context_vector"])
 
+    def _gap_from(self, goal_vector, context_vector):
+        similarity = self._cosine_sim(goal_vector, context_vector)
+        similarity = max(0.0, min(1.0, similarity))
         return self.SEMANTIC_BASE + self.SEMANTIC_COEF * (1.0 - similarity)
+
+    @staticmethod
+    def _fallback_goal_drafts(spec):
+        """PATCH 43. The goal drafts goal fidelity rejected, when the goal
+        fell back to the request text; else []."""
+        record = spec.get("goal_fidelity") or {}
+        if record.get("outcome") != "fallback_raw_text":
+            return []
+        # A degenerate draw (PATCH 40) is looping text, not a goal.
+        return [str(a.get("goal")).strip() for a in record.get("attempts") or []
+                if a.get("goal") and str(a.get("goal")).strip()
+                and not a.get("degenerate")]
 
     def estimate_complexity(self, spec):
         """
