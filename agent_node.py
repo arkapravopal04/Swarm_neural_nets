@@ -28,6 +28,8 @@ from text_utils import (
     trim_closer_tail,
     without_decision_records,
 )
+# PATCH 51 (review): the residue rule shared with is_exemplar_echo.
+from text_utils import EXEMPLAR_ONLY_MAX_EXTRA_WORDS, normalize_words
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList
 import ast
@@ -55,8 +57,15 @@ from collections import deque
 # inside a PAYLOAD -- and once decide() started taking the LAST block,
 # prose like "PAYLOAD: The recommended action: DIE if pressure > 5 bar."
 # was parsed as ACTION: DIE. A real label always opens its own line.
+#
+# PATCH 48 (review): markdown emphasis around the colon is tolerated --
+# "**ACTION:** REPORT" and "**ACTION**: REPORT" used to match nothing (the
+# "**" after the colon is not a letter), so a bold-labelled answer fell
+# through to the no-ACTION path. A backtick may open the line too
+# ("`ACTION:` REPORT").
 _ACTION_LINE_RE = re.compile(
-    r"^[ \t>*_#-]*ACTION\s*:\s*(?:(?:ACTION|PAYLOAD)\b\s*:?\s*)*([A-Za-z]+)",
+    r"^[ \t>*_#`-]*ACTION[*_`]*\s*:[*_`\s]*"
+    r"(?:(?:ACTION|PAYLOAD)\b[*_`]*\s*:?[*_`\s]*)*([A-Za-z]+)",
     re.IGNORECASE | re.MULTILINE,
 )
 _ACTION_TOKENS = ("THINK", "SPAWN", "TOOL", "REPORT", "DIE")
@@ -64,7 +73,20 @@ _ACTION_TOKENS = ("THINK", "SPAWN", "TOOL", "REPORT", "DIE")
 _BARE_ACTION_RE = re.compile(
     r"^[ \t]*(THINK|SPAWN|TOOL|REPORT|DIE)\b", re.IGNORECASE | re.MULTILINE
 )
-_PAYLOAD_RE = re.compile(r"PAYLOAD:\s*(.*)", re.DOTALL | re.IGNORECASE)
+# PATCH 48 (review): "**PAYLOAD:** x" / "**PAYLOAD**: x" -- emphasis that
+# sits right against the label (and is followed by whitespace) is not part
+# of the payload. Emphasis that opens the payload itself ("*Option B* is
+# best", "`x = 3`", "* item") is kept.
+_PAYLOAD_RE = re.compile(r"PAYLOAD[*_`]*\s*:(?:[*_`]+(?=\s))?\s*(.*)",
+                         re.DOTALL | re.IGNORECASE)
+_PAYLOAD_LABEL_RE = re.compile(r"PAYLOAD[*_`]*\s*:", re.IGNORECASE)
+# PATCH 47. Where a plain-text payload ends if the model opened another
+# block after it: a line starting with an uppercase "ACTION:" label, or a
+# bare "ACTION" at the very end. The colon is required otherwise, so prose
+# headings such as "ACTION ITEMS:" or "ACTION PLAN:" stay in the payload.
+# PATCH 47 (review): emphasis between ACTION and the colon ("**ACTION**:")
+# still ends a block.
+_NEXT_ACTION_LINE_RE = re.compile(r"\n[ \t>*_#-]*ACTION[*_`]*[ \t]*(?::|\s*$)")
 
 
 def _last_action_match(text):
@@ -134,7 +156,7 @@ def _payload_match_for(text, action_match):
     if action_match is not None:
         return _PAYLOAD_RE.search(text, action_match.end())
     last = None
-    for last in re.finditer(r"PAYLOAD:", text, re.IGNORECASE):
+    for last in _PAYLOAD_LABEL_RE.finditer(text):
         pass
     return _PAYLOAD_RE.search(text, last.start()) if last else None
 
@@ -183,6 +205,33 @@ EXEMPLAR_SUBTASK_DESCRIPTIONS = (
 _EX_WORKED_REPORT = ("Both options meet every constraint, and the second costs "
                      "less, so choose the second.")
 EXEMPLAR_REPORT_TEXTS = (_EX_WORKED_REPORT,)
+
+
+def _exemplar_pattern(example):
+    """PATCH 51 (review). A copy of `example` as a REPORT may carry it:
+    any case, any whitespace between its words, its final punctuation
+    optional, on word boundaries ("...the secondary school" is not a copy),
+    and wrapped in a MATCHING pair of quotes or none -- a lone quote mark
+    next to it belongs to the agent's own text ('"Plan B"', "'A'")."""
+    body = example.rstrip(".!?")
+    words = r"\s+".join(re.escape(w) for w in body.split())
+    core = r"(?<!\w)" + words + r"(?!\w)[.!?]?"
+    quoted = [r'"\s*' + core + r'\s*"', r"'\s*" + core + r"\s*'",
+              "\u201c\\s*" + core + "\\s*\u201d", "\u2018\\s*" + core + "\\s*\u2019"]
+    return re.compile("(?:" + "|".join(quoted + [core]) + ")", re.IGNORECASE)
+
+
+def _is_example_fragment(text, example):
+    """PATCH 51 (review). True when `text`, word-normalized, is a run of
+    consecutive words from `example` -- the cut-off tail of a looped copy."""
+    left = normalize_words(text).split()
+    words = normalize_words(example).split()
+    if not left or len(left) > len(words):
+        return False
+    return any(words[i:i + len(left)] == left for i in range(len(words) - len(left) + 1))
+
+
+_EXEMPLAR_REPORT_PATTERNS = tuple(_exemplar_pattern(ex) for ex in EXEMPLAR_REPORT_TEXTS)
 
 # PATCH 11. What decide() substitutes when generation came back empty and no
 # action could be recovered from it. Hoisted out of decide()'s body into a
@@ -249,9 +298,20 @@ class _ActionPayloadStop(StoppingCriteria):
     # reads it. The budget is a ceiling on generation, not on what is kept.
     REPORT_MAX_NEW_TOKENS = 200
 
+    # PATCH 47. A trailing line that opens a new "ACTION:" label (no action
+    # word yet). Case-sensitive, and the colon is required: prose "action"
+    # and headings such as "ACTION ITEMS" / "ACTION PLAN" / "ACTIONS TAKEN"
+    # inside a payload are not a new block.
+    # PATCH 47 (review): "**ACTION**:" and "**ACTION:**" too -- emphasis
+    # before or after the colon.
+    _TRAILING_ACTION_STUB_RE = re.compile(r"\n[ \t>*_#-]*ACTION[*_`]*[ \t]*:[*_` \t]*$")
+
     def __init__(self, tokenizer, prompt_len, extract_balanced_object, min_new_tokens=10,
-                 report_max_new_tokens=None):
+                 report_max_new_tokens=None, role=None):
         self.tokenizer = tokenizer
+        # PATCH 47: a decomposer's REPORT (the roll-up) ends on the cap or
+        # EOS only, never on a blank line.
+        self.role = role
         self.prompt_len = prompt_len
         self.extract_balanced_object = extract_balanced_object
         self.min_new_tokens = min_new_tokens
@@ -311,6 +371,33 @@ class _ActionPayloadStop(StoppingCriteria):
         # wait for, so a blank line after real content is treated as "the
         # model considers this done" (matches how format_example_str's own
         # examples are paragraph-separated).
+        #
+        # PATCH 47. The model has started a SECOND block ("...\n\nACTION:")
+        # after a complete plain-text one: stop now. A bare "ACTION:" stub
+        # has no action word, so it does not match _ACTION_LINE_RE and
+        # action_match is still the complete earlier block; decide() cuts
+        # the stub off. Plain-text payloads only -- a JSON payload is
+        # governed by extract_balanced_object above.
+        stub = self._TRAILING_ACTION_STUB_RE.search(text)
+        if stub is not None:
+            before_stub = text[payload_match.start(1):stub.start()].strip()
+            if before_stub:
+                return True
+
+        # PATCH 47. Not for a REPORT that is plainly unfinished: a lead-in
+        # ("Here are the results:" + blank line) or a last line with no
+        # sentence end yet. A decomposer's roll-up runs to the REPORT cap or
+        # EOS -- it is several paragraphs by design. THINK and DIE keep the
+        # blank-line stop unchanged.
+        if action == "REPORT":
+            if self.role == "decomposer":
+                return False
+            lines = [ln.strip() for ln in payload_raw.splitlines() if ln.strip()]
+            last_line = lines[-1] if lines else ""
+            if last_line.endswith(":"):
+                return False
+            if not re.search(r"[.!?]", last_line):
+                return False
         return text.endswith("\n\n")
 
 
@@ -356,11 +443,16 @@ class Agent:
     THINK_DEGEN_MIN_TOKENS = 48
 
     MAX_TOTAL_THINK_TOKENS = 4096
-    THINK_CYCLES_BEFORE_DECIDE = 1
+    # PATCH 46. Was 1: think() returned "THINK" on an agent's first cycle, so
+    # the first run() skipped decide() and spent a whole tick (one extra
+    # think generation, ~2-5 energy, counted toward MAX_NON_TERMINAL_CYCLES)
+    # before the agent could act. At 0 think() always returns FORCE_DECIDE,
+    # so every run() is think -> decide.
+    THINK_CYCLES_BEFORE_DECIDE = 0
 
     # Hard ceiling on run() cycles that end without finishing or handing off.
-    # Every run() past the first spends a full think() generation AND a
-    # decide() generation, so an agent whose decide() keeps answering THINK
+    # Every run() spends a full think() generation AND a decide() generation
+    # (PATCH 46: the first one included), so an agent whose decide() keeps answering THINK
     # never ends -- one executor looped THINK seven-plus times without a
     # REPORT or DIE and was most of that run's think_tick spend on its own.
     # MAX_TOTAL_THINK_TOKENS does not catch it: it only stops think() from
@@ -370,11 +462,15 @@ class Agent:
     # `awaiting` unset -- not only THINK. A SPAWN or TOOL the agent itself
     # rejects (malformed JSON, missing keys) returns without setting
     # `awaiting`, so the next tick is another think()+decide() on the same
-    # task: the same loop, and counting THINK alone never saw it. Includes
-    # think()'s automatic first cycle, so 4 means three more chosen by
-    # decide(). Once reached, run() skips think() and decide() is offered
-    # only final_actions.
-    MAX_NON_TERMINAL_CYCLES = 4
+    # task: the same loop, and counting THINK alone never saw it. Once
+    # reached, run() skips think() and decide() is offered only
+    # final_actions.
+    #
+    # PATCH 46: 4 -> 3. There is no automatic first THINK cycle any more
+    # (THINK_CYCLES_BEFORE_DECIDE = 0), so every counted cycle was chosen by
+    # decide(). 3 keeps the worst case (3 thinks, 4 decides) below the old
+    # one (4 thinks, 4 decides).
+    MAX_NON_TERMINAL_CYCLES = 3
 
     def __init__(self, tokeniser, model, message: Messenger, node: AgentNode,
                  KV_Cache=None, last_hidden_state=None):
@@ -452,6 +548,10 @@ class Agent:
         # available_tools=[] argument actually block TOOL at execute() time
         # instead of only changing prompt wording -- see request_tool().
         self._run_available_tools = None
+        # PATCH 45. What think()'s KV cache last saw of the information that
+        # can change between cycles (_think_context_snapshot). None until the
+        # first seed.
+        self._think_context_key = None
 
     @property
     def agent_id(self):
@@ -740,23 +840,22 @@ class Agent:
                 'ACTION: REPORT\n'
                 'PAYLOAD: ' + _EX_WORKED_REPORT
             ),
+            # PATCH 51. Was ACTION: TOOL with run_code print('hello'): an
+            # executor's only worked example taught a pointless tool call,
+            # against its own role rule ("If the task did not ask for a
+            # program, answer in plain sentences -- no code"). The same
+            # worked REPORT as the verifier now; how to call a tool stays in
+            # the tool argument reference below. (This also retires the old
+            # "swap the TOOL example out when tools are blocked" branch --
+            # no example is a TOOL any more.)
             "executor": (
-                'ACTION: TOOL\n'
-                'PAYLOAD: {"tool_name": "run_code", "args": {"code_string": "print(\'hello\')"}}'
+                'ACTION: REPORT\n'
+                'PAYLOAD: ' + _EX_WORKED_REPORT
             ),
         }
         tools_blocked = self._tools_blocked(available_tools)
 
         positive = examples.get(self.role, examples["executor"])
-        if tools_blocked and positive.startswith("ACTION: TOOL"):
-            # Showing a TOOL example while TOOL is refused is the single
-            # strongest nudge back into the loop we are trying to break.
-            # Widened from (circuit_open or disabled_closed) to the shared
-            # gate: with tools disabled for the run, EVERY executor was
-            # still being shown a run_code call as its one worked example
-            # of a valid response, which is why so many of them opened
-            # with one.
-            positive = examples["verifier"]
 
         if final_only:
             # Cycle cap reached with a REPORT/DIE menu, so the only worked
@@ -839,14 +938,15 @@ class Agent:
         # lines of exact-key JSON for tools the agent is not permitted to
         # call -- it is both the largest tool-shaped block in the prompt
         # and an implicit claim that calling them is on the table.
+        # PATCH 50: run_code and verify_math only. The file tools
+        # (safe_read_file, write_file, query_dataframe) are off the menu
+        # (ToolRegistry.list_tools) because they cannot work in a run, so
+        # they are not advertised here either.
         tool_arg_reference = "" if tools_blocked or not self._role_may_tool else (
             "Tool argument reference (use the EXACT keys shown for each "
             "tool -- they are NOT interchangeable):\n"
             '- run_code: {"tool_name": "run_code", "args": {"code_string": "..."}}\n'
             '- verify_math: {"tool_name": "verify_math", "args": {"expression": "...", "mode": "computational"}}\n'
-            '- safe_read_file: {"tool_name": "safe_read_file", "args": {"filepath": "..."}}\n'
-            '- write_file: {"tool_name": "write_file", "args": {"filepath": "...", "content": "..."}}\n'
-            '- query_dataframe: {"tool_name": "query_dataframe", "args": {"filepath": "...", "action": "summary"}}\n'
         )
 
         # SPAWN examples go to decomposers only. A SPAWN from any other role
@@ -1077,6 +1177,63 @@ class Agent:
             "there. Your task below is the part of it you answer.\n\n"
         )
 
+    _EARLIER_ATTEMPTS_HEADER = (
+        "[EARLIER ATTEMPTS AT THIS TASK FAILED -- do not repeat these]\n")
+    # PATCH 55 (review): per-reason ceiling, same figure ColonyState uses
+    # for earlier_failures.
+    GHOST_REASON_MAX_CHARS = 300
+    # PATCH 55: the latest reason when a respawn's predecessor left none.
+    _NO_STATED_REASON = "previous attempt ended without a stated reason"
+
+    def _ghost_context_str(self):
+        """
+        PATCH 55. The ghost context as prompt text, for the thinking
+        seed and the decide prompt both.
+
+        A respawned agent's ghost_context is a dict (ColonyState.
+        extract_agent_ghost): "base_context" (the project-goal line and the
+        prerequisite results the task was first given), "earlier_failures"
+        (oldest first) and "fail_reason" (why the previous agent died), plus
+        last_task / energy_spent / role, which are never shown. Printed as
+        f"Ghost Context: {dict}" it was a raw Python repr with newlines shown
+        as backslash-n and energy_spent visible. A plain string renders
+        exactly as before.
+        """
+        value = self.ghost_context
+        if not value:
+            return ""
+        if not isinstance(value, dict):
+            return f"Ghost Context: {value}\n"
+        parts = []
+        base = value.get("base_context")
+        if base:
+            # PATCH 55 (review): no blank line between base and the header.
+            parts.append(str(base).rstrip("\n") + "\n")
+        raw = [r for r in (value.get("earlier_failures") or []) if r]
+        if value.get("fail_reason"):
+            raw.append(value["fail_reason"])
+        else:
+            # PATCH 55: a dict ghost always means a respawn, so the previous
+            # attempt died even when it left no reason -- say so now rather
+            # than one respawn later (ColonyState's placeholder text).
+            raw.append(self._NO_STATED_REASON)
+        # PATCH 55 (review): every reason -- the current fail_reason too --
+        # capped like ColonyState caps earlier_failures, then hard-cut, and
+        # flattened to one line so an embedded "[END VERDICT]" or newline
+        # cannot break out of its bullet.
+        reasons = []
+        for r in raw:
+            r = " ".join(str(r).split())
+            r = _dedupe_repeated_sentences(r, max_chars=self.GHOST_REASON_MAX_CHARS)
+            if len(r) > self.GHOST_REASON_MAX_CHARS:
+                r = r[:self.GHOST_REASON_MAX_CHARS - 3].rstrip() + "..."
+            if r:
+                reasons.append(r)
+        if reasons:
+            parts.append(self._EARLIER_ATTEMPTS_HEADER
+                         + "".join(f"- {r}\n" for r in reasons))
+        return "".join(parts)
+
     def _build_thinking_seed(self, requirements=None, available_tools=None):
         if requirements is None:
             requirements = self.requirements or []
@@ -1133,7 +1290,7 @@ class Agent:
             )
         else:
             actions_str = "Real actions that exist for your role: THINK, TOOL, REPORT, DIE (no others exist).\n"
-        ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
+        ghost_str = self._ghost_context_str()  # PATCH 55
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
         # more line of the agent's own commentary, especially with the
@@ -1164,7 +1321,7 @@ class Agent:
         if requirements is None:
             requirements = self.requirements or []
 
-        ghost_str = f"Ghost Context: {self.ghost_context}\n" if self.ghost_context else ""
+        ghost_str = self._ghost_context_str()  # PATCH 55
         # Delimited and labelled as an external verdict, not narrated as a
         # sentence. "WARNING - Previous Action Failed: <prose>" read as one
         # more line of the agent's own commentary, especially with the
@@ -1378,6 +1535,53 @@ Your next action:"""
         return prompt
     
 
+    def _think_context_snapshot(self):
+        """PATCH 45. The parts of the thinking seed that can change after it
+        was fed to the KV cache: (fail_reason, last_tool_result,
+        repr(ghost_context), child-status block). Compared by think() each
+        continued cycle."""
+        child_block = (self._child_status_block(self._direct_child_statuses())
+                       if self.role == "decomposer" else "")
+        return (self.fail_reason, self.last_tool_result,
+                repr(self.ghost_context), child_block)
+
+    def _think_context_update(self, snap):
+        """PATCH 45. (text to feed think()'s KV cache, [names of the changed
+        parts]) for the parts of `snap` that differ from what the cache last
+        saw and are non-empty now. ("", []) when nothing worth adding --
+        e.g. only fail_reason was cleared."""
+        prev = self._think_context_key or (None, None, None, None)
+        fail_reason, tool_result, ghost_repr, child_block = snap
+        body = []
+        changed = []
+        if fail_reason != prev[0] and fail_reason:
+            # Same wording as _build_prompt / _build_thinking_seed.
+            body.append(
+                f"[VERDICT FROM REVIEWER -- this is not your reasoning, it is a "
+                f"ruling on your last attempt]\n{fail_reason}\n[END VERDICT]\n")
+            changed.append("fail_reason")
+        if tool_result != prev[1] and tool_result:
+            # PATCH 45 (review): a failed call's result is already inside
+            # fail_reason ("Tool call to X failed: <result>") -- feed it once.
+            result_text = tool_result.split("]: ", 1)[-1]
+            if fail_reason and result_text in fail_reason:
+                changed.append("last_tool_result (in verdict)")
+            else:
+                body.append(f"Result of your most recent TOOL call:\n{tool_result}\n")
+                changed.append("last_tool_result")
+        if ghost_repr != prev[2]:
+            ghost_str = self._ghost_context_str()
+            if ghost_str:
+                body.append(ghost_str)
+                changed.append("ghost_context")
+        if child_block != prev[3] and child_block:
+            body.append(child_block)
+            changed.append("child_status")
+        if not body:
+            return "", []
+        return ("\n\n[NEW INFORMATION since your last thoughts]\n" + "".join(body)
+                + "[END NEW INFORMATION]\nContinue thinking with this in mind:\n"), changed
+
     def think(self, available_roles=None, available_tools=None, requirements=None):
         """
         See class-level docstring/comments in the previous revision for the
@@ -1392,12 +1596,36 @@ Your next action:"""
             input_ids = inputs["input_ids"]
             self._total_generated = 0  # fresh reasoning chain -- reset lifetime counter
             self._think_recent_ids.clear()  # ...and the repetition window it shares a context with
+            # PATCH 45: what this seed showed, so later cycles can tell what changed.
+            self._think_context_key = self._think_context_snapshot()
 
         else:
             if self.last_token_id is not None:
                 input_ids = torch.tensor([[self.last_token_id]], device=self.model.device)
             else:
                 raise ValueError("KV_Cache is present, but missing last_token_id to continue generation.")
+            # PATCH 45. The cache only ever saw the seed. A tool result, a
+            # reviewer verdict, a child status or a threaded dependency result
+            # that arrived since is fed in here, after last_token_id (sampled
+            # last cycle but never fed to the model, so it goes first).
+            # Prompt-side only: not added to thought_process, not counted in
+            # _total_generated or the repetition window.
+            snap = self._think_context_snapshot()
+            # PATCH 45 (review): at the lifetime token ceiling the loop below
+            # generates nothing, so feeding an update now would only grow the
+            # cache. Leave the change pending (key not advanced).
+            if (snap != self._think_context_key
+                    and self._total_generated < self.MAX_TOTAL_THINK_TOKENS):
+                update_text, changed = self._think_context_update(snap)
+                if update_text:
+                    delta = self.tokeniser(update_text, return_tensors="pt",
+                                           add_special_tokens=False)
+                    delta_ids = delta["input_ids"].to(self.model.device)
+                    input_ids = torch.cat([input_ids, delta_ids], dim=1)
+                    print(f"  [think() context update] agent={self.agent_id} "
+                          f"role={self.role} +{delta_ids.shape[1]} tokens "
+                          f"(changed: {', '.join(changed)})")
+                self._think_context_key = snap
 
         hit_token_ceiling = False
         hit_degenerate = False
@@ -1511,6 +1739,11 @@ Your next action:"""
         # THINK continues the same KV cache that just produced the loop, so
         # it would most likely reproduce it. Hand control to decide()
         # instead, which has its own retry loop and can re-roll.
+        #
+        # PATCH 46: with THINK_CYCLES_BEFORE_DECIDE = 0 the "THINK" return is
+        # unreachable (think_cycle is already >= 1 here), so think() always
+        # returns FORCE_DECIDE. Kept so the constant still means what it
+        # says if it is ever raised again.
         if (self.think_cycle <= self.THINK_CYCLES_BEFORE_DECIDE
                 and not hit_token_ceiling and not hit_degenerate):
             return "THINK"
@@ -1631,7 +1864,9 @@ Your next action:"""
         # input_ids each call), so the same instance is reused across the
         # retry loop below.
         stopping_criteria = StoppingCriteriaList([
-            _ActionPayloadStop(self.tokeniser, prompt_len, self._extract_first_balanced_object)
+            # PATCH 47: role, so a decomposer's roll-up is not cut at a blank line.
+            _ActionPayloadStop(self.tokeniser, prompt_len, self._extract_first_balanced_object,
+                               role=self.role)
         ])
 
         generated_text = None
@@ -1682,6 +1917,7 @@ Your next action:"""
         self.thought_process += f"\n{record_decision_text(strip_special_tokens(generated_text))}\n"
 
         action = "REPORT"  # Safe default fallback
+        recovered_spawn = None  # PATCH 48 (review): unlabelled decomposer SPAWN
         # Last block wins -- see _last_action_match.
         action_match = _last_action_match(generated_text)
 
@@ -1745,6 +1981,40 @@ Your next action:"""
                         f"cycle) rather than REPORT (ends the task on a parse "
                         f"failure)."
                     )
+        else:
+            # PATCH 48 (a). No ACTION: line and no bare keyword. `action`
+            # used to stay at its "REPORT" default here, so free-form text
+            # was submitted as the answer and ended the task -- the one
+            # parse failure that did not degrade to THINK like the others.
+            if not generated_text.strip():
+                # Empty generation keeps REPORT -> EMPTY_DECISION_PLACEHOLDER
+                # below (orchestrator identity-compares it, Patch 11).
+                pass
+            elif self.role != "decomposer" and _payload_match_for(generated_text, None):
+                # "PAYLOAD: answer" with no ACTION line: still a REPORT.
+                pass
+            else:
+                # PATCH 48 (review): a decomposer that wrote its batch with no
+                # labels at all has still written the SPAWN -- run it rather
+                # than spend a THINK cycle re-deriving it.
+                recovered_spawn = (
+                    self._recover_unlabelled_payload("SPAWN", generated_text)
+                    if self.role == "decomposer" else None)
+                if isinstance(recovered_spawn, dict):
+                    action = "SPAWN"
+                    self.fail_reason = None
+                    print(f"  [decide() payload RECOVERED] agent={self.agent_id} "
+                          f"-- no ACTION line, but a well-formed SPAWN object was "
+                          f"found; running the SPAWN.")
+                else:
+                    action = "THINK"
+                    self.fail_reason = (
+                        "No ACTION: line was found in your last response, so "
+                        "nothing was done. Reply with exactly one ACTION: line "
+                        "followed by one PAYLOAD: line."
+                    )
+                    print(f"  [decide() NO ACTION] agent={self.agent_id} role={self.role} "
+                          f"-- unlabelled text treated as THINK, not REPORT.")
 
         # Past the tool cap a TOOL (from habit, or copied from earlier
         # context) is turned into a REPORT here, before the payload parser:
@@ -1757,6 +2027,9 @@ Your next action:"""
 
         payload = ""
         payload_match = _payload_match_for(generated_text, action_match)
+        if recovered_spawn is not None:
+            # PATCH 48 (review): the unlabelled SPAWN object found above.
+            payload, payload_match = recovered_spawn, None
 
         if payload_match:
             payload_raw = payload_match.group(1).strip()
@@ -1850,12 +2123,45 @@ Your next action:"""
                 # tail that _looks_degenerate now also flags upstream --
                 # both are needed, since the flag only triggers a retry and
                 # a retry can come back with filler of its own.
+                #
+                # PATCH 47: the stop criterion now ends generation when the
+                # model opens a second block ("\n\nACTION"); that stub, and
+                # anything after it, is not part of this payload.
+                payload_raw = _NEXT_ACTION_LINE_RE.split(payload_raw, maxsplit=1)[0].rstrip()
                 payload = _dedupe_repeated_sentences(
                     trim_closer_tail(payload_raw), max_chars=2000
                 )
 
         if not payload and not (isinstance(payload, dict)):
-            if generated_text.strip():
+            if (generated_text.strip() and action_match is not None
+                    and action in ("REPORT", "THINK", "DIE")):
+                # PATCH 48 (b). A labelled plain-text action with no PAYLOAD:
+                # used to take the WHOLE generation as its payload -- the
+                # "ACTION: REPORT" line and any abandoned draft above it
+                # included -- and scrub_result does not remove label lines,
+                # so they reached the judge and the parent. Only what follows
+                # the chosen ACTION line is the body.
+                body = strip_scaffolding_lines(
+                    strip_special_tokens(generated_text[action_match.end():])).strip()
+                # PATCH 48 (review): the closing "**" of "**ACTION: REPORT**"
+                # -- only a run of emphasis that ends its line, so a body
+                # opening with "*Option B*" or a "* item" bullet keeps it.
+                body = re.sub(r"^[*_`]+(?=[ \t]*(?:\n|$))", "", body).strip()
+                if body:
+                    payload = _dedupe_repeated_sentences(
+                        trim_closer_tail(body), max_chars=2000)
+                elif action == "REPORT":
+                    action = "THINK"
+                    self.fail_reason = (
+                        "Your REPORT had no content after the ACTION line. "
+                        "Put the answer after PAYLOAD:."
+                    )
+                    payload = generated_text.strip()
+                    print(f"  [decide() EMPTY REPORT] agent={self.agent_id} "
+                          f"-- no body after 'ACTION: REPORT'; treated as THINK.")
+                else:
+                    payload = generated_text.strip()
+            elif generated_text.strip():
                 payload = generated_text.strip()
                 if action in ("SPAWN", "TOOL"):
                     # FIX (SPAWN/TOOL -> REPORT mislabel): this used to
@@ -1900,6 +2206,9 @@ Your next action:"""
             else:
                 payload = EMPTY_DECISION_PLACEHOLDER
 
+        if action == "REPORT" and isinstance(payload, str):
+            payload = self._strip_exemplar_echo(payload)
+
         self.cap_coerced_last_run = False
         if self.final_only:
             final = self.final_actions
@@ -1908,6 +2217,43 @@ Your next action:"""
                 self.cap_coerced_last_run = True
 
         return action, payload
+
+    @staticmethod
+    def _strip_exemplar_echo(text):
+        """
+        PATCH 51 (review). Every executor now sees _EX_WORKED_REPORT as its
+        worked example. A REPORT that copies it and then answers ("<example
+        sentence> The answer is 42 because ...") reached promotion, where
+        text_utils.degeneracy_cut cuts from the example to the END -- the
+        real answer went with it. Each copy of an EXEMPLAR_REPORT_TEXTS string
+        is removed here -- case-insensitive, final punctuation optional, any
+        whitespace between its words, on word boundaries, together with a
+        matching pair of quotes wrapped round it (_exemplar_pattern).
+
+        The text is returned UNCHANGED (so the orchestrator's whole-echo
+        reject still fires) when what is left is a label or a word or two:
+        at most EXEMPLAR_ONLY_MAX_EXTRA_WORDS normalized words, the same
+        residue rule text_utils.is_exemplar_echo uses, or nothing
+        alphanumeric. Text with no copy in it is returned untouched.
+        """
+        stripped, hits = text, 0
+        for pattern in _EXEMPLAR_REPORT_PATTERNS:
+            stripped, n = pattern.subn(" ", stripped)
+            hits += n
+        if not hits:
+            return text
+        stripped = re.sub(r"[ \t]+", " ", stripped)
+        stripped = re.sub(r" *\n *", "\n", stripped)
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+        if (not re.search(r"[A-Za-z0-9]", stripped)
+                or len(normalize_words(stripped).split()) <= EXEMPLAR_ONLY_MAX_EXTRA_WORDS
+                # A looped copy cut off mid-way: what is left is still the
+                # example, only shorter.
+                or any(_is_example_fragment(stripped, ex) for ex in EXEMPLAR_REPORT_TEXTS)):
+            return text
+        print(f"  [decide() EXEMPLAR ECHO] removed a copy of the prompt's worked "
+              f"REPORT; kept {len(stripped)} chars of the agent's own text.")
+        return stripped
 
     @staticmethod
     def _is_spawn_payload(payload):
@@ -2065,6 +2411,13 @@ Your next action:"""
     # changes between attempt 1 and attempt 15 of the same deterministically
     # blocked call; two is enough to establish the agent is repeating it.
     MAX_DISABLED_TOOL_ATTEMPTS = 2
+    # PATCH 49. Ceiling on one tool result as it enters this agent's
+    # context (receive_tool_result): longer results keep the first
+    # TOOL_RESULT_HEAD_CHARS and the last TOOL_RESULT_TAIL_CHARS around a
+    # "characters cut" marker.
+    TOOL_RESULT_MAX_CHARS = 1500
+    TOOL_RESULT_HEAD_CHARS = 1000
+    TOOL_RESULT_TAIL_CHARS = 400
 
     @staticmethod
     def _normalize_args_for_signature(value):
@@ -2256,6 +2609,21 @@ Your next action:"""
         # MAX_DISABLED_TOOL_ATTEMPTS identical-in-kind blocks instead of
         # letting the agent grind all the way to the per-agent tool cap
         # re-discovering the same "no tools available" fact each time.
+        # PATCH 50: split. Only an EMPTY available set means "tools are
+        # disabled for this run" (and counts toward closing TOOL). A name
+        # outside a non-empty set is a wrong choice of tool: say which tools
+        # exist, and leave TOOL open -- before, two such calls closed TOOL
+        # entirely, run_code included.
+        if (self._run_available_tools is not None and len(self._run_available_tools) > 0
+                and tool_name not in self._run_available_tools):
+            self.fail_reason = (
+                f"Tool '{tool_name}' is not available. Available tools: "
+                f"{list(self._run_available_tools)}. Use one of those, or REPORT."
+            )
+            print(f"  [request_tool() BLOCKED - not an available tool] {tool_name} "
+                  f"(available: {list(self._run_available_tools)})")
+            return
+
         if self._run_available_tools is not None and tool_name not in self._run_available_tools:
             self.disabled_tool_attempts += 1
             if self.disabled_tool_attempts >= self.MAX_DISABLED_TOOL_ATTEMPTS:
@@ -2396,6 +2764,19 @@ Your next action:"""
         place that learns whether a call actually worked.
         """
         result_summary = str(result_summary)
+        # PATCH 49. Cap before anything stores it: run_code can return up to
+        # 1 MB of stdout, and this string is re-printed (via last_tool_result
+        # and thought_process) in every later think seed and decide() prompt.
+        # Head + tail, so both the first values and a trailing error or
+        # final print survive.
+        if len(result_summary) > self.TOOL_RESULT_MAX_CHARS:
+            head = result_summary[:self.TOOL_RESULT_HEAD_CHARS]
+            tail = result_summary[-self.TOOL_RESULT_TAIL_CHARS:]
+            cut = len(result_summary) - len(head) - len(tail)
+            # PATCH 49 (review): the "print less" advice only fits a call
+            # that worked; a failure's long text is a traceback or error.
+            advice = " -- print only the values you need" if success else ""
+            result_summary = f"{head}\n[... {cut} characters cut{advice} ...]\n{tail}"
         if self.pending_tool_name_correction:
             result_summary = f"{self.pending_tool_name_correction}\n{result_summary}"
             self.pending_tool_name_correction = None
