@@ -1877,6 +1877,73 @@ def trim_status_tail(text, grounding=None):
     return text[:spans[cut - 1][1]].rstrip() if cut > 0 else "", "status-report tail"
 
 
+# PATCH 56. A sentence grading the answer instead of giving it.
+_SELF_CHECK_RE = re.compile(
+    r"\b(?:word count|checksum"
+    r"|(?:includes|contains) all (?:\w+ )?required (?:results|components|parts|sections)"
+    r"|all required (?:results|components|parts|sections) are present"
+    r"|does not contain any additional|meets all (?:the )?requirements|ready to submit)",
+    re.IGNORECASE)
+# PATCH 56. Words of a submit/verify procedure, not of an answer.
+_META_WORD_RE = re.compile(r"\b(?:submission|submit|verifier|verify|verified|revert)\b",
+                           re.IGNORECASE)
+# PATCH 56 (review). Meta segments the text after the first made-up status
+# line must hold, beyond that line, before it is cut. Low overlap alone cut a
+# real agenda written in its own words; run 19's tail holds a dozen.
+META_TAIL_MIN_MARKERS = 2
+# PATCH 56. Under this fraction of its content stems in the problem and the
+# subtask results, the text after a made-up status line is not answer
+# content. Run 19's tail ("Previous submission status: failed ... You must
+# either VERIFY or REVERT") scored 0.06; a real sentence from the results 0.87.
+META_TAIL_GROUNDED_MAX = 0.3
+
+
+def cut_ungrounded_meta_tail(text, grounding):
+    """PATCH 56. Cut at the first made-up status line (a "signal" segment:
+    submission ID, ungrounded timestamp) when everything from there on is
+    not drawn from `grounding` and holds at least META_TAIL_MIN_MARKERS more
+    meta segments (status lines, self-checks, submit/verify wording), walking
+    back over closers and self-checks
+    ("Validated checksum passes.") just before it. (kept, reason), or
+    (text, None). trim_status_tail only cuts a status run that reaches the
+    END; run 19's ran on for ten more meta lines and shipped."""
+    if not text or not grounding:
+        return text, None
+    text = str(text)
+    spans = _segment_spans(text)
+    seg = lambda i: text[spans[i][0]:spans[i][1]]
+    first = next((i for i in range(len(spans))
+                  if _status_segment_kind(seg(i), grounding) == "signal"), None)
+    if not first:  # none, or the answer opens with one: not this cut's case
+        return text, None
+    rest = content_stems(text[spans[first][0]:])
+    if rest and len(rest & content_stems(grounding)) / len(rest) >= META_TAIL_GROUNDED_MAX:
+        return text, None
+    # A strong marker is a self-check or a non-telemetry status line
+    # (submission ID, end marker, output tag). Not a made-up timestamp: a
+    # schedule of invented "Opening time: ..." lines is still content. Nor
+    # submit/verify wording alone, which fits real instructions ("Submit
+    # plot requests by March. Verify the fee with the treasurer.").
+    cut = first
+    while cut > 0 and (_status_segment_kind(seg(cut - 1), grounding) == "closer"
+                       or _SELF_CHECK_RE.search(seg(cut - 1))):
+        cut -= 1
+    if cut == 0:
+        return text, None
+    # Self-checks in the walked-back run count as evidence too: run 19's
+    # "word count ... checksum ... includes all four required components"
+    # all sit just BEFORE its first made-up line.
+    strong = [i for i in range(cut, len(spans)) if i != first
+              and (_SELF_CHECK_RE.search(seg(i))
+                   or (_status_segment_kind(seg(i), grounding) == "signal"
+                       and not is_telemetry_segment(seg(i), grounding)))]
+    weak = [i for i in range(first + 1, len(spans))
+            if i not in strong and _META_WORD_RE.search(seg(i))]
+    if not strong or len(strong) + len(weak) < META_TAIL_MIN_MARKERS:
+        return text, None
+    return text[:spans[cut - 1][1]].rstrip(), "ungrounded meta tail"
+
+
 def cut_adjacent_repeat(text, max_block=4, min_chars=_REPEAT_MIN_SENTENCE_CHARS):
     """Cut at the second copy of a block repeated back to back, as
     (kept, reason). (text, None) when there is none.

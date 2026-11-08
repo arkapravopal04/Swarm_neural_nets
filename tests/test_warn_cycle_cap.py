@@ -156,10 +156,13 @@ def test_warn_with_no_live_agent_still_behaves():
 
 def test_promote_is_unaffected():
     orch = _orchestrator(judge=_WarnJudge(verdict="promote", reason="fine"))
+    agent = orch.live_agents["a1"]
     _report(orch, "Weight is traded against cost.")
 
     assert orch.task_graph.tasks["t-1"].status == 2
-    assert orch.live_agents["a1"].non_terminal_cycles == 0
+    assert agent.non_terminal_cycles == 0
+    assert "a1" not in orch.live_agents  # PATCH 57: a promoted agent leaves live_agents
+    assert agent.KV_Cache is None and agent.last_hidden_state is None
 
 
 def test_ledger_reports_warns_and_cap_respawns(capsys):

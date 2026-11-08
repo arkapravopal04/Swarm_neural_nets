@@ -4205,6 +4205,23 @@ class Orchestrator:
             task_node.result = result
         self._thread_results_to_unblocked_dependents(task_node)
 
+        # PATCH 57. A promoted agent is finished: drop it from live_agents
+        # and free its KV cache. Run 19 ended with all 5 promoted agents
+        # still live (reserved VRAM 4.8 -> 6.3 GB). Not _retire_agent: that
+        # writes a failure ghost and unregisters the agent, which is for an
+        # agent that died. The colony registry keeps it for the ledger.
+        finished = self.live_agents.pop(agent_id, None)
+        if finished is not None:
+            finished.KV_Cache = None
+            finished.last_hidden_state = None
+            try:  # same release _retire_agent does, so reserved VRAM drops too
+                import gc, torch
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
         # Root completion check
         if task_id == self.root_task_id:
             print("Root task completed! Triggering Synthesizer...")
@@ -5856,6 +5873,7 @@ class Orchestrator:
             ("synthesis cut at a degenerate tail", trims.get("cut", 0)),
             ("synthesis cut at a repeated block ", trims.get("repeat_cut", 0)),
             ("synthesis cut at a status report  ", trims.get("status_tail", 0)),
+            ("synthesis cut at a meta tail (P56)", trims.get("meta_tail", 0)),
             ("synthesis empty after its cut     ", trims.get("empty", 0)),
             ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
             ("synthesis shipped made-up metrics ", trims.get("shipped_telemetry", 0)),

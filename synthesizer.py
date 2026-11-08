@@ -20,8 +20,11 @@ synthesizer doesn't own a model instance, the orchestrator wires in whatever
 already wraps the shared model.
 """
 
+import re
+
 from text_utils import (
     cut_adjacent_repeat as _cut_adjacent_repeat,
+    cut_ungrounded_meta_tail as _cut_ungrounded_meta_tail,
     dedupe_global_and_cap as _dedupe_and_cap,
     degeneracy_cut as _degeneracy_cut,
     drop_incomplete_tail as _drop_incomplete_tail,
@@ -414,6 +417,16 @@ class Synthesizer:
             self._record_trim("status_tail")
             print(f"  [synthesis-trim] final answer cut at a status-report tail "
                   f"({len(untrimmed)} -> {len(kept)} chars).")
+
+        # PATCH 56. A made-up status line mid-answer followed only by meta
+        # text, and the prompt's "COMPLETED WORK" label echoed into a line.
+        before_meta = kept
+        kept, reason = _cut_ungrounded_meta_tail(kept, grounding)
+        if reason is not None:
+            self._record_trim("meta_tail")
+            print(f"  [synthesis-trim] final answer cut at an {reason} "
+                  f"({len(before_meta)} -> {len(kept)} chars, PATCH 56).")
+        kept = re.sub(r"\s+(?:used\s+)?in (?:the )?COMPLETED WORK(?=\s*:)", "", kept)
 
         # The walk-back again, after the cuts. _drop_incomplete_tail above ran
         # on the raw decode only; a cut at a line boundary (the repeat and
