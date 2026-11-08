@@ -2144,9 +2144,9 @@ Your next action:"""
                 body = strip_scaffolding_lines(
                     strip_special_tokens(generated_text[action_match.end():])).strip()
                 # PATCH 48 (review): the closing "**" of "**ACTION: REPORT**"
-                # -- only a run of emphasis standing on its own, so a body
-                # that opens with "*Option B*" keeps its asterisk.
-                body = re.sub(r"^[*_`]+(?=\s|$)", "", body).strip()
+                # -- only a run of emphasis that ends its line, so a body
+                # opening with "*Option B*" or a "* item" bullet keeps it.
+                body = re.sub(r"^[*_`]+(?=[ \t]*(?:\n|$))", "", body).strip()
                 if body:
                     payload = _dedupe_repeated_sentences(
                         trim_closer_tail(body), max_chars=2000)

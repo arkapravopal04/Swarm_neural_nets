@@ -148,3 +148,16 @@ def test_bold_labels_still_stripped():
 
 def test_backtick_label_parses():
     assert _report_payload("`ACTION:` REPORT\nThe answer is 5.") == "The answer is 5."
+
+
+# -------------------------------------------------- review fixes, third round
+
+def test_unlabelled_answer_opening_with_a_bullet_keeps_it():
+    payload = _report_payload("ACTION: REPORT\n* item one\n* item two")
+    assert payload.startswith("* item one")
+    assert "* item two" in payload
+
+
+def test_closing_bold_of_the_action_line_is_still_removed():
+    assert _report_payload("**ACTION: REPORT**\nThe answer is 5.") == "The answer is 5."
+    assert _report_payload("**ACTION: REPORT**\n*Option B* is best.") == "*Option B* is best."
