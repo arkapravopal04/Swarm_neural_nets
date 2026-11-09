@@ -227,7 +227,7 @@ class Judge:
     # ------------------------------------------------------------------
 
     def deep_critique(self, output, subtask_spec, project_goal=None,
-                      ungrounded_figures=None) -> dict:
+                      ungrounded_figures=None, figures_follow=False) -> dict:
         """
         Full LLM call. Only invoked when an agent is attempting to promote
         its result to its parent -- the most expensive tier, reserved for
@@ -310,6 +310,13 @@ class Judge:
                "reject if it builds on a number the output itself rejected (for "
                "example the cost of an option it did not choose).\n\n"
                if chained else "")
+            # PATCH 67. Run 22 rejected a correct "15,000 / 50 = 300 per
+            # person" as bad arithmetic; the figures had all checked out.
+            + ("FIGURES CHECKED: an automatic check found every figure in the OUTPUT "
+               "in the request or a simple arithmetic step from its numbers. Do not "
+               "reject for arithmetic alone; still reject if a figure stands for the "
+               "wrong quantity or the reasoning is wrong.\n\n"
+               if figures_follow and not figures else "")
             + "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
             f"{output}\n"
             "=== END OUTPUT ===\n\n"
@@ -414,6 +421,7 @@ class Judge:
         project_goal=None,
         prior_warnings: int = 0,
         ungrounded_figures=None,
+        figures_follow=False,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
@@ -556,7 +564,8 @@ class Judge:
         figures = list(ungrounded_figures or [])
         critique = self.deep_critique(output, getattr(agent, "task", None),
                                       project_goal=project_goal,
-                                      **({"ungrounded_figures": figures} if figures else {}))
+                                      **({"ungrounded_figures": figures} if figures else {}),
+                                      **({"figures_follow": True} if figures_follow else {}))
         if critique["verdict"] == "reject":
             return {"verdict": "execute", "reason": critique["reasoning"], "tier": 3,
                     "escalated": escalated, "similarity": similarity,

@@ -39,6 +39,7 @@ from agent_node import (
 from tools import ToolRegistry
 from text_utils import (
     ask_coverage,
+    figure_values,
     request_asks,
     content_stems,
     normalize_identifier,
@@ -1512,7 +1513,7 @@ class Orchestrator:
             found = [d for v, d in chained.items() if v not in small] + [
                 e["written"] for e in first if e["value"] not in passed | small]
         except Exception:
-            return []
+            return None  # PATCH 67: no check ran -- not the same as "all clear"
         return found[:self.MAX_UNGROUNDED_FIGURES]
 
     def _project_goal_text(self) -> Optional[str]:
@@ -4111,6 +4112,12 @@ class Orchestrator:
             # escalated and could be promoted unchanged. Handed to the WARN
             # branch below, whose short-circuit respawns it as before.
             previous_warned = self.last_warned_report.get(agent_id)
+            # PATCH 62 / 67. Figures the critique should check, and whether
+            # every figure checked out (run 22's critique rejected a correct
+            # "15,000 / 50 = 300 per person" as an arithmetic error).
+            figures = self._ungrounded_figures(result, task_id)
+            figures_follow = (figures == [] and bool((self.spec or {}).get("supplies_data"))
+                              and any(v > 10 for v in figure_values(str(result))))
             verdict = ({"verdict": "warn", "tier": 2, "resubmission": True,
                         "reason": "identical REPORT resubmitted after a WARN"}
                        if previous_warned is not None and previous_warned == str(result)
@@ -4143,8 +4150,8 @@ class Orchestrator:
                 # judge adds the current agent's own warning_count.
                 prior_warnings=max(0, getattr(self, "task_warn_counts", {}).get(task_id, 0)
                                    - int(getattr(agent_node, "warning_count", 0) or 0)),
-                # PATCH 62. Figures the critique should check, not guess at.
-                ungrounded_figures=self._ungrounded_figures(result, task_id),
+                ungrounded_figures=figures or [],
+                figures_follow=figures_follow,
             )
 
             if verdict.get("tier") == 3 and verdict.get("ungrounded_figures"):
@@ -6110,10 +6117,11 @@ class Orchestrator:
         if is_successful:
             print("System Status: TERMINATED [SUCCESS]")
             print("The root task successfully completed and synthesized.")
-            if self.abandoned_tasks:
+            unanswered = self._unanswered_abandoned()
+            if unanswered:
                 # Both at once: the root was accepted, and some of the work
                 # under it was not done. Said here and in the answer itself.
-                print(f"PARTIAL: {len(self.abandoned_tasks)} subtask(s) were "
+                print(f"PARTIAL: {len(unanswered)} subtask(s) were "
                       f"abandoned -- the returned answer carries the "
                       f"[PARTIAL RESULT] banner.")
         elif self.hit_tick_ceiling:
@@ -6217,11 +6225,31 @@ class Orchestrator:
         # Any run with abandoned subtasks gets it, whatever its status: run 3
         # was SUCCESS with 8 abandoned, all three of the root's subtasks among
         # them, and its answer carried no sign of it.
-        if partial_synthesis or self.abandoned_tasks:
+        if partial_synthesis or self._unanswered_abandoned():
             best_result = self._with_partial_banner(best_result, is_successful, synthesized)
         self._print_final_answer_figures(best_result)
         self._print_final_answer_report()
         return best_result
+
+    def _unanswered_abandoned(self):
+        """PATCH 65. The abandoned tasks whose request part no completed task
+        answered. Run 22 abandoned its first meal task, completed the same
+        part on a re-plan, and still shipped the [PARTIAL RESULT] banner. A
+        task matched to no single part counts as unanswered."""
+        # Root children only: a completed leaf ("plan day 1 meals") is a
+        # piece of a part, not an answer to it.
+        done = {self._request_part_for(t.description, t.description_embedding)
+                for t in self.task_graph.tasks.values()
+                if t.status == 2 and t.parent_task_id == self.root_task_id}
+        done.discard(None)
+        out = []
+        for tid in self.abandoned_tasks:
+            t = self.task_graph.tasks.get(tid)
+            part = (self._request_part_for(t.description, t.description_embedding)
+                    if t is not None and tid != self.root_task_id else None)
+            if part is None or part not in done:
+                out.append(tid)
+        return out
 
     def _with_partial_banner(self, answer, is_successful: bool, synthesized: bool):
         """`answer` under the [PARTIAL RESULT] banner. Left alone when it is
