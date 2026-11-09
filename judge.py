@@ -226,7 +226,8 @@ class Judge:
     # Tier 3 -- deep critique
     # ------------------------------------------------------------------
 
-    def deep_critique(self, output, subtask_spec, project_goal=None) -> dict:
+    def deep_critique(self, output, subtask_spec, project_goal=None,
+                      ungrounded_figures=None) -> dict:
         """
         Full LLM call. Only invoked when an agent is attempting to promote
         its result to its parent -- the most expensive tier, reserved for
@@ -291,7 +292,15 @@ class Judge:
                f"was NOT asked to do all of this): {project_goal}\n\n"
                if project_goal else "")
             + f"SUBTASK: {subtask_spec}\n\n"
-            "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
+            # PATCH 62. The run already knows which figures came from
+            # nowhere; the critique read prose and accepted invented ones.
+            + (f"FIGURES TO CHECK: the OUTPUT states "
+               f"{', '.join(map(str, ungrounded_figures))}, which appear neither in "
+               "the project request, the subtask, nor accepted results, and are "
+               "not simple arithmetic on their figures. Reject if the output's "
+               "answer depends on one of these and it does not present it as an "
+               "assumption.\n\n" if ungrounded_figures else "")
+            + "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
             f"{output}\n"
             "=== END OUTPUT ===\n\n"
             "The OUTPUT block above is already finished. Do not continue, "
@@ -394,6 +403,7 @@ class Judge:
         goal_embedding=None,
         project_goal=None,
         prior_warnings: int = 0,
+        ungrounded_figures=None,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
@@ -531,11 +541,17 @@ class Judge:
                 "tier": 2,
             }
 
+        # PATCH 62. Passed only when there are figures, so a critique
+        # without the parameter (a stand-in) still runs.
+        figures = list(ungrounded_figures or [])
         critique = self.deep_critique(output, getattr(agent, "task", None),
-                                      project_goal=project_goal)
+                                      project_goal=project_goal,
+                                      **({"ungrounded_figures": figures} if figures else {}))
         if critique["verdict"] == "reject":
             return {"verdict": "execute", "reason": critique["reasoning"], "tier": 3,
-                    "escalated": escalated, "similarity": similarity}
+                    "escalated": escalated, "similarity": similarity,
+                    "ungrounded_figures": figures}
 
         return {"verdict": "promote", "reason": critique["reasoning"], "tier": 3,
-                "escalated": escalated, "similarity": similarity}
+                "escalated": escalated, "similarity": similarity,
+                "ungrounded_figures": figures}

@@ -1453,6 +1453,49 @@ class Orchestrator:
                             ghost_context=self._child_ghost_context(dependencies)) is None:
             self._close_unstartable_child(task_id, parent_id)
 
+    # PATCH 62. At most this many figures go into one critique prompt.
+    MAX_UNGROUNDED_FIGURES = 8
+
+    def _ungrounded_figures(self, result, task_id):
+        """PATCH 62. Figures `result` states that are neither in the request,
+        the task's own description or an accepted result, nor simple
+        arithmetic on theirs -- the ledger's "neither" class, until now
+        measure-only. Run 20's critique accepted "2x6=12 watering events,
+        24 watering hours" and "21 possible combinations" because it read
+        prose and never saw which figures came from nowhere. [] when the
+        request supplies no data (every figure is then the model's own)."""
+        spec = self.spec or {}
+        request = spec.get("raw_text") or ""
+        if not request or not spec.get("supplies_data"):
+            return []
+        task = self.task_graph.tasks.get(task_id)
+        # PATCH 62 (review). Only what this task builds on: its dependencies
+        # and its own children. Every accepted result in the run made the
+        # pair check quadratic late in a run and let random values pass as
+        # derivable.
+        deps = set(getattr(task, "dependencies", None) or ())
+        parts = [request, str(getattr(task, "description", "") or "")]
+        parts += [str(t.result) for tid, t in self.task_graph.tasks.items()
+                  if tid != task_id and getattr(t, "status", None) == 2
+                  and getattr(t, "result", None) is not None
+                  and (tid in deps or getattr(t, "parent_task_id", None) == task_id)]
+        try:
+            from text_utils import classify_figures, FIGURE_NEITHER
+            source = chr(10).join(parts)
+            first = classify_figures(source, str(result))
+            # A second pass with the output's own grounded and derived
+            # figures added: "40,000 + 45,000 = 85,000, leaving 95,000" is
+            # two steps, and one-step arithmetic flagged the 95,000.
+            steps = " ".join(e["written"] for e in first if e["class"] != FIGURE_NEITHER)
+            final = classify_figures(source + chr(10) + steps, str(result)) if steps else first
+            # A whole number up to 10 is a count ("1 teacher" for the
+            # request's "one", "2 waterings"), too common to call invented.
+            found = [e["written"] for e in final if e["class"] == FIGURE_NEITHER
+                     and not (float(e["value"]).is_integer() and abs(float(e["value"])) <= 10)]
+        except Exception:
+            return []
+        return found[:self.MAX_UNGROUNDED_FIGURES]
+
     def _project_goal_text(self) -> Optional[str]:
         """PATCH 8. The goal as one short line, for the tier-3 prompt and the
         zero-requirement referent. Deduped and capped the same way
@@ -3985,7 +4028,18 @@ class Orchestrator:
                 # judge adds the current agent's own warning_count.
                 prior_warnings=max(0, getattr(self, "task_warn_counts", {}).get(task_id, 0)
                                    - int(getattr(agent_node, "warning_count", 0) or 0)),
+                # PATCH 62. Figures the critique should check, not guess at.
+                ungrounded_figures=self._ungrounded_figures(result, task_id),
             )
+
+            if verdict.get("tier") == 3 and verdict.get("ungrounded_figures"):
+                rejected = verdict.get("verdict") == "execute"
+                self.colony.record_verdict("tier3_ungrounded_shown")
+                if rejected:
+                    self.colony.record_verdict("tier3_ungrounded_reject")
+                print(f"  [ungrounded figures] {agent_id}/{task_id}: critique shown "
+                      f"{verdict['ungrounded_figures']} -- "
+                      f"{'rejected' if rejected else 'accepted'} (PATCH 62).")
 
             if verdict.get("escalated"):
                 self.last_warned_report.pop(agent_id, None)
@@ -5403,6 +5457,9 @@ class Orchestrator:
                 rate = 100.0 * accepts / tier3_total
                 print(f"    accept : {accepts}")
                 print(f"    reject : {rejects}")
+                shown = verdicts.get("tier3_ungrounded_shown", 0)
+                print(f"    shown ungrounded figures (P62) : {shown}"
+                      f"  (rejected {verdicts.get('tier3_ungrounded_reject', 0)})")
                 print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
             # PATCH 34. "Caught" = a tier-3 reject; printed even at 0/0 so
             # every run's log carries the line.
@@ -5874,6 +5931,8 @@ class Orchestrator:
             ("synthesis cut at a repeated block ", trims.get("repeat_cut", 0)),
             ("synthesis cut at a status report  ", trims.get("status_tail", 0)),
             ("synthesis cut at a meta tail (P56)", trims.get("meta_tail", 0)),
+            ("synthesis near-copies dropped (P60)", trims.get("near_dup", 0)),
+            ("synthesis cut at self-praise (P61)", trims.get("self_praise", 0)),
             ("synthesis empty after its cut     ", trims.get("empty", 0)),
             ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
             ("synthesis shipped made-up metrics ", trims.get("shipped_telemetry", 0)),

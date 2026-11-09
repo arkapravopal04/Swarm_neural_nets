@@ -1944,6 +1944,109 @@ def cut_ungrounded_meta_tail(text, grounding):
     return text[:spans[cut - 1][1]].rstrip(), "ungrounded meta tail"
 
 
+# PATCH 60. A repeat shorter than this many words is left to the exact
+# dedupe: a list number ("1.") or "Yes." can recur legitimately.
+NEAR_DUP_MIN_WORDS = 3
+_LIST_NUMBER_END_RE = re.compile(r"(?:^|\n)[ \t]*(?:\d{1,3}|[A-Za-z])[.)]$")
+
+
+def _loose_sentence_key(sentence):
+    """PATCH 60. A sentence read past case, punctuation and a leading article."""
+    # Edge punctuation only: "-5" vs "5" and "3.5" vs "3,5" stay different.
+    words = [w for w in (t.strip("\"'.,;:!?()") for t in str(sentence).lower().split()) if w]
+    if words and words[0] in ("the", "a", "an"):
+        words = words[1:]
+    return " ".join(words) if len(words) >= NEAR_DUP_MIN_WORDS else ""
+
+
+def drop_repeated_sentences(text):
+    """PATCH 60. Drop a sentence that repeats an earlier one once case,
+    punctuation and a leading the/a/an are ignored, as (kept, dropped).
+    The global dedupe runs last and matches exactly, so run 20's closing
+    "The total cost coverage exactly meets ..." (sentence 5 again, plus a
+    "The") shipped -- and sitting at the very end, it hid the self-praise
+    run before it from every tail cut."""
+    if not text:
+        return text, 0
+    seen, kept, dropped = set(), [], 0
+    prev_sep, prev_sentence = "", ""
+    for sentence, sep in _split_keeping_separators(str(text)):
+        key = _loose_sentence_key(sentence)
+        # Prose only: a sentence opening a line, or after a list number
+        # ("1.", "Day 2:\n1."), is a list step or heading that may recur.
+        inline = "\n" not in prev_sep and not _LIST_NUMBER_END_RE.search(prev_sentence)
+        prev_sep, prev_sentence = sep, sentence
+        if key and key in seen and inline:
+            dropped += 1
+            # A dropped sentence that ended a line takes the break back to
+            # the sentence before it, or the next line joins this one.
+            if kept and "\n" in sep:
+                kept[-1] = (kept[-1][0], sep)
+            continue
+        if key:
+            seen.add(key)
+        kept.append((sentence, sep))
+    if not dropped:
+        return text, 0
+    return "".join(s + sep for s, sep in kept).rstrip(), dropped
+
+
+# PATCH 61. A sentence praising the answer instead of giving it: "All
+# outcomes align well with the stated goals", "It fully satisfies all
+# specified requirements", "All constraints met".
+_SELF_PRAISE_RE = re.compile(
+    r"\b(?:align(?:s|ed)? (?:well |closely )?with (?:the |all )?(?:\w+ )?"
+    r"(?:goals?|requirements|constraints|objectives)"
+    r"|(?:satisf(?:y|ies|ied)|meets?|met|fulfil(?:l|ls|led)?|address(?:es|ed)?) "
+    r"(?:all|every) (?:of )?(?:the )?(?:\w+ )?"
+    r"(?:requirements?|constraints?|goals?|tasks?|objectives?)"
+    r"|(?:all|every) (?:\w+ )?(?:constraints?|requirements?|tasks?|goals?|objectives?) "
+    r"(?:(?:are|is|have been|has been|were|was) )?(?:\w+ )?(?:met|satisfied|fulfilled|addressed)"
+    r"|successfully balances|ready for (?:final )?(?:submission|review))",
+    re.IGNORECASE)
+# PATCH 61. A rule for the reader ("Members must meet all safety
+# requirements") is content, whatever its wording.
+_DIRECTIVE_RE = re.compile(r"\b(?:must|should|shall|needs? to|ha(?:ve|s) to|required to)\b",
+                           re.IGNORECASE)
+SELF_PRAISE_MIN_RUN = 2
+SELF_PRAISE_MAX_WORDS = 14
+
+
+def _is_self_praise(segment):
+    s = str(segment).strip()
+    # PATCH 61 (review). A sentence with a figure ("Total spend of 85,000
+    # meets every cost constraint") or a condition ("If a student falls
+    # ill, ...") is content.
+    return (len(s.split()) <= SELF_PRAISE_MAX_WORDS and not _DIRECTIVE_RE.search(s)
+            and not re.search(r"\d", s) and not re.match(r"\W*if\b", s, re.IGNORECASE)
+            and bool(_SELF_PRAISE_RE.search(s) or _SELF_CHECK_RE.search(s)))
+
+
+def cut_self_praise_tail(text):
+    """PATCH 61. Cut a trailing run of SELF_PRAISE_MIN_RUN or more short
+    sentences grading the answer, as (kept, reason) or (text, None). The
+    closer cut only sees sentences of three words or fewer, and PATCH 56
+    needs a made-up status line first; run 20 ended "The design
+    successfully balances multiple competing constraints effectively. It
+    fully satisfies all specified requirements." and shipped. Never cuts
+    the whole answer."""
+    if not text:
+        return text, None
+    text = str(text)
+    spans = _segment_spans(text)
+    cut = len(spans)
+    while cut > 0 and _is_self_praise(text[spans[cut - 1][0]:spans[cut - 1][1]]):
+        cut -= 1
+    if len(spans) - cut < SELF_PRAISE_MIN_RUN:
+        return text, None
+    # A header left introducing the cut run ("Checklist:") goes with it.
+    while cut > 0 and text[spans[cut - 1][0]:spans[cut - 1][1]].strip().endswith(":"):
+        cut -= 1
+    if cut == 0:
+        return text, None
+    return text[:spans[cut - 1][1]].rstrip(), "self-praise tail"
+
+
 def cut_adjacent_repeat(text, max_block=4, min_chars=_REPEAT_MIN_SENTENCE_CHARS):
     """Cut at the second copy of a block repeated back to back, as
     (kept, reason). (text, None) when there is none.
