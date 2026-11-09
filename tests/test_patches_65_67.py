@@ -126,3 +126,15 @@ def test_run22_correct_meal_answer_reaches_the_critique_marked_as_checked():
 def test_invented_figures_are_not_marked_as_checked():
     kwargs = _complete("Each meal costs 120 rupees, so 150 meals cost 18,000 rupees.")
     assert kwargs["ungrounded_figures"] and kwargs["figures_follow"] is False
+
+
+# ---------------- PATCH 66 ----------------
+
+def test_synthesis_prompt_says_where_the_answer_ends():
+    import synthesizer as synth_mod
+    captured = []
+    synth_mod.Synthesizer(llm_call_fn=lambda p: captured.append(p) or "Take the bus.").format_output(
+        [{"description": "Transport.", "result": "Take the bus at 40,000 rupees."}], SCHOOL)
+    prompt = captured[0]
+    assert "Answer each part of the PROBLEM in turn, then stop." in prompt
+    assert prompt.rstrip().endswith("ANSWER:")

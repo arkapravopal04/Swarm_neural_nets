@@ -320,7 +320,12 @@ class Synthesizer:
             f"PROBLEM: {problem_spec}\n\n"
             f"COMPLETED WORK:\n{results_block}\n\n"
             "Write the answer, built from the COMPLETED WORK. Copy names, "
-            "identifiers and numbers from it as they are written there.\n\n"
+            "identifiers and numbers from it as they are written there. "
+            # PATCH 66. Nothing said where the answer ends: run 22 covered the
+            # four parts, then kept going ("Fuel reserves: Full tank...",
+            # "Ground crew: ...", "Insurance coverage: ..."). A step, not a
+            # quality word -- see the note above on what comes back.
+            "Answer each part of the PROBLEM in turn, then stop.\n\n"
             "ANSWER:"
         )
 
