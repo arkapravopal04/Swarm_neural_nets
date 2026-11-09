@@ -1995,7 +1995,10 @@ def drop_repeated_sentences(text):
 # outcomes align well with the stated goals", "It fully satisfies all
 # specified requirements", "All constraints met".
 _SELF_PRAISE_RE = re.compile(
-    r"\b(?:align(?:s|ed)? (?:well |closely )?with (?:the |all )?(?:\w+ )?"
+    # Run 21: any adverb, object a few words on ("aligns perfectly with the
+    # stated budget cap and operational requirements").
+    r"\b(?:align(?:s|ed)? (?:\w+ )?with (?:the |all |every )?"
+    r"(?:stated|specified|project|overall|all|every)\b[^.!?]{0,30}?\b"
     r"(?:goals?|requirements|constraints|objectives)"
     r"|(?:satisf(?:y|ies|ied)|meets?|met|fulfil(?:l|ls|led)?|address(?:es|ed)?) "
     r"(?:all|every) (?:of )?(?:the )?(?:\w+ )?"
@@ -2010,6 +2013,14 @@ _DIRECTIVE_RE = re.compile(r"\b(?:must|should|shall|needs? to|ha(?:ve|s) to|requ
                            re.IGNORECASE)
 SELF_PRAISE_MIN_RUN = 2
 SELF_PRAISE_MAX_WORDS = 14
+# Run 21. A checklist tick ("Safety protocols included.", "Travel cost
+# justification complete."). Cut only in a trailing run that also holds a
+# real praise sentence: "Museum entry included." alone is a fact.
+# A full sentence ("Lunch is included.") is a fact, so no is/are/was/were.
+_CHECK_TICK_RE = re.compile(
+    r"^\W*(?:(?!(?:is|are|was|were)\b)\w+\s+){0,4}(?:complete|completed|included|specified|addressed|"
+    r"covered|confirmed|satisfied|verified|justified)"
+    r"(?:\s+(?:clearly|fully|successfully))?\W*$", re.IGNORECASE)
 
 
 def _is_self_praise(segment):
@@ -2019,7 +2030,8 @@ def _is_self_praise(segment):
     # ill, ...") is content.
     return (len(s.split()) <= SELF_PRAISE_MAX_WORDS and not _DIRECTIVE_RE.search(s)
             and not re.search(r"\d", s) and not re.match(r"\W*if\b", s, re.IGNORECASE)
-            and bool(_SELF_PRAISE_RE.search(s) or _SELF_CHECK_RE.search(s)))
+            and bool(_SELF_PRAISE_RE.search(s) or _SELF_CHECK_RE.search(s)
+                     or _CHECK_TICK_RE.match(s)))
 
 
 def cut_self_praise_tail(text):
@@ -2037,7 +2049,9 @@ def cut_self_praise_tail(text):
     cut = len(spans)
     while cut > 0 and _is_self_praise(text[spans[cut - 1][0]:spans[cut - 1][1]]):
         cut -= 1
-    if len(spans) - cut < SELF_PRAISE_MIN_RUN:
+    run = [text[a:b] for a, b in spans[cut:]]
+    if len(run) < SELF_PRAISE_MIN_RUN or not any(
+            _SELF_PRAISE_RE.search(s) or _SELF_CHECK_RE.search(s) for s in run):
         return text, None
     # A header left introducing the cut run ("Checklist:") goes with it.
     while cut > 0 and text[spans[cut - 1][0]:spans[cut - 1][1]].strip().endswith(":"):

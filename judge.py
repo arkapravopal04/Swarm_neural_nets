@@ -245,6 +245,10 @@ class Judge:
         """
         if self.llm_call_fn is None:
             raise ValueError("deep_critique requires llm_call_fn to be set at Judge construction")
+        # PATCH 62: "a = b - c" entries are derivations, the rest figures.
+        figures = [str(f) for f in (ungrounded_figures or [])]
+        chained = [f for f in figures if " = " in f]
+        loose = [f for f in figures if " = " not in f]
 
         # FIX (tier-3 scope rewrite): the docstring above has always promised
         # this critique looks at engagement depth, confidence calibration,
@@ -294,12 +298,18 @@ class Judge:
             + f"SUBTASK: {subtask_spec}\n\n"
             # PATCH 62. The run already knows which figures came from
             # nowhere; the critique read prose and accepted invented ones.
-            + (f"FIGURES TO CHECK: the OUTPUT states "
-               f"{', '.join(map(str, ungrounded_figures))}, which appear neither in "
-               "the project request, the subtask, nor accepted results, and are "
-               "not simple arithmetic on their figures. Reject if the output's "
-               "answer depends on one of these and it does not present it as an "
-               "assumption.\n\n" if ungrounded_figures else "")
+            + (f"FIGURES TO CHECK: the OUTPUT states {', '.join(loose)}, which "
+               "appear neither in the project request, the subtask, nor accepted "
+               "results, and are not simple arithmetic on their figures. Reject if "
+               "the output's answer depends on one of these and it does not present "
+               "it as an assumption.\n\n" if loose else "")
+            # PATCH 62 (run 21). Arithmetic on the output's own numbers.
+            + (f"DERIVATIONS TO CHECK: {'; '.join(chained)}. Each shows one way "
+               "the figure follows from the output's own numbers, not necessarily "
+               "the output's working. Find where the output gets the figure and "
+               "reject if it builds on a number the output itself rejected (for "
+               "example the cost of an option it did not choose).\n\n"
+               if chained else "")
             + "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
             f"{output}\n"
             "=== END OUTPUT ===\n\n"

@@ -123,6 +123,27 @@ def test_a_header_over_the_cut_run_goes_with_it():
     assert cut_self_praise_tail(text) == ("Take the bus for 40,000 rupees.", "self-praise tail")
 
 
+def test_run21_checklist_ticks_and_adverb_praise_are_cut():
+    text = ("Meal planning accommodates all attendees safely without exceeding daily limits. "
+            "Medical response procedure specified clearly. All constraints satisfied. Travel cost "
+            "justification complete. Safety protocols included. Final verification confirms "
+            "everything aligns perfectly with the stated budget cap and operational requirements.")
+    assert cut_self_praise_tail(text) == (
+        "Meal planning accommodates all attendees safely without exceeding daily limits.",
+        "self-praise tail")
+
+
+def test_a_single_tick_or_ticks_with_figures_stay():
+    for text in ("Take the bus. Booking confirmed.",
+                 "Take the bus. Deposit of 5,000 paid. 45 seats confirmed.",
+                 "Day plan: museum in the morning. Museum entry included. Packed lunch included.",
+                 "Take the bus. Lunch is included. Insurance is covered. This aligns with all "
+                 "requirements.",
+                 "We pick the bus. The schedule aligns with the bus company's requirements. "
+                 "Booking confirmed."):
+        assert cut_self_praise_tail(text) == (text, None)
+
+
 def test_long_sentences_are_not_praise():
     text = ("Plots go by lottery. Fees are Rs. 750. The committee meets all the "
             "neighbourhood groups each spring to agree the watering rota and the "
@@ -162,7 +183,8 @@ REPORT = ("Each plot gets 2 waterings a month over the 6 months, so 12 x 2 = 24 
 
 def test_figures_from_nowhere_are_listed():
     found = _orch()._ungrounded_figures(REPORT, "t-water")
-    assert found == ["21"]
+    # 24 = 12 x 2 is a chain on the output's own 2: shown with its working
+    assert found == ["24 = 12 x 2", "21"]
     # the task's own figure, the request's, an accepted result's, and
     # arithmetic on them, two steps deep (2 = 12 / 6, 24 = 12 x 2), are not
     assert "6" not in found and "12" not in found and "750" not in found
@@ -171,6 +193,43 @@ def test_figures_from_nowhere_are_listed():
 def test_small_counts_are_not_listed():
     found = _orch()._ungrounded_figures("Each group has 1 lead and 3 helpers; 21 combos.", "t-water")
     assert found == ["21"]
+
+
+SCHOOL = ("A school is taking 45 students and 5 teachers on a 3-day trip with a budget of "
+          "180,000 rupees. Choose between a bus that costs 40,000 rupees in total and a train at "
+          "900 rupees per person, plan meals so that each day stays under 15,000 rupees, split the "
+          "students into groups with one teacher each, and decide what to do if a student falls ill "
+          "during the trip.")
+
+
+def _school(description="Calculate the total transportation cost"):
+    orch = _orch()
+    orch.spec = {"raw_text": SCHOOL, "supplies_data": True}
+    orch.task_graph.add_task(TaskNode(task_id="t-bus", description=description,
+                                      agent_id="b", status=1))
+    return orch
+
+
+def test_run21_remaining_budget_on_the_rejected_train_is_shown_with_its_working():
+    found = _school()._ungrounded_figures(
+        "The bus is 40,000 rupees versus 900*50 = 45,000 for the train, so take the bus. "
+        "The remaining budget after transport is 135,000 rupees.", "t-bus")
+    assert len(found) == 1 and found[0].startswith("135000 = ") and "45000" in found[0]
+
+
+def test_a_three_step_chain_is_working_not_invention():
+    found = _school()._ungrounded_figures("Bus 40,000 + meals 45,000 = 85,000, leaving 95,000.",
+                                          "t-bus")
+    assert found == ["85000 = 40000 + 45000", "95000 = 180000 - 85000"]
+
+
+def test_critique_gets_figures_and_derivations_on_separate_lines():
+    captured = []
+    Judge(llm_call_fn=lambda p: captured.append(p) or " accept\nok").deep_critique(
+        "out", "task", ungrounded_figures=["21", "135000 = 180000 - 45000"])
+    lines = [l for l in captured[0].splitlines() if "TO CHECK" in l]
+    assert lines[0].startswith("FIGURES TO CHECK: the OUTPUT states 21,")
+    assert lines[1].startswith("DERIVATIONS TO CHECK: 135000 = 180000 - 45000.")
 
 
 def test_nothing_is_listed_for_a_data_free_request():

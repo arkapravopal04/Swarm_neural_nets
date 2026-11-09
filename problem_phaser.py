@@ -17,6 +17,7 @@ from text_utils import (
     looks_like_source_code,
     plain_register,
     reasoning_reason,
+    request_asks,
     strip_code_fences,
 )
 
@@ -45,6 +46,7 @@ class Problem_Phaser:
     }
 
     # Constraint scoring variables
+    BUDGET_PER_REQUEST_PART = 125  # PATCH 64: 4 parts -> 500, about the garden's 515
     CONSTRAINT_BASE = 1.0
     CONSTRAINT_COEF = 0.5
     CONSTRAINT_CAP = 2.5
@@ -852,6 +854,16 @@ Output:"""
         
         clamped_score = max(1.0, min(raw_score, 9.0))
         budget = int(np.interp(clamped_score, score_points, budget_points))
+        # PATCH 64. At least BUDGET_PER_REQUEST_PART per part of the request.
+        # The score follows how many constraints the phaser happened to
+        # extract: two 4-part requests got 515 (garden) and 329 (school
+        # trip), and run 21 ran out with a part still unanswered.
+        parts = len(request_asks(spec.get("raw_text") or ""))
+        floor = self.BUDGET_PER_REQUEST_PART * parts
+        if floor > budget:
+            print(f"[Problem_Phaser] budget raised {budget} -> {floor}: "
+                  f"{parts} request parts x {self.BUDGET_PER_REQUEST_PART} (PATCH 64).")
+            budget = floor
 
         spec.update({
             "complexity_score": round(raw_score, 2),

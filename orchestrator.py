@@ -159,6 +159,11 @@ GOAL_DRIFT_GATE_ACTS = False
 # text equality counts as a match whatever the cosine (and is the only test
 # when there is no embedding model).
 SPAWN_DEDUP_COSINE = 0.92
+# Run 21. The bar against a COMPLETED task on the SAME request part (PATCH
+# 63's matcher): re-plans of finished work scored 0.636-0.775, but so do
+# different tasks ("total transport cost" vs "total meal cost", 0.74), which
+# the part match tells apart.
+SPAWN_DEDUP_COMPLETED_COSINE = 0.6
 
 
 def _cosine(a, b) -> Optional[float]:
@@ -253,6 +258,7 @@ class Orchestrator:
         # once per run rather than twice. A dropped subtask's entry is popped
         # by the gate itself -- nothing else ever looks it up.
         self._gate_description_embeddings: Dict[str, Any] = {}
+        self._ask_vectors: Dict[str, Any] = {}  # PATCH 63: request part -> embedding
 
         # PATCH 12, measure-only mode. task_ids the gate scored below
         # threshold while GOAL_DRIFT_GATE_ACTS is False. Read once, by
@@ -1480,18 +1486,31 @@ class Orchestrator:
                   and getattr(t, "result", None) is not None
                   and (tid in deps or getattr(t, "parent_task_id", None) == task_id)]
         try:
-            from text_utils import classify_figures, FIGURE_NEITHER
+            from text_utils import classify_figures, FIGURE_DERIVABLE, FIGURE_NEITHER
             source = chr(10).join(parts)
             first = classify_figures(source, str(result))
-            # A second pass with the output's own grounded and derived
-            # figures added: "40,000 + 45,000 = 85,000, leaving 95,000" is
-            # two steps, and one-step arithmetic flagged the 95,000.
-            steps = " ".join(e["written"] for e in first if e["class"] != FIGURE_NEITHER)
-            final = classify_figures(source + chr(10) + steps, str(result)) if steps else first
+            # Up to two more passes with the output's passed figures added, so
+            # "40,000 + 45,000 = 85,000, leaving 95,000" is a chain. A figure
+            # that only passes that way is arithmetic on the output's own
+            # numbers -- run 21's "135,000 remaining" used the rejected train
+            # -- so its working goes to the critique.
+            passed = {e["value"] for e in first if e["class"] != FIGURE_NEITHER}
+            chained = {}
+            for _ in range(2):
+                steps = " ".join(e["written"] for e in first if e["value"] in passed)
+                newly = [e for e in classify_figures(source + chr(10) + steps, str(result))
+                         if e["class"] == FIGURE_DERIVABLE and e["value"] not in passed]
+                if not newly:
+                    break
+                for e in newly:
+                    passed.add(e["value"])
+                    chained[e["value"]] = e["detail"]
             # A whole number up to 10 is a count ("1 teacher" for the
             # request's "one", "2 waterings"), too common to call invented.
-            found = [e["written"] for e in final if e["class"] == FIGURE_NEITHER
-                     and not (float(e["value"]).is_integer() and abs(float(e["value"])) <= 10)]
+            small = {e["value"] for e in first
+                     if float(e["value"]).is_integer() and abs(float(e["value"])) <= 10}
+            found = [d for v, d in chained.items() if v not in small] + [
+                e["written"] for e in first if e["value"] not in passed | small]
         except Exception:
             return []
         return found[:self.MAX_UNGROUNDED_FIGURES]
@@ -2628,17 +2647,18 @@ class Orchestrator:
             task_id = node.parent_task_id if node is not None else None
         return out
 
-    def _subtask_matches(self, desc_a: str, emb_a, desc_b: str, emb_b) -> Optional[float]:
+    def _subtask_matches(self, desc_a: str, emb_a, desc_b: str, emb_b,
+                         threshold: float = SPAWN_DEDUP_COSINE) -> Optional[float]:
         """The match score of two subtask descriptions, or None if they are
         not the same work: 1.0 on normalised-text equality, else the cosine
-        when it clears SPAWN_DEDUP_COSINE."""
+        when it clears `threshold` (SPAWN_DEDUP_COSINE unless told)."""
         if not desc_a or not desc_b:
             return None
         if (self._normalize_for_exemplar_match(desc_a)
                 == self._normalize_for_exemplar_match(desc_b)):
             return 1.0
         cos = _cosine(emb_a, emb_b)
-        if cos is not None and cos >= SPAWN_DEDUP_COSINE:
+        if cos is not None and cos >= threshold:
             return cos
         return None
 
@@ -2653,11 +2673,22 @@ class Orchestrator:
         if self.root_task_id:
             excluded.add(self.root_task_id)
         best = None
+        # The lower bar is for a ROOT re-plan only: both tasks root children
+        # on the same request part.
+        part = (self._request_part_for(description, embedding)
+                if self.root_task_id and spawner_task_id == self.root_task_id else None)
         for node in list(self.task_graph.tasks.values()):
             if node.task_id in excluded or node.status not in (0, 1, 2):
                 continue
-            score = self._subtask_matches(description, embedding,
-                                          node.description, node.description_embedding)
+            threshold = SPAWN_DEDUP_COSINE
+            if (part is not None and node.status == 2
+                    and node.parent_task_id == self.root_task_id
+                    and part == self._request_part_for(node.description,
+                                                       node.description_embedding)):
+                threshold = SPAWN_DEDUP_COMPLETED_COSINE
+            score = self._subtask_matches(
+                description, embedding, node.description, node.description_embedding,
+                threshold=threshold)
             if score is None:
                 continue
             if (node.status != 2 and spawner_task_id
@@ -2774,6 +2805,88 @@ class Orchestrator:
                     if n.parent_task_id == self.root_task_id]
         scores = [c for c in (_cosine(ask_vec, v) for v in vectors) if c is not None]
         return max(scores) if scores else None
+
+    # PATCH 63. A task belongs to one request part when that part is at least
+    # this close by embedding and this much closer than the next (runs 20-21:
+    # own part 0.44-0.82, margin 0.26+; the stem fallback takes the rest).
+    ANCHOR_MIN_COSINE = 0.40
+    ANCHOR_MIN_MARGIN = 0.10
+
+    def _request_part_for(self, description, vec=None):
+        """PATCH 63. The request part this description works on, or None
+        when no single part clearly wins. `vec`: its embedding, if stored."""
+        asks = request_asks((self.spec or {}).get("raw_text") or "")
+        if len(asks) < 2 or not description:
+            return None
+        if vec is None and self.embed_model is not None:
+            vec = self._embed_description(description)
+        if vec is not None:
+            for a in asks:
+                if a not in self._ask_vectors:
+                    self._ask_vectors[a] = self._embed_description(a)
+            scored = sorted(((_cosine(vec, self._ask_vectors[a]) or 0.0, a) for a in asks),
+                            reverse=True)
+            if (scored[0][0] >= self.ANCHOR_MIN_COSINE
+                    and scored[0][0] - scored[1][0] >= self.ANCHOR_MIN_MARGIN):
+                return scored[0][1]
+        covered = [a for a, _, ok in ask_coverage(asks, description, distinctive=True) if ok]
+        return covered[0] if len(covered) == 1 else None
+
+    @staticmethod
+    def _anchored_description(part):
+        text = str(part).strip()
+        text = text[0].upper() + text[1:]
+        return text if text.endswith((".", "?", "!")) else text + "."
+
+    def _anchor_task_to_request(self, task_node, why):
+        """PATCH 63. A root child that failed is retried on the user's own
+        words for its part: run 21's meal part had three wordings that changed
+        the request's rule ("15k per meal type"); nine attempts, none
+        accepted. Only root children own a whole part -- a deeper task is a
+        piece of one."""
+        if task_node is None or task_node.parent_task_id != self.root_task_id:
+            return False
+        part = self._request_part_for(task_node.description, task_node.description_embedding)
+        if part is None or task_node.description == self._anchored_description(part):
+            return False
+        anchored = self._anchored_description(part)
+        task_node.original_description = task_node.description
+        print(f"  [retry-anchor] {task_node.task_id}: {why} -- task reworded to the "
+              f"request's own words (PATCH 63): {anchored!r} "
+              f"(was {task_node.description[:80]!r}).")
+        task_node.description = anchored
+        if self.embed_model is not None:
+            task_node.description_embedding = self._embed_description(anchored)
+        self.colony.record_verdict("retry_anchored")
+        return True
+
+    def _anchor_replanned_parts(self, parent_id, prepared):
+        """PATCH 63. In a ROOT re-plan, the first new subtask for a part whose
+        earlier root child was abandoned starts from the request's words."""
+        spawner = self.colony.get_agent(parent_id) if parent_id else None
+        if getattr(spawner, "task_id", None) != self.root_task_id or not self.root_task_id:
+            return prepared
+        abandoned = {self._request_part_for(n.description, n.description_embedding)
+                     for n in self.task_graph.tasks.values()
+                     if n.status == 3 and n.parent_task_id == self.root_task_id}
+        abandoned.discard(None)
+        out = []
+        for sub, description, task_id in prepared:
+            part = self._request_part_for(
+                description, self._gate_description_embeddings.get(task_id)) if abandoned else None
+            if part in abandoned:
+                abandoned.discard(part)  # one per part: the rest of the batch stays as written
+                anchored = self._anchored_description(part)
+                if anchored != description:
+                    print(f"  [retry-anchor] re-plan of an abandoned part -- subtask reworded "
+                          f"to the request's own words (PATCH 63): {anchored!r} "
+                          f"(was {description[:80]!r}).")
+                    self.colony.record_verdict("replan_anchored")
+                    sub = dict(sub, task=anchored)
+                    self._gate_description_embeddings.pop(task_id, None)
+                    description = anchored
+            out.append((sub, description, task_id))
+        return out
 
     def _fill_uncovered_asks(self, parent_id, prepared, label_to_id):
         """PATCH 44. When the ROOT decomposer SPAWNs, every part of the user's
@@ -3258,6 +3371,7 @@ class Orchestrator:
             prepared, reused_ids = self._dedupe_spawn_batch(
                 parent_id, prepared, label_to_id)
             self._last_spawn_reused = len(reused_ids)
+            prepared = self._anchor_replanned_parts(parent_id, prepared)  # PATCH 63
 
             # Admission: the batch is cut to the largest k whose reservation
             # fits (queued overflow included -- it is reserved now, spawned
@@ -3402,6 +3516,7 @@ class Orchestrator:
         self._last_spawn_reused = len(reused_ids)
         if not kept:
             return True
+        kept = self._anchor_replanned_parts(parent_id, kept)  # PATCH 63
 
         spawner = self.colony.get_agent(parent_id) if parent_id else None
         if spawner is not None and self._admit_spawn_batch(spawner.task_id, [role]) == 0:
@@ -3409,7 +3524,7 @@ class Orchestrator:
             return False
 
         self._spawn_child_task(
-            description=description,
+            description=kept[0][1],
             role=role,
             parent_id=parent_id,
             dependencies=payload.get("dependencies", []),
@@ -4677,6 +4792,8 @@ class Orchestrator:
         if self.memory_store is not None and task_node is not None:
             self._measure_ghost_lessons(agent_id, task_id, task_node)
 
+        if count_attempt and role != "decomposer":
+            self._anchor_task_to_request(task_node, "retry after a failed attempt")  # PATCH 63
         if count_attempt:
             print(f"Agent {agent_id} failed. Respawning {role} with ghost context "
                   f"(attempt {attempts + 2} of {self.MAX_TASK_ATTEMPTS + 1} for this task).")
