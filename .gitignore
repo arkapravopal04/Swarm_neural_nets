@@ -46,3 +46,5 @@ qwen3-4b-local/
 hive_energy_trace.jsonl
 hive_memory/
 hive_answer.txt
+
+FINISH_PLAN.md

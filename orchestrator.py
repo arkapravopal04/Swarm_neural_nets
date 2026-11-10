@@ -4121,7 +4121,7 @@ class Orchestrator:
             verdict = ({"verdict": "warn", "tier": 2, "resubmission": True,
                         "reason": "identical REPORT resubmitted after a WARN"}
                        if previous_warned is not None and previous_warned == str(result)
-                       else None) or self.judge.decide(
+                       else None) or self._root_gate_verdict(task_id) or self.judge.decide(
                 agent_node,
                 output=result,
                 output_type="text",
@@ -4153,6 +4153,18 @@ class Orchestrator:
                 ungrounded_figures=figures or [],
                 figures_follow=figures_follow,
             )
+
+            # PATCH 69, MEASURE-ONLY. Every figure checked out and the critique
+            # rejected on arithmetic of its own. Counted, not overruled: when
+            # both sides use derivable numbers (a wrong 900 x 45 against a
+            # right 900 x 50) this cannot tell which side is right.
+            if (verdict.get("tier") == 3 and verdict.get("verdict") == "execute"
+                    and figures_follow
+                    and self._critique_disputes_arithmetic(verdict.get("reason"), result)):
+                self.colony.record_verdict("tier3_arith_dispute")
+                print(f"  [arith-dispute] {agent_id}/{task_id}: every figure in the REPORT "
+                      f"checked out and the critique rejected on its own arithmetic "
+                      f"(PATCH 69, measure-only -- reject kept).")
 
             if verdict.get("tier") == 3 and verdict.get("ungrounded_figures"):
                 rejected = verdict.get("verdict") == "execute"
@@ -5584,7 +5596,11 @@ class Orchestrator:
                 shown = verdicts.get("tier3_ungrounded_shown", 0)
                 print(f"    shown ungrounded figures (P62) : {shown}"
                       f"  (rejected {verdicts.get('tier3_ungrounded_reject', 0)})")
+                print(f"    rejects disputing figures that checked out (P69, measure-only) : "
+                      f"{verdicts.get('tier3_arith_dispute', 0)}")
                 print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
+            print(f"    root roll-up accepted without critique (P68) : "
+                  f"{verdicts.get('root_gate_accepted', 0)}")
             # PATCH 34. "Caught" = a tier-3 reject; printed even at 0/0 so
             # every run's log carries the line.
             print(f"    {rejects} caught / {tier3_total} checked")
@@ -6230,6 +6246,44 @@ class Orchestrator:
         self._print_final_answer_figures(best_result)
         self._print_final_answer_report()
         return best_result
+
+    def _root_gate_verdict(self, task_id):
+        """PATCH 68. The root's roll-up is accepted without the deep critique
+        when every part of the request has an accepted root child: the final
+        answer is synthesized from those children, not from the roll-up, so
+        rejecting it can only burn energy and abandon the run. Run 23 had all
+        four parts answered and still ended ABANDONED after four roll-up
+        rejects. None when a part is unanswered (the roll-up is judged)."""
+        if task_id != self.root_task_id:
+            return None
+        parts = request_asks((self.spec or {}).get("raw_text") or "")
+        done = {self._request_part_for(t.description, t.description_embedding)
+                for t in self.task_graph.tasks.values()
+                if t.status == 2 and t.parent_task_id == self.root_task_id}
+        if len(parts) < 2 or not set(parts) <= done:
+            return None
+        self.colony.record_verdict("root_gate_accepted")
+        print(f"  [root-gate] {task_id}: all {len(parts)} request parts have an "
+              f"accepted answer -- roll-up accepted without the deep critique (PATCH 68).")
+        return {"verdict": "promote", "tier": 0,
+                "reason": "every part of the request has an accepted answer (PATCH 68)"}
+
+    # PATCH 69. An equation in the critique's own reasoning: "900 * 45 = 40,500".
+    _ARITH_CLAIM_RE = re.compile(
+        r"\d[\d,]*(?:\.\d+)?\s*[x×*/+\-]\s*\(?\d[\d,]*(?:\.\d+)?\)?"
+        r"(?:\s*[x×*/+\-]\s*\(?\d[\d,]*(?:\.\d+)?\)?)*\s*=\s*\$?(\d[\d,]*(?:\.\d+)?)")
+
+    def _critique_disputes_arithmetic(self, reason, result):
+        """PATCH 69. True when the critique's reason states its own
+        equations and none of their results appears in the output: it
+        rejected the output's numbers for different numbers of its own. Run
+        23's critique wrote "900 * 45 = 40,500" (the train without its 5
+        teachers) against a correct 45,000, twice, and the retries copied it.
+        A reason restating the output's own figure is not a dispute."""
+        claims = [float(m.group(1).replace(",", ""))
+                  for m in self._ARITH_CLAIM_RE.finditer(str(reason or ""))]
+        stated = set(figure_values(str(result)))
+        return bool(claims) and not any(c in stated for c in claims)
 
     def _unanswered_abandoned(self):
         """PATCH 65. The abandoned tasks whose request part no completed task
