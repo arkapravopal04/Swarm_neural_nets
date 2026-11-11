@@ -29,11 +29,16 @@ from text_utils import dedupe_and_cap as _dedupe_and_cap
 TIER_1_CRASH = "TIER_1_CRASH"
 SEMANTIC_DRIFT = "SEMANTIC_DRIFT"
 SELF_REPORTED = "SELF_REPORTED"
+# PATCH 74. A tier-3 deep-critique reject. It was labelled TIER_1_CRASH,
+# so [ghost-memory] showed a reviewer's verdict as a crash.
+TIER_3_REJECT = "TIER_3_REJECT"
 
 
 def _derive_failure_type(dead_agent, verdict: dict = None) -> str:
     if verdict is None:
         return SELF_REPORTED
+    if verdict.get("tier") == 3:
+        return TIER_3_REJECT
     if dead_agent.warning_count >= 3:
         return SEMANTIC_DRIFT
     return TIER_1_CRASH

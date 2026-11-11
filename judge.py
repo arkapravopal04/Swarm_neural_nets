@@ -226,8 +226,28 @@ class Judge:
     # Tier 3 -- deep critique
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _figures_checked_note(derivations=None, request_labels=None):
+        """PATCH 71. The tier-3 note when every figure checked out: the
+        arithmetic code verified, with each operand's request label, and no
+        ruling on whether the operands are the right quantities."""
+        stated = (f"The request states: {', '.join(request_labels)}. "
+                  if request_labels else "")
+        if derivations:
+            return (f"ARITHMETIC CHECKED BY CODE (the OUTPUT's own equations): "
+                    f"{'; '.join(derivations)}. These steps are right; do not "
+                    "recompute it. This concerns only that arithmetic; it is not a "
+                    "ruling on the OUTPUT. " + stated
+                    + "On these steps, reject only if an operand is the wrong "
+                    "quantity for the subtask.\n\n")
+        return ("FIGURES CHECKED: an automatic check found every figure in the OUTPUT "
+                "in the request or the results it builds on. " + stated + "Still reject if a figure stands for "
+                "the wrong quantity or the reasoning is wrong.\n\n")
+
     def deep_critique(self, output, subtask_spec, project_goal=None,
-                      ungrounded_figures=None, figures_follow=False) -> dict:
+                      ungrounded_figures=None, figures_follow=False,
+                      derivations_checked=None, request_labels=None,
+                      tool_output=None, code_note=None) -> dict:
         """
         Full LLM call. Only invoked when an agent is attempting to promote
         its result to its parent -- the most expensive tier, reserved for
@@ -312,18 +332,21 @@ class Judge:
                if chained else "")
             # PATCH 67. Run 22 rejected a correct "15,000 / 50 = 300 per
             # person" as bad arithmetic; the figures had all checked out.
-            + ("FIGURES CHECKED: an automatic check found every figure in the OUTPUT "
-               "in the request or a simple arithmetic step from its numbers. Do not "
-               "reject for arithmetic alone; still reject if a figure stands for the "
-               "wrong quantity or the reasoning is wrong.\n\n"
-               if figures_follow and not figures else "")
+            # PATCH 71. The old note blessed a wrong 45 x 900 (students only)
+            # as "checked". Code now shows WHICH request quantities each step
+            # used and leaves whether they are the right ones to the critique.
+            + (self._figures_checked_note(derivations_checked, request_labels)
+               if derivations_checked or (figures_follow and not figures) else "")
+            + (f"CODE THE AGENT RAN PRINTED: {tool_output} (computed; inputs not "
+               "checked)\n\n" if tool_output else "")
             + "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
             f"{output}\n"
             "=== END OUTPUT ===\n\n"
             "The OUTPUT block above is already finished. Do not continue, "
             "extend, or add to it -- everything you write from here on is "
             "your own critique, not a continuation of the agent's answer.\n"
-            "Respond with exactly one verdict line: 'VERDICT: accept' or "
+            + (f"A code check found: {code_note}.\n" if code_note else "")
+            + "Respond with exactly one verdict line: 'VERDICT: accept' or "
             "'VERDICT: reject', followed by a brief reasoning.\n"
             # Prefilled: the completion's first word is the ruling. Left to
             # open its own reply, the model wrote "Example:" and invented a
@@ -422,10 +445,18 @@ class Judge:
         prior_warnings: int = 0,
         ungrounded_figures=None,
         figures_follow=False,
+        derivations_checked=None,
+        request_labels=None,
+        tool_output=None,
+        critique_check=None,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
         tiers into one verdict.
+
+        PATCH 71. critique_check(reason) -> note or None. A tier-3 reject
+        whose ground it finds checkably false is critiqued once more with
+        the note shown; that second verdict is final ("arith_recheck").
 
         agent: the AgentNode being judged. Must expose `warning_count`
                (int) and `fail_reason` (str) -- decide() mutates both as a
@@ -562,15 +593,30 @@ class Judge:
         # PATCH 62. Passed only when there are figures, so a critique
         # without the parameter (a stand-in) still runs.
         figures = list(ungrounded_figures or [])
+        optional = {"ungrounded_figures": figures, "figures_follow": figures_follow,
+                    "derivations_checked": derivations_checked,
+                    "request_labels": request_labels, "tool_output": tool_output}
+        optional = {k: v for k, v in optional.items() if v}
         critique = self.deep_critique(output, getattr(agent, "task", None),
-                                      project_goal=project_goal,
-                                      **({"ungrounded_figures": figures} if figures else {}),
-                                      **({"figures_follow": True} if figures_follow else {}))
-        if critique["verdict"] == "reject":
-            return {"verdict": "execute", "reason": critique["reasoning"], "tier": 3,
-                    "escalated": escalated, "similarity": similarity,
-                    "ungrounded_figures": figures}
-
-        return {"verdict": "promote", "reason": critique["reasoning"], "tier": 3,
-                "escalated": escalated, "similarity": similarity,
-                "ungrounded_figures": figures}
+                                      project_goal=project_goal, **optional)
+        # PATCH 71. One re-critique, never on an accept; code never rules.
+        recheck = None
+        if critique["verdict"] == "reject" and critique_check is not None:
+            try:
+                note = critique_check(critique["reasoning"])
+            except Exception:
+                note = None  # a failed check is no finding
+            if note:
+                first_reason = critique["reasoning"]
+                critique = self.deep_critique(output, getattr(agent, "task", None),
+                                              project_goal=project_goal,
+                                              code_note=note, **optional)
+                recheck = {"note": note, "verdict": critique["verdict"],
+                           "first_reason_chars": len(str(first_reason or ""))}
+        out = {"verdict": "execute" if critique["verdict"] == "reject" else "promote",
+               "reason": critique["reasoning"], "tier": 3,
+               "escalated": escalated, "similarity": similarity,
+               "ungrounded_figures": figures}
+        if recheck:
+            out["arith_recheck"] = recheck
+        return out

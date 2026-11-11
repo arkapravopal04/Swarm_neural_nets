@@ -31,7 +31,7 @@ class Event:
         "judge_verdict": None,  # judge.decide() result dict, when a failure_request
                                  # originates from a judge "execute" verdict rather
                                  # than a self-reported DIE -- lets ghost_extractor
-                                 # distinguish TIER_1_CRASH/SEMANTIC_DRIFT from
+                                 # distinguish TIER_1_CRASH/TIER_3_REJECT/SEMANTIC_DRIFT from
                                  # SELF_REPORTED correctly.
     })
 

@@ -50,6 +50,9 @@ class Problem_Phaser:
     CONSTRAINT_BASE = 1.0
     CONSTRAINT_COEF = 0.5
     CONSTRAINT_CAP = 2.5
+    # PATCH 73: constraint sanity. The extraction prompt's examples run 3-7
+    # words; a constraint over this is a run-on, not a rule.
+    CONSTRAINT_MAX_WORDS = 25
 
     # Semantic gap variables
     SEMANTIC_BASE = 1.0
@@ -634,26 +637,46 @@ Output:
                     for c in items
                     if figure_fidelity(raw_text, c, require_all=False)[0]]
 
-        first = extract(False)
+        def sane(items):
+            # PATCH 73. Run 24 kept a 55-word run-on ("Illness contingency
+            # protocol required prior agreement from both parties ...") that
+            # went verbatim into an executor's prompt. Drop-only.
+            long = [c for c in items if len(c.split()) > self.CONSTRAINT_MAX_WORDS]
+            return [c for c in items if c not in long], long
+
+        first_raw = extract(False)
+        first, sanity_drops = sane(first_raw)
         bad = offenders(first)
         record = {"dropped": [], "repaired": [], "retried": False}
-        chosen = first
+        chosen, chosen_raw = first, first_raw
         if bad:
             record["retried"] = True
-            second = extract(True)
+            second_raw = extract(True)
+            second, second_drops = sane(second_raw)
             bad_second = offenders(second)
             print(f"[Problem_Phaser] constraint fidelity: {len(bad)} constraint(s) "
                   f"state figures the request does not -- re-extracted, "
                   f"{len(bad_second)} on the second draw.")
-            if len(bad_second) < len(bad):
-                chosen, bad = second, bad_second
+            # A draw is scored by everything it loses, figure offenders and
+            # PATCH 73 run-ons alike; the greedy draw wins ties.
+            if len(bad_second) + len(second_drops) < len(bad) + len(sanity_drops):
+                chosen, chosen_raw, bad = second, second_raw, bad_second
+                sanity_drops = second_drops
+        for constraint in sanity_drops:
+            reason = f"{len(constraint.split())} words, over {self.CONSTRAINT_MAX_WORDS}"
+            print(f"[Problem_Phaser] constraint fidelity: DROPPED {constraint[:80]!r} "
+                  f"({reason}, PATCH 73).")
+            # "extra" is what the ledger prints beside each drop, so it says
+            # why; there are no offending figures to list.
+            record["dropped"].append({"constraint": constraint,
+                                      "extra": [f"PATCH 73: {reason}"]})
         # PATCH 31. How many constraints the chosen draw held before this
         # filter touched it. _estimate_by_constraints reads this count, not
         # the kept list, so a constraint the filter drops no longer shrinks
         # the budget. Known edge (not fixed): extracted can exceed kept even
         # when nothing is dropped, if two constraints are repaired into the
         # same string and the dedupe below merges them.
-        record["extracted"] = len(chosen)
+        record["extracted"] = len(chosen_raw)
         replaced = {}
         for constraint, extra in bad:
             repaired, repairs, unrepaired = repair_figures(raw_text, constraint)

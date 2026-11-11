@@ -40,7 +40,9 @@ from tools import ToolRegistry
 from text_utils import (
     ask_coverage,
     figure_values,
+    request_figure_labels,
     request_asks,
+    split_sentences,
     content_stems,
     normalize_identifier,
     normalize_words,
@@ -1516,6 +1518,30 @@ class Orchestrator:
             return None  # PATCH 67: no check ran -- not the same as "all clear"
         return found[:self.MAX_UNGROUNDED_FIGURES]
 
+    def _labelled_derivations(self, labels, result):
+        """PATCH 71. Each equation `result` itself writes whose arithmetic is
+        right, operands labelled from the request's own wording (`labels`,
+        request_figure_labels): "45 x 900 = 40,500" -> "40,500 = 45
+        [students] x 900 [rupees per person]". Only the REPORT's own working
+        -- classify_figures' first matching pair wrote a correct 45,000 as
+        "3 [trip] x 15,000"."""
+        from text_utils import _format_figure
+
+        def show(token):
+            value = float(token.replace(",", ""))
+            label = labels.get(value, "").split(" ", 1)
+            return _format_figure(value) + (f" [{label[1]}]" if len(label) == 2 else "")
+
+        out = []
+        for lhs, claimed, _, values, percent in self._arith_claims(result):
+            if not values or not any(self._claim_matches(claimed, v) for v in values):
+                continue
+            parts = re.findall(r"\d[\d,]*(?:\.\d+)?|[x×*/+\-()]", lhs)
+            shown = " ".join(show(p) if p[0].isdigit() else ("x" if p in "x×*" else p)
+                             for p in parts)
+            out.append(f"{_format_figure(claimed)}{'%' if percent else ''} = {shown}")
+        return out
+
     def _project_goal_text(self) -> Optional[str]:
         """PATCH 8. The goal as one short line, for the tier-3 prompt and the
         zero-requirement referent. Deduped and capped the same way
@@ -2422,7 +2448,7 @@ class Orchestrator:
         constraints = spec.get("constraint_fidelity")
         if constraints:
             print(f"    constraints : {len(constraints['dropped'])} dropped for "
-                  f"figures not in the request"
+                  f"figures not in the request or over-long (PATCH 73)"
                   + (" (after one re-extraction)" if constraints["retried"] else ""))
             for item in constraints["dropped"]:
                 print(f"      {item['extra']}  {item['constraint'][:80]!r}")
@@ -4115,8 +4141,20 @@ class Orchestrator:
             # PATCH 62 / 67. Figures the critique should check, and whether
             # every figure checked out (run 22's critique rejected a correct
             # "15,000 / 50 = 300 per person" as an arithmetic error).
+            # PATCH 71. Request labels for the checked arithmetic, and the
+            # agent's last tool output -- shown, never added to the grounding.
+            supplies_data = bool((self.spec or {}).get("supplies_data"))
+            labels = (request_figure_labels((self.spec or {}).get("raw_text") or "")
+                      if supplies_data else {})
+            request_labels = list(labels.values())[:self.MAX_REQUEST_LABELS] or None
+            derivations = []
+            if supplies_data:
+                try:
+                    derivations = self._labelled_derivations(labels, str(result))
+                except Exception:
+                    derivations = []
             figures = self._ungrounded_figures(result, task_id)
-            figures_follow = (figures == [] and bool((self.spec or {}).get("supplies_data"))
+            figures_follow = (figures == [] and supplies_data
                               and any(v > 10 for v in figure_values(str(result))))
             verdict = ({"verdict": "warn", "tier": 2, "resubmission": True,
                         "reason": "identical REPORT resubmitted after a WARN"}
@@ -4152,7 +4190,26 @@ class Orchestrator:
                                    - int(getattr(agent_node, "warning_count", 0) or 0)),
                 ungrounded_figures=figures or [],
                 figures_follow=figures_follow,
+                derivations_checked=derivations or None,
+                request_labels=request_labels,
+                # Evaluated only when decide is actually called.
+                tool_output=self._tool_output_for_critique(agent_node, result,
+                                                           agent_id, task_id),
+                critique_check=((lambda reason: self._critique_unfounded(reason, result))
+                                if supplies_data else None),
             )
+
+            # PATCH 71. A reject whose ground code found false, critiqued once more.
+            recheck = verdict.get("arith_recheck") if verdict.get("tier") == 3 else None
+            if recheck:
+                self.colony.record_verdict("tier3_arith_recheck")
+                if recheck["verdict"] == "accept":
+                    self.colony.record_verdict("tier3_arith_recheck_accept")
+                print(f"  [arith-recheck] {agent_id}/{task_id}: critique ground unfounded "
+                      f"({recheck['note']}) -- re-critiqued: {recheck['verdict']} (PATCH 71).")
+                # The first critique's call; the tier-3 debit below covers the second.
+                recheck_cost = max(1, int(recheck.get("first_reason_chars", 0)) // 100)
+                self.colony.debit_energy(agent_id, recheck_cost, category="tier3_recheck")
 
             # PATCH 69, MEASURE-ONLY. Every figure checked out and the critique
             # rejected on arithmetic of its own. Counted, not overruled: when
@@ -4330,6 +4387,18 @@ class Orchestrator:
 
         if verdict["verdict"] == "execute":
             print(f"Judge EXECUTE on {agent_id}/{task_id}: {verdict['reason']}")
+
+            # PATCH 74. The respawn hint and the ghost lesson get the reason
+            # without the critique's own equations that the REPORT does not
+            # bear out (run 23: "900*45=40,500" spread into the final
+            # answer). The copy goes down to _retire_agent's ghost write.
+            if verdict.get("tier") == 3:
+                lesson, dropped = self._drop_unverified_judge_equations(
+                    verdict.get("reason"), result)
+                if dropped:
+                    print(f"  [ghost] {agent_id}: dropped {dropped} judge equation(s) "
+                          f"not in the REPORT from the lesson (PATCH 74).")
+                    verdict = dict(verdict, reason=lesson)
 
             if agent_node is not None:
                 # The critique used to be pasted in at up to 400 chars of the
@@ -4571,6 +4640,27 @@ class Orchestrator:
 
         self._kill_and_respawn(agent_id, task_id, role, parent_id, verdict=verdict,
                                count_attempt=count_attempt)
+
+    def _drop_unverified_judge_equations(self, reason, report):
+        """PATCH 74. (reason without its unverified equations, number dropped).
+        A sentence goes when it states an equation whose result the REPORT
+        does not: "900*46=41400" against 45,000 is the judge's own arithmetic,
+        and as a ghost lesson it taught the next agent the wrong figure."""
+        text = str(reason or "")
+        stated = set(figure_values(str(report or "")))
+        kept, dropped = [], 0
+        # Abbreviation-aware ("= Rs. 40,500" is one sentence), per line.
+        sentences = [s for line in text.strip().split("\n") for s in split_sentences(line)]
+        for sentence in sentences:
+            unverified = sum(1 for _, c, _, _, _ in self._arith_claims(sentence)
+                             if c not in stated)
+            if unverified:
+                dropped += unverified
+                continue
+            kept.append(sentence)
+        if not dropped:
+            return text, 0
+        return (" ".join(kept) or "the reviewer disputed the arithmetic."), dropped
 
     def _retire_agent(self, agent_id: str, task_id: Optional[str],
                       verdict: Optional[Dict[str, Any]] = None) -> dict:
@@ -5598,6 +5688,9 @@ class Orchestrator:
                       f"  (rejected {verdicts.get('tier3_ungrounded_reject', 0)})")
                 print(f"    rejects disputing figures that checked out (P69, measure-only) : "
                       f"{verdicts.get('tier3_arith_dispute', 0)}")
+                print(f"    rejects on an unfounded ground, re-critiqued (P71) : "
+                      f"{verdicts.get('tier3_arith_recheck', 0)}"
+                      f"  (accepted {verdicts.get('tier3_arith_recheck_accept', 0)})")
                 print(f"    accept rate : {accepts}/{tier3_total} ({rate:.1f}%)")
             print(f"    root roll-up accepted without critique (P68) : "
                   f"{verdicts.get('root_gate_accepted', 0)}")
@@ -6073,6 +6166,7 @@ class Orchestrator:
             ("synthesis cut at a meta tail (P56)", trims.get("meta_tail", 0)),
             ("synthesis near-copies dropped (P60)", trims.get("near_dup", 0)),
             ("synthesis cut at self-praise (P61)", trims.get("self_praise", 0)),
+            ("synthesis cut unanchored tail (P72)", trims.get("unanchored_tail", 0)),
             ("synthesis empty after its cut     ", trims.get("empty", 0)),
             ("synthesis shipped still degenerate", trims.get("shipped_degenerate", 0)),
             ("synthesis shipped made-up metrics ", trims.get("shipped_telemetry", 0)),
@@ -6271,7 +6365,7 @@ class Orchestrator:
     # PATCH 69. An equation in the critique's own reasoning: "900 * 45 = 40,500".
     _ARITH_CLAIM_RE = re.compile(
         r"\d[\d,]*(?:\.\d+)?\s*[x×*/+\-]\s*\(?\d[\d,]*(?:\.\d+)?\)?"
-        r"(?:\s*[x×*/+\-]\s*\(?\d[\d,]*(?:\.\d+)?\)?)*\s*=\s*\$?(\d[\d,]*(?:\.\d+)?)")
+        r"(?:\s*[x×*/+\-]\s*\(?\d[\d,]*(?:\.\d+)?\)?)*\s*=\s*(?:\$|₹|Rs\.?|INR)?\s*(\d[\d,]*(?:\.\d+)?)")
 
     def _critique_disputes_arithmetic(self, reason, result):
         """PATCH 69. True when the critique's reason states its own
@@ -6280,10 +6374,140 @@ class Orchestrator:
         23's critique wrote "900 * 45 = 40,500" (the train without its 5
         teachers) against a correct 45,000, twice, and the retries copied it.
         A reason restating the output's own figure is not a dispute."""
-        claims = [float(m.group(1).replace(",", ""))
-                  for m in self._ARITH_CLAIM_RE.finditer(str(reason or ""))]
+        claims = [c for _, c, _, _, _ in self._arith_claims(reason)]
         stated = set(figure_values(str(result)))
         return bool(claims) and not any(c in stated for c in claims)
+
+    # PATCH 71. How much of the agent's last tool output the critique sees,
+    # and how many request figure labels go into one critique prompt.
+    TOOL_OUTPUT_CRITIQUE_CHARS = 200
+    MAX_REQUEST_LABELS = 12
+    _TOOL_ERROR_RE = re.compile(
+        r"^ERROR\b|Traceback \(most recent call last\)|CRASH VERDICT|\b\w+(?:Error|Exception):")
+
+    def _tool_output_for_critique(self, agent_node, result, agent_id, task_id):
+        """PATCH 71. The agent's last tool result without its "[TOOL RESULT -
+        x]:" tag, capped, or None. Measure-only "[tool-mismatch]" print when
+        it states a figure over 10 and the REPORT states none of its figures
+        (run 24's run_code printed "Train cost: 45000"; the REPORT said 40,500)."""
+        raw = getattr(agent_node, "last_tool_result", None)
+        if not raw:
+            return None
+        text = re.sub(r"^\[TOOL RESULT - [^\]]*\]:\s*", "", str(raw)).strip()
+        # A failed call printed nothing worth showing as computed output.
+        if not text or self._TOOL_ERROR_RE.search(text):
+            return None
+        printed = set(figure_values(text))
+        if any(v > 10 for v in printed) and not printed & set(figure_values(str(result))):
+            print(f"  [tool-mismatch] {agent_id}/{task_id}: the agent's last tool output "
+                  f"states figures the REPORT does not (PATCH 71, measure-only).")
+        cap = self.TOOL_OUTPUT_CRITIQUE_CHARS
+        return text if len(text) <= cap else text[:cap].rstrip() + "..."
+
+    @staticmethod
+    def _eval_claim(lhs):
+        """PATCH 71. The values `lhs` ("900 * 46", "45+5 x 900") can mean:
+        normal precedence and, without brackets, plain left to right. Only
+        + - * / and unary minus on numbers; empty when anything else
+        ("9**9**9") or nothing readable. Division by zero drops a value."""
+        import ast
+        import operator
+        ops = {ast.Add: operator.add, ast.Sub: operator.sub,
+               ast.Mult: operator.mul, ast.Div: operator.truediv}
+        expr = lhs.replace(",", "").replace("×", "*").replace("x", "*").replace("X", "*")
+
+        def ev(node):
+            if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+                return float(node.value)
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+                return -ev(node.operand)
+            if isinstance(node, ast.BinOp) and type(node.op) in ops:
+                return ops[type(node.op)](ev(node.left), ev(node.right))
+            raise ValueError("not plain arithmetic")
+
+        try:
+            tree = ast.parse(expr.strip(), mode="eval").body
+        except (SyntaxError, ValueError):
+            return []
+        out = []
+        try:
+            out.append(ev(tree))
+        except ZeroDivisionError:
+            pass
+        except (ValueError, TypeError, RecursionError):
+            return []
+        tokens = re.findall(r"\d+(?:\.\d+)?|[*/+\-]", expr)
+        if "(" not in expr and len(tokens) % 2 == 1 and all(
+                (t[0].isdigit()) == (i % 2 == 0) for i, t in enumerate(tokens)):
+            try:
+                acc = float(tokens[0])
+                for op, num in zip(tokens[1::2], tokens[2::2]):
+                    acc = {"*": operator.mul, "/": operator.truediv,
+                           "+": operator.add, "-": operator.sub}[op](acc, float(num))
+                out.append(acc)
+            except ZeroDivisionError:
+                pass
+        return out
+
+    # PATCH 71. Operands a critique may use without the request stating
+    # them: percent, months, hours, minutes, days.
+    _COMMON_CONSTANTS = frozenset({100.0, 12.0, 24.0, 60.0, 365.0})
+
+    @staticmethod
+    def _claim_matches(claimed, value):
+        """PATCH 71. Whether a stated result matches a computed one."""
+        return abs(claimed - value) <= max(1.0, 0.005 * abs(value))
+
+    def _arith_claims(self, text):
+        """PATCH 71. (lhs, stated result, operands, computed values,
+        percent) for each equation `text` writes. A result written with %
+        may be a fraction or already x 100 ("45,000 / 60,000 x 100 = 75%"),
+        so both readings are kept. An unspaced hyphen ("10-15", "Day 1-2")
+        is a range, not a subtraction: skipped."""
+        text = str(text or "")
+        out = []
+        for m in self._ARITH_CLAIM_RE.finditer(text):
+            lhs = m.group(0)[:m.group(0).rfind("=")].strip()
+            if re.search(r"\d-\d", lhs):
+                continue
+            percent = re.match(r"\s?%", text[m.end():]) is not None
+            claimed = float(m.group(1).replace(",", ""))
+            operands = [float(t.replace(",", "")) for t in re.findall(r"\d[\d,]*(?:\.\d+)?", lhs)]
+            values = self._eval_claim(lhs)
+            if percent:
+                values = values + [v * 100 for v in values]
+            out.append((lhs, claimed, operands, values, percent))
+        return out
+
+    def _critique_unfounded(self, reason, result):
+        """PATCH 71. A short note when a reject's stated ground is checkably
+        false, else None: a wrong equation, or an operand over 10 not grounded
+        nor one step from two grounded figures ("900*46" on 45 + 5). Two
+        grounded, right equations (900 x 50 vs 900 x 45) are None: code
+        cannot say which is meant."""
+        from text_utils import _format_figure, _one_op_match
+        claims = self._arith_claims(reason)
+        if not claims:
+            return None
+        for lhs, claimed, _, values, percent in claims:
+            if values and not any(self._claim_matches(claimed, v) for v in values):
+                unit = "%" if percent else ""
+                nearest = min(values, key=lambda v: abs(v - claimed))
+                return (f"an earlier review wrote {lhs} = {_format_figure(claimed)}{unit}, "
+                        f"but {lhs} = {_format_figure(round(nearest, 2))}{unit}")
+        grounded = (set(figure_values(str(result)))
+                    | set(figure_values((self.spec or {}).get("raw_text") or "")))
+        own = {c for _, c, _, _, _ in claims}  # "45 + 5 = 50" then "900 * 50"
+        # Steps only between grounded figures: with its own results in, 46 is
+        # 41400 / 900. 0 and 1 make every neighbour one step away (45 + 1).
+        pairs = [(a, b) for a in grounded for b in grounded if a != b and a > 1 and b > 1]
+        for _, _, operands, _, _ in claims:
+            for v in operands:
+                if (v > 10 and v not in grounded | own | self._COMMON_CONSTANTS
+                        and _one_op_match(v, pairs) is None):
+                    return (f"an earlier review used {_format_figure(v)}, which is in "
+                            f"neither the request nor the REPORT")
+        return None
 
     def _unanswered_abandoned(self):
         """PATCH 65. The abandoned tasks whose request part no completed task

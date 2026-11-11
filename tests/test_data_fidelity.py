@@ -260,7 +260,7 @@ def test_ledger_section():
     assert "goal : fallback_raw_text  (1 draw(s))" in out
     assert "figures not in request ['9567', 'six']" in out
     assert "missing part: 'What should happen to members" in out
-    assert "constraints : 1 dropped for figures not in the request (after one re-extraction)" in out
+    assert "constraints : 1 dropped for figures not in the request or over-long (PATCH 73) (after one re-extraction)" in out
     assert "stating figures the request does not : 1 of 1" in out
 
 

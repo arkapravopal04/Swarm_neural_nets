@@ -2061,6 +2061,77 @@ def cut_self_praise_tail(text):
     return text[:spans[cut - 1][1]].rstrip(), "self-praise tail"
 
 
+# PATCH 72. Share of an answer block's stems a grounding line must hold to
+# lend it its part (run 23's "Illness protocol" restated 0.65 of the result).
+# Known gap: a correct total computed only by the synthesizer is cut too.
+UNANCHORED_SUPPORT_MIN = 0.5
+
+
+def _line_spans(text):
+    """(start, end) of each non-empty line, or of each sentence when the
+    text is one line."""
+    spans = [(m.start(), m.end()) for m in re.finditer(r"[^\n]*\S[^\n]*", text)]
+    if len(spans) > 1:
+        return spans
+    # Sentences as split_sentences reads them: "Rs. 9,000" is not a break.
+    out = []
+    for start, end in _sentence_spans(text):
+        if out and _abbreviation_joins(text[out[-1][0]:out[-1][1]], text[start:end]):
+            out[-1] = (out[-1][0], end)
+        else:
+            out.append((start, end))
+    return out
+
+
+def cut_unanchored_tail(answer, asks, grounding):
+    """PATCH 72. Once every part of the request has been answered, cut from
+    the first block (line, or one-line answer's sentence) that answers no
+    part and is not in `grounding` (an unstated figure over 10, or under
+    UNANCHORED_SUPPORT_MIN of its stems) through the end. (kept, reason) or
+    (answer, None). No-op under two checkable asks, when some part is never
+    covered, or when the answer has a ``` fence (a code example would be cut
+    mid-block). Structural: run 23's per-pattern tail regexes missed an
+    invented total plus a status box after four correct parts."""
+    if not answer or not grounding:
+        return answer, None
+    text = str(answer)
+    if "```" in text:
+        return answer, None
+    checkable = [a for a, _, _ in ask_coverage(asks, "")]
+    if len(checkable) < 2:
+        return answer, None
+    have_stems = content_stems(grounding)
+    have_values = set(figure_values(grounding))
+    part_lines = []
+    for line in str(grounding).splitlines():
+        covered = [a for a, _, ok in ask_coverage(asks, line, distinctive=True) if ok]
+        if len(covered) == 1:
+            part_lines.append((content_stems(line), line))
+
+    def covers(block):
+        stems = content_stems(block)
+        lent = [line for s, line in part_lines
+                if stems and len(stems & s) >= UNANCHORED_SUPPORT_MIN * len(stems)]
+        target = "\n".join([block] + lent)
+        return {a for a, _, ok in ask_coverage(asks, target, distinctive=True) if ok}
+
+    def supported(block):
+        if any(v > 10 and v not in have_values for v in figure_values(block)):
+            return False
+        stems = content_stems(block)
+        return not stems or len(stems & have_stems) >= UNANCHORED_SUPPORT_MIN * len(stems)
+
+    spans = _line_spans(text)
+    seen = set()
+    for i, (start, end) in enumerate(spans):
+        block = text[start:end]
+        hit = covers(block)
+        if len(seen) == len(checkable) and not hit and not supported(block):
+            return text[:spans[i - 1][1]].rstrip(), "unanchored tail"
+        seen |= hit
+    return answer, None
+
+
 def cut_adjacent_repeat(text, max_block=4, min_chars=_REPEAT_MIN_SENTENCE_CHARS):
     """Cut at the second copy of a block repeated back to back, as
     (kept, reason). (text, None) when there is none.
@@ -3139,6 +3210,39 @@ def classify_figures(request_text, text, near_misses=None):
                     entry["detail"] = (f"traces to {compact_figure(a)} "
                                        f"{symbol} {compact_figure(b)}")
         out.append(entry)
+    return out
+
+
+# PATCH 71. Words that end a figure's label: "45 students and 5 teachers".
+_LABEL_STOP_WORDS = frozenset(
+    "and or but who which that to with on for at so if while a an the".split())
+
+
+def request_figure_labels(request_text):
+    """PATCH 71. {value: label} for every digit figure the request states,
+    the label being the figure plus up to three following words, stopping
+    at punctuation, another figure or a joining word: 900 -> "900 rupees
+    per person", 45 -> "45 students". The first mention of a value wins."""
+    text = unglue_currency(request_text or "")
+    out = {}
+    for m in _FIGURE_RE.finditer(text):
+        value = _figure_value(m.group(0))
+        if value is None or value in out:
+            continue
+        # "2,000," -- the regex keeps a trailing comma; it ends the label.
+        rest = ("," if m.group(0).endswith(",") else "") + text[m.end():]
+        head = re.match(r"-[A-Za-z]+", rest)  # "3-day trip"
+        label = (_format_figure(value) + ("%" if m.group(0).endswith("%") else "")
+                 + (head.group(0) if head else ""))
+        rest = re.split(r"[.,;:!?()\n]", rest[head.end() if head else 0:], maxsplit=1)[0]
+        words = []
+        for word in rest.split():
+            if word.lower() in _LABEL_STOP_WORDS or any(c.isdigit() for c in word):
+                break
+            words.append(word)
+            if len(words) == 3:
+                break
+        out[value] = " ".join([label] + words)
     return out
 
 

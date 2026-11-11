@@ -25,6 +25,7 @@ import re
 from text_utils import (
     cut_adjacent_repeat as _cut_adjacent_repeat,
     cut_self_praise_tail as _cut_self_praise_tail,
+    cut_unanchored_tail as _cut_unanchored_tail,
     cut_ungrounded_meta_tail as _cut_ungrounded_meta_tail,
     drop_repeated_sentences as _drop_repeated_sentences,
     dedupe_global_and_cap as _dedupe_and_cap,
@@ -33,6 +34,7 @@ from text_utils import (
     looks_degenerate as _looks_degenerate,
     cut_model_not_completed as _cut_model_not_completed,
     not_completed_sentence as _not_completed_sentence,
+    request_asks as _request_asks,
     strip_task_ids as _strip_task_ids,
     trim_degenerate_tails as _trim_degenerate_tails,
     ungrounded_telemetry as _ungrounded_telemetry,
@@ -449,6 +451,15 @@ class Synthesizer:
             self._record_trim("self_praise")
             print(f"  [synthesis-trim] final answer cut at a {reason} "
                   f"({len(before_praise)} -> {len(kept)} chars, PATCH 61).")
+        # PATCH 72. Structural: after every request part is answered, a block
+        # answering none and not in the completed work starts the tail.
+        before_unanchored = kept
+        kept, reason = _cut_unanchored_tail(kept, _request_asks(problem_spec), grounding)
+        if reason is not None:
+            self._record_trim("unanchored_tail")
+            print(f"  [synthesis-trim] final answer cut at a block answering no request "
+                  f"part and not in the completed work ({len(before_unanchored)} -> "
+                  f"{len(kept)} chars, PATCH 72).")
 
         # The walk-back again, after the cuts. _drop_incomplete_tail above ran
         # on the raw decode only; a cut at a line boundary (the repeat and
