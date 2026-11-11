@@ -247,7 +247,8 @@ class Judge:
     def deep_critique(self, output, subtask_spec, project_goal=None,
                       ungrounded_figures=None, figures_follow=False,
                       derivations_checked=None, request_labels=None,
-                      tool_output=None, code_note=None) -> dict:
+                      tool_output=None, code_note=None,
+                      labelled_estimates=None) -> dict:
         """
         Full LLM call. Only invoked when an agent is attempting to promote
         its result to its parent -- the most expensive tier, reserved for
@@ -269,6 +270,8 @@ class Judge:
         figures = [str(f) for f in (ungrounded_figures or [])]
         chained = [f for f in figures if " = " in f]
         loose = [f for f in figures if " = " not in f]
+        # PATCH 77: figures the OUTPUT itself marks as estimates.
+        estimated = [str(f) for f in (labelled_estimates or [])]
 
         # FIX (tier-3 scope rewrite): the docstring above has always promised
         # this critique looks at engagement depth, confidence calibration,
@@ -323,6 +326,14 @@ class Judge:
                "results, and are not simple arithmetic on their figures. Reject if "
                "the output's answer depends on one of these and it does not present "
                "it as an assumption.\n\n" if loose else "")
+            # PATCH 77. Run 25 rejected "about Rs. 700 per meal" as invented
+            # on a request that gives no meal price. Limits still bind.
+            + (f"LABELLED ESTIMATES (figures the OUTPUT marks as estimates): "
+               f"{', '.join(estimated)}. An estimate is allowed only for a value the "
+               "request does not give and does not let you compute; for such a value "
+               "it is not fabrication. Reject an estimate of a value the request "
+               "states or determines, an implausible one, or one whose totals break "
+               "a limit the request states.\n\n" if estimated else "")
             # PATCH 62 (run 21). Arithmetic on the output's own numbers.
             + (f"DERIVATIONS TO CHECK: {'; '.join(chained)}. Each shows one way "
                "the figure follows from the output's own numbers, not necessarily "
@@ -449,6 +460,7 @@ class Judge:
         request_labels=None,
         tool_output=None,
         critique_check=None,
+        labelled_estimates=None,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
@@ -595,7 +607,8 @@ class Judge:
         figures = list(ungrounded_figures or [])
         optional = {"ungrounded_figures": figures, "figures_follow": figures_follow,
                     "derivations_checked": derivations_checked,
-                    "request_labels": request_labels, "tool_output": tool_output}
+                    "request_labels": request_labels, "tool_output": tool_output,
+                    "labelled_estimates": list(labelled_estimates or [])}
         optional = {k: v for k, v in optional.items() if v}
         critique = self.deep_critique(output, getattr(agent, "task", None),
                                       project_goal=project_goal, **optional)
@@ -616,7 +629,8 @@ class Judge:
         out = {"verdict": "execute" if critique["verdict"] == "reject" else "promote",
                "reason": critique["reasoning"], "tier": 3,
                "escalated": escalated, "similarity": similarity,
-               "ungrounded_figures": figures}
+               "ungrounded_figures": figures,
+               "labelled_estimates": list(labelled_estimates or [])}
         if recheck:
             out["arith_recheck"] = recheck
         return out

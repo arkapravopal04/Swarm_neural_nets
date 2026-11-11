@@ -1465,7 +1465,7 @@ class Orchestrator:
     # PATCH 62. At most this many figures go into one critique prompt.
     MAX_UNGROUNDED_FIGURES = 8
 
-    def _ungrounded_figures(self, result, task_id):
+    def _ungrounded_figures(self, result, task_id, estimates_out=None):
         """PATCH 62. Figures `result` states that are neither in the request,
         the task's own description or an accepted result, nor simple
         arithmetic on theirs -- the ledger's "neither" class, until now
@@ -1489,7 +1489,9 @@ class Orchestrator:
                   and getattr(t, "result", None) is not None
                   and (tid in deps or getattr(t, "parent_task_id", None) == task_id)]
         try:
-            from text_utils import classify_figures, FIGURE_DERIVABLE, FIGURE_NEITHER
+            from text_utils import (classify_figures, FIGURE_DERIVABLE, FIGURE_NEITHER,
+                                    _one_op_match, compact_figure, hedged_figure_values,
+                                    request_figure_labels)
             source = chr(10).join(parts)
             first = classify_figures(source, str(result))
             # Up to two more passes with the output's passed figures added, so
@@ -1512,9 +1514,43 @@ class Orchestrator:
             # request's "one", "2 waterings"), too common to call invented.
             small = {e["value"] for e in first
                      if float(e["value"]).is_integer() and abs(float(e["value"])) <= 10}
+            # PATCH 77. A "neither" figure the REPORT hedges ("about Rs. 700
+            # per meal") is a labelled estimate, shown to the critique as one.
+            # In REPORT order, a later figure one step from an earlier
+            # estimate ("2100" = 3 x 700) goes to DERIVATIONS TO CHECK with
+            # its working, so an over-limit total stays in view. Only
+            # "neither" figures move: a request-derivable "approximately
+            # 40,500" (45 x 900) never does.
+            moved, built = set(), []
+            hedged = (hedged_figure_values(str(result))
+                      if estimates_out is not None else set())
+            if hedged:
+                pool = set(figure_values(source)) | passed | small
+                est = []
+                for e in first:
+                    v = e["value"]
+                    if v in passed | small:
+                        continue
+                    # Built on an estimate: one operand is an estimate or built.
+                    hit = _one_op_match(v, [(a, b) for a in pool for b in pool
+                                            if a != b and (a in moved or b in moved)])
+                    if hit is not None:
+                        built.append(f"{compact_figure(v)} = {compact_figure(hit[0])} "
+                                     f"{hit[1]} {compact_figure(hit[2])}")
+                    elif v in hedged and len(est) < self.MAX_UNGROUNDED_FIGURES:
+                        est.append(e)
+                    else:
+                        continue
+                    pool.add(v)
+                    moved.add(v)
+                labels = request_figure_labels(str(result))
+                estimates_out.extend(labels.get(e["value"], e["written"]) for e in est)
+            # Loose figures before `built`, so the cap never hides an invented one.
             found = [d for v, d in chained.items() if v not in small] + [
-                e["written"] for e in first if e["value"] not in passed | small]
+                e["written"] for e in first if e["value"] not in passed | small | moved] + built
         except Exception:
+            if estimates_out is not None:
+                del estimates_out[:]
             return None  # PATCH 67: no check ran -- not the same as "all clear"
         return found[:self.MAX_UNGROUNDED_FIGURES]
 
@@ -3198,18 +3234,13 @@ class Orchestrator:
             print(f"  [handle_spawn] {parent_id}'s SPAWN matched only "
                   f"completed subtasks -- results linked, releasing it to "
                   f"REPORT instead of re-running them.")
-            live_parent.fail_reason = (
+            self._release_to_report(live_parent, (
                 "Every subtask you requested is already completed in the "
                 "colony; those results are now yours and listed under YOUR "
                 "SUBTASKS. Do not SPAWN them again. REPORT what they "
                 "produced, or SPAWN only the parts of your task that none "
                 "of them covers."
-            )
-            live_parent.awaiting = None
-            if hasattr(live_parent, "non_terminal_cycles"):
-                live_parent.non_terminal_cycles += 1
-                if live_parent.cycles_capped:
-                    self.colony.record_verdict("cycle_cap_reached")
+            ))
             return
 
         # Two cases where releasing it to try again cannot help, so it goes
@@ -3292,10 +3323,46 @@ class Orchestrator:
             if live_parent.cycles_capped:
                 self.colony.record_verdict("cycle_cap_reached")
 
+    def _release_to_report(self, live_parent, reason: str):
+        """PATCH 35/76. Hand an awaiting decomposer back with `reason`,
+        charging the cycle (request_spawn's `awaiting` meant run() did not)."""
+        live_parent.fail_reason = reason
+        live_parent.awaiting = None
+        if hasattr(live_parent, "non_terminal_cycles"):
+            live_parent.non_terminal_cycles += 1
+            if live_parent.cycles_capped:
+                self.colony.record_verdict("cycle_cap_reached")
+
+    def _refuse_root_replan(self, event: Event) -> bool:
+        """PATCH 76. True (and the root decomposer released to REPORT) when
+        the root SPAWNs again although every request part already has a
+        completed root child and none is still open. Run 25's root SPAWNed 7
+        more times after 4/4 parts were answered (~10 min, most of its
+        energy). The first SPAWN (no root children) and a part whose only
+        child was abandoned (the P63/P65 recovery) are left alone."""
+        spawner = self.colony.get_agent(event.from_agent) if event.from_agent else None
+        parent_id = event.payload.get("parent_id")
+        live = self.live_agents.get(parent_id)
+        if (spawner is None or spawner.role != "decomposer"
+                or spawner.task_id != self.root_task_id or live is None
+                or self._open_child_task_ids(parent_id)
+                or not self._all_parts_answered()):
+            return False
+        self.colony.record_verdict("root_replan_refused")
+        print("[root-replan] every request part has an accepted answer -- root "
+              "SPAWN refused, released to REPORT (PATCH 76).")
+        self._release_to_report(live, (
+            "Every part of the request already has a completed subtask, listed "
+            "under YOUR SUBTASKS. Do not SPAWN again. REPORT what they produced."
+        ))
+        return True
+
     def _handle_spawn_request(self, event: Event) -> bool:
         """Body of handle_spawn. Returns False only when the request was
-        rejected and the spawner already routed to a respawn, True in every
-        other case (including when nothing ended up being spawned)."""
+        rejected and the spawner already routed to a respawn, or (PATCH 76)
+        a root re-plan was refused and the root already released to REPORT;
+        True in every other case (including when nothing ended up being
+        spawned)."""
         payload = event.payload
         parent_id = payload.get("parent_id")
         self._last_spawn_reused = 0
@@ -3310,6 +3377,8 @@ class Orchestrator:
         # path the prompt already describes, which handle_failure respawns
         # as a decomposer on the same task.
         if not self._reject_spawn_from_non_decomposer(event):
+            return False
+        if self._refuse_root_replan(event):
             return False
 
         subtasks = payload.get("subtasks")
@@ -4153,8 +4222,9 @@ class Orchestrator:
                     derivations = self._labelled_derivations(labels, str(result))
                 except Exception:
                     derivations = []
-            figures = self._ungrounded_figures(result, task_id)
-            figures_follow = (figures == [] and supplies_data
+            estimates = []  # PATCH 77: filled by _ungrounded_figures
+            figures = self._ungrounded_figures(result, task_id, estimates_out=estimates)
+            figures_follow = (figures == [] and supplies_data and not estimates
                               and any(v > 10 for v in figure_values(str(result))))
             verdict = ({"verdict": "warn", "tier": 2, "resubmission": True,
                         "reason": "identical REPORT resubmitted after a WARN"}
@@ -4189,6 +4259,7 @@ class Orchestrator:
                 prior_warnings=max(0, getattr(self, "task_warn_counts", {}).get(task_id, 0)
                                    - int(getattr(agent_node, "warning_count", 0) or 0)),
                 ungrounded_figures=figures or [],
+                labelled_estimates=estimates or None,
                 figures_follow=figures_follow,
                 derivations_checked=derivations or None,
                 request_labels=request_labels,
@@ -4231,6 +4302,15 @@ class Orchestrator:
                 print(f"  [ungrounded figures] {agent_id}/{task_id}: critique shown "
                       f"{verdict['ungrounded_figures']} -- "
                       f"{'rejected' if rejected else 'accepted'} (PATCH 62).")
+
+            if verdict.get("tier") == 3 and verdict.get("labelled_estimates"):
+                rejected = verdict.get("verdict") == "execute"
+                self.colony.record_verdict("tier3_estimates_shown")
+                if rejected:
+                    self.colony.record_verdict("tier3_estimates_reject")
+                print(f"  [estimates] {agent_id}/{task_id}: labelled estimate(s) shown to "
+                      f"the critique: {verdict['labelled_estimates']} -- "
+                      f"{'rejected' if rejected else 'accepted'} (PATCH 77).")
 
             if verdict.get("escalated"):
                 self.last_warned_report.pop(agent_id, None)
@@ -4488,7 +4568,8 @@ class Orchestrator:
                     final_answer = self.synthesizer.run(
                         self.colony, self.task_graph, goal_text,
                         root_task_id=self.root_task_id,
-                        abandoned_ids=set(self.abandoned_tasks),
+                        # PATCH 75: the "Not completed:" line follows the banner's list.
+                        abandoned_ids=set(self._unanswered_abandoned()),
                     )
                     # Read by terminate()'s partial banner: this answer is a
                     # synthesis, not the root agent's raw REPORT.
@@ -5686,6 +5767,9 @@ class Orchestrator:
                 shown = verdicts.get("tier3_ungrounded_shown", 0)
                 print(f"    shown ungrounded figures (P62) : {shown}"
                       f"  (rejected {verdicts.get('tier3_ungrounded_reject', 0)})")
+                print(f"    shown labelled estimates (P77) : "
+                      f"{verdicts.get('tier3_estimates_shown', 0)}"
+                      f"  (rejected {verdicts.get('tier3_estimates_reject', 0)})")
                 print(f"    rejects disputing figures that checked out (P69, measure-only) : "
                       f"{verdicts.get('tier3_arith_dispute', 0)}")
                 print(f"    rejects on an unfounded ground, re-critiqued (P71) : "
@@ -5989,6 +6073,8 @@ class Orchestrator:
                   f"{verdicts.get('root_request_part_added', 0)}")
             print(f"    skipped, a paraphrase    : "
                   f"{verdicts.get('root_request_part_paraphrased', 0)}")
+            print(f"    root re-plans refused (P76) : "
+                  f"{verdicts.get('root_replan_refused', 0)}")
 
             # PATCH 42. Subtasks a decomposer re-planned beside finished ones.
             print("\n  SIBLING REDOS (PATCH 42)")
@@ -6305,7 +6391,7 @@ class Orchestrator:
                 goal_text = self._synthesis_problem_text()
                 try:
                     not_completed = self.synthesizer.collect_not_completed(
-                        self.task_graph, set(self.abandoned_tasks), partial_results)
+                        self.task_graph, set(self._unanswered_abandoned()), partial_results)
                     best_result = self.synthesizer.format_output(
                         partial_results, goal_text, not_completed=not_completed)
                     synthesized = partial_synthesis = True
@@ -6341,6 +6427,15 @@ class Orchestrator:
         self._print_final_answer_report()
         return best_result
 
+    def _all_parts_answered(self):
+        """PATCH 68/75/76. The request's parts when it has at least two and
+        every one has a completed root child, else an empty list."""
+        parts = request_asks((self.spec or {}).get("raw_text") or "")
+        done = {self._request_part_for(t.description, t.description_embedding)
+                for t in self.task_graph.tasks.values()
+                if t.status == 2 and t.parent_task_id == self.root_task_id}
+        return parts if len(parts) >= 2 and set(parts) <= done else []
+
     def _root_gate_verdict(self, task_id):
         """PATCH 68. The root's roll-up is accepted without the deep critique
         when every part of the request has an accepted root child: the final
@@ -6350,11 +6445,8 @@ class Orchestrator:
         rejects. None when a part is unanswered (the roll-up is judged)."""
         if task_id != self.root_task_id:
             return None
-        parts = request_asks((self.spec or {}).get("raw_text") or "")
-        done = {self._request_part_for(t.description, t.description_embedding)
-                for t in self.task_graph.tasks.values()
-                if t.status == 2 and t.parent_task_id == self.root_task_id}
-        if len(parts) < 2 or not set(parts) <= done:
+        parts = self._all_parts_answered()
+        if not parts:
             return None
         self.colony.record_verdict("root_gate_accepted")
         print(f"  [root-gate] {task_id}: all {len(parts)} request parts have an "
@@ -6513,7 +6605,16 @@ class Orchestrator:
         """PATCH 65. The abandoned tasks whose request part no completed task
         answered. Run 22 abandoned its first meal task, completed the same
         part on a re-plan, and still shipped the [PARTIAL RESULT] banner. A
-        task matched to no single part counts as unanswered."""
+        task matched to no single part counts as unanswered -- unless every
+        part has a completed root child (PATCH 75): an abandoned extra then
+        leaves no part unanswered. Run 25 shipped the banner over 4/4."""
+        if self.abandoned_tasks and self._all_parts_answered():
+            if not getattr(self, "_p75_printed", False):
+                self._p75_printed = True
+                print(f"[partial-banner] every request part has an accepted answer -- "
+                      f"{len(self.abandoned_tasks)} abandoned task(s) not "
+                      f"reported as missing (PATCH 75).")
+            return []
         # Root children only: a completed leaf ("plan day 1 meals") is a
         # piece of a part, not an answer to it.
         done = {self._request_part_for(t.description, t.description_embedding)

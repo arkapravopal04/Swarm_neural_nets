@@ -3213,6 +3213,34 @@ def classify_figures(request_text, text, near_misses=None):
     return out
 
 
+# PATCH 77. A hedge word marks a figure as the writer's own estimate -- but
+# only right before it (or a trailing "(estimated)"), so one "about" cannot
+# cover the next figure or the REPORT. "say" only as "say Rs 700" / "say 700".
+_HEDGE_RE = re.compile(r"~|\b(?:about|around|approx(?:imately)?|roughly|estimat\w*|"
+                       r"assum\w*|typical(?:ly)?)\b|\bsay\s+(?:(?:Rs\.?|INR|₹)\s*)?$",
+                       re.IGNORECASE)
+_HEDGE_TRAIL_RE = re.compile(r"^%?(?:\s+[A-Za-z]+){0,3}\s*\((?:estimated|est\.?|approx\.?|"
+                             r"approximately)\)", re.IGNORECASE)
+_HEDGE_WINDOW = 4  # tokens before the figure
+
+
+def hedged_figure_values(text):
+    """PATCH 77. Values of the digit figures `text` writes with a hedge word
+    in the _HEDGE_WINDOW tokens before them (not reaching past an earlier
+    figure), or followed by "(estimated)": "costing about Rs. 700" -> {700}."""
+    text = unglue_currency(text or "")
+    out = set()
+    for m in _FIGURE_RE.finditer(text):
+        before = text[max(0, m.start() - 80):m.start()].split()
+        digits = [i for i, tok in enumerate(before)
+                  if any(c.isdigit() for c in tok) or ")" in tok]
+        before = before[digits[-1] + 1:] if digits else before
+        window = " ".join(before[-_HEDGE_WINDOW:]) + " "
+        if _HEDGE_RE.search(window) or _HEDGE_TRAIL_RE.match(text[m.end():]):
+            out.update(figure_values(m.group(0).rstrip(",")))
+    return out
+
+
 # PATCH 71. Words that end a figure's label: "45 students and 5 teachers".
 _LABEL_STOP_WORDS = frozenset(
     "and or but who which that to with on for at so if while a an the".split())
