@@ -89,7 +89,20 @@ def pick_dtype():
     return torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
 
 
+def disable_peft_torchao_probe():
+    """Kaggle ships torchao 0.10.0; a current peft wants >= 0.16.0 and its
+    availability check RAISES instead of returning False, while dispatching
+    every LoRA/DoRA layer. Nothing here uses torchao quantization, so tell the
+    dispatcher it is absent (the same fix hive_kaggle.ipynb applies)."""
+    try:
+        import peft.tuners.lora.torchao as _lora_torchao
+        _lora_torchao.is_torchao_available = lambda: False
+    except Exception:
+        pass
+
+
 def load(args):
+    disable_peft_torchao_probe()
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
     kw = {"revision": args.revision} if args.revision else {}
