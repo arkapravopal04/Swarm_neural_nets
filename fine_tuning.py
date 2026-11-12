@@ -194,27 +194,44 @@ def evaluate(model, tok, dev_enc, dev_rows, device, dtype, n_gen, n_loss):
         model.train()
 
 
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def _evaluate(model, tok, dev_enc, dev_rows, device, dtype, n_gen):
+    """Dev loss, then greedy generations, each timed separately so the cost of
+    an evaluation (and the adapter's decode speed) is measured, not guessed."""
+    _sync()
+    t0 = time.time()
     losses = []
     for ex in dev_enc:
         loss, _ = row_loss(model, ex, device, dtype)
         losses.append(loss.item())
+    _sync()
+    t_loss = time.time() - t0
     stop_ids = [tok.convert_tokens_to_ids("<|im_end|>"), tok.convert_tokens_to_ids("<|endoftext|>")]
     agg = {"action_match": 0, "payload_valid": 0, "exact": 0, "stopped": 0}
     rows = dev_rows[:n_gen]
+    t1, new_tokens = time.time(), 0
     for r in rows:
         ids = torch.tensor([serving.render(tok, r["prompt"])], device=device)
         with torch.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
             out = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=400,
-                                 do_sample=False, eos_token_id=stop_ids, pad_token_id=tok.pad_token_id)
+                                 do_sample=False, use_cache=True, eos_token_id=stop_ids,
+                                 pad_token_id=tok.pad_token_id)
         new = out[0, ids.shape[1]:].tolist()
+        new_tokens += len(new)
         agg["stopped"] += int(any(t in stop_ids for t in new))
         s = score(tok.decode(new, skip_special_tokens=True), r["response"])
         for k in s:
             agg[k] += s[k]
+    _sync()
+    t_gen = time.time() - t1
     n = max(1, len(rows))
     return {"dev_loss": sum(losses) / max(1, len(losses)), **{k: v / n for k, v in agg.items()},
-            "n_gen": len(rows)}
+            "n_gen": len(rows), "loss_seconds": round(t_loss, 1), "gen_seconds": round(t_gen, 1),
+            "gen_tokens": new_tokens, "gen_tokens_per_s": round(new_tokens / max(1e-9, t_gen), 2)}
 
 
 # ---------------------------------------------------------------- training
