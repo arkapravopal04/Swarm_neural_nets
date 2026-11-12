@@ -103,8 +103,12 @@ class Serving:
         return self.model(*a, **kw)
 
     def _adapter_ctx(self):
-        if self.cond.adapter or not hasattr(self.model, "disable_adapter"):
+        if self.cond.adapter:
             return contextlib.nullcontext()
+        if not hasattr(self.model, "disable_adapter"):
+            # a "base" condition on a non-PEFT model would silently run with
+            # whatever weights it has -- refuse instead
+            raise TypeError("base condition needs a PeftModel (disable_adapter)")
         return self.model.disable_adapter()
 
     def chat_ids(self, text, thinking=False):
@@ -256,7 +260,10 @@ def run_decide(model, tok, out_dir, conds=SERVING_GRID, repeats=3, agents=DECIDE
                 s = Serving(model, tok, c)
                 node = AgentNode(agent_id=f"{name}-{i}", role=a["role"], status="running",
                                  parent_id=a["parent_id"], task=a["task"], task_id=f"t-{name}",
-                                 generation=1, request_text=SCHOOL)
+                                 # root (no parent) is generation 0: Agent gives
+                                 # generation 0 the ROOT decomposer rule
+                                 generation=0 if a["parent_id"] is None else 1,
+                                 request_text=SCHOOL)
                 agent = Agent(tokeniser=tok, model=s, message=Messenger(), node=node)
                 error = None
                 try:

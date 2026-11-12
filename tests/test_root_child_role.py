@@ -40,8 +40,10 @@ def test_root_child_with_unknown_role_is_an_executor():
     assert orch._enforce_child_role("worker", "p") == "executor"
 
 
-def test_non_root_decomposer_children_are_still_executors():
-    orch = _orch_with_parent(1)
+def test_leaf_decomposer_children_are_still_executors():
+    # D4: generation 1 may now nest a decomposer (tests/test_depth_d4.py);
+    # generation 2 is the first level whose children are forced to executor.
+    orch = _orch_with_parent(2)
     assert orch._enforce_child_role("decomposer", "p") == "executor"
 
 

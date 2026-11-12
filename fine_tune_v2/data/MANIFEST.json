@@ -1,0 +1,73 @@
+{
+  "spec": "TRAINING_SPEC.md draft 3",
+  "generator_commit": "3295e8d+dirty",
+  "seed": "v2",
+  "prompt_builder_hash": "fe71448c22f4",
+  "chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
+  "tokenizer_dir": "fine_tuned_params_v1 (Qwen3-4B tokenizer)",
+  "files": {
+    "train.jsonl": "b8637d8eb5070c3879f6a6d0e1f10d136ffda91dcfed05dfb9f8bd7246090ad5",
+    "dev.jsonl": "2c842a761702027e3d4924fcdf4e56345a2489d41a38b3739a19fbe6f28cd9d7"
+  },
+  "counts": {
+    "train": 2122,
+    "dev": 290
+  },
+  "class_counts": {
+    "train": {
+      "E1": 260,
+      "E2": 220,
+      "E3": 220,
+      "E4": 70,
+      "E5": 50,
+      "E6": 130,
+      "E7": 60,
+      "E8": 52,
+      "E9": 80,
+      "N1": 100,
+      "N2": 40,
+      "R1": 150,
+      "R2": 140,
+      "R3": 120,
+      "R4": 120,
+      "R5": 40,
+      "U1": 150,
+      "U2": 90,
+      "U3": 30
+    },
+    "dev": {
+      "E1": 36,
+      "E2": 30,
+      "E3": 30,
+      "E4": 9,
+      "E5": 7,
+      "E6": 18,
+      "E7": 8,
+      "E8": 8,
+      "E9": 11,
+      "N1": 14,
+      "N2": 5,
+      "R1": 21,
+      "R2": 19,
+      "R3": 16,
+      "R4": 16,
+      "R5": 5,
+      "U1": 21,
+      "U2": 12,
+      "U3": 4
+    }
+  },
+  "held_out_families": [
+    "comms_choice",
+    "dose_calc",
+    "festival_plan",
+    "gamblers_ruin",
+    "garden_plan",
+    "inclusion_exclusion",
+    "knapsack",
+    "rc_charge",
+    "trip_budget"
+  ],
+  "max_total_tokens": 2538,
+  "source": "solver gold + runtime-rendered prompts + templated non-gold context (no harvest yet)"
+}

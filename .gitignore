@@ -1,6 +1,17 @@
-# Local training scratch (the published adapter lives in adapter/, data in fine_tune/)
+# Local training scratch (the published adapter lives in adapter/, data in fine_tune/).
+# fine_tuning.py is the committed v2 training script (TRAINING_SPEC.md section 11).
 fine_tuned_params_v1/
-fine_tuning.py
+
+# v2 locked test: sealed until the TRAINING_SPEC section 10 decision, never pushed
+fine_tune_v2/locked/
+
+# Probe 4 results: model answers on benchmark dev items and their grades --
+# graded against private keys, kept local like reasoning_benchmark/
+probe_results/
+
+# v2 training outputs downloaded from Kaggle (adapters.zip unpacked here)
+adapters/
+adapters.zip
 
 # Research-only folders
 outreach/

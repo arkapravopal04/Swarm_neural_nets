@@ -35,6 +35,8 @@ from agent_node import (
     EMPTY_DECISION_PLACEHOLDER,
     PROMPT_EXEMPLARS,
     role_may_use_tools,
+    may_spawn_decomposers,
+    may_convert_to_decomposer,
 )
 from tools import ToolRegistry
 from text_utils import (
@@ -950,6 +952,11 @@ class Orchestrator:
 
         parent_node = self.colony.get_agent(parent_id) if parent_id else None
         generation = (parent_node.generation + 1) if parent_node else 0
+        # D4 (review): a respawn whose parent agent was retired is reparented
+        # (unregister_agent) and can arrive with parent_id=None, which used to
+        # make it generation 0 -- a root prompt and root fan-out deep in the
+        # tree. Now that depth is capped, the task graph's depth is the floor.
+        generation = max(generation, self._task_depth(task_id))
 
         new_agent = AgentNode(
             agent_id=agent_id,
@@ -1286,7 +1293,9 @@ class Orchestrator:
             return requested_role
         if requested_role == "verifier":
             return requested_role
-        if parent_node.generation == 0:
+        if may_spawn_decomposers(parent_node.generation):
+            # D4 (TRAINING_SPEC.md §6.3): every decomposer up to
+            # MAX_DECOMPOSER_GENERATION keeps PATCH 37's rule, not just the root.
             # PATCH 37. The root's children keep the role the root asked
             # for. Run 16's root asked for four executors, one per clause;
             # forced to decomposers, each re-planned the WHOLE request (it
@@ -1775,6 +1784,18 @@ class Orchestrator:
         print(f"  [software-shaped task] {child_node.task_id} asks for software "
               f"{hits} on a project that never did (measure-only, not blocked): "
               f"{str(child_node.description)[:70]!r}")
+
+    def _task_depth(self, task_id: Optional[str]) -> int:
+        """How many SPAWNs separate `task_id` from the root task in the task
+        graph (root = 0), following parent_task_id. 0 for an unknown task.
+        Bounded walk, so a malformed cycle cannot hang a spawn."""
+        depth, seen = 0, set()
+        task = self.task_graph.tasks.get(task_id) if task_id else None
+        while task is not None and task.parent_task_id and task.task_id not in seen:
+            seen.add(task.task_id)
+            depth += 1
+            task = self.task_graph.tasks.get(task.parent_task_id)
+        return depth
 
     def _child_ghost_context(self, dependencies: Optional[list]) -> Optional[str]:
         """A child's starting ghost context: the project goal as background,
@@ -4691,7 +4712,28 @@ class Orchestrator:
             else:
                 print(f"  [software-framing] DIE from {agent_id} {software_reason} "
                       f"(block lever off).")
+        too_deep = False
         if verdict is None and role == "executor" and die_text.startswith("TASK TOO LARGE:"):
+            dead = self.colony.get_agent(agent_id)
+            dead_generation = (dead.generation if dead is not None
+                               else self._task_depth(task_id))
+            if not may_convert_to_decomposer(dead_generation):
+                # D4. Converting here would put the decomposer's children past
+                # MAX_AGENT_GENERATION. The prompt does not offer TASK TOO
+                # LARGE at this depth, so this is the safety net: respawn an
+                # executor told to answer in one pass.
+                too_deep = True
+                if dead is not None:
+                    dead.fail_reason = (
+                        "Previous attempt said the task was too large, but the "
+                        "colony is already at its maximum depth and cannot split "
+                        "it further. Answer the task directly in one pass.")
+                self.colony.record_verdict("depth_conversion_refused")
+                print(f"  [depth] {agent_id} (generation {dead_generation}) said "
+                      f"TASK TOO LARGE at the depth cap -- respawning as an "
+                      f"executor, not converting.")
+        if (verdict is None and role == "executor" and not too_deep
+                and die_text.startswith("TASK TOO LARGE:")):
             if task_id and not self._admit_conversion(task_id):
                 # No budget to decompose: the executor's DIE stands, and the
                 # parent gets whatever it left instead of a re-plan.
@@ -5049,7 +5091,11 @@ class Orchestrator:
         # The one child an unspawned decomposer's k=1 pricing assumes. The
         # root's children may be decomposers (PATCH 37: whichever role the
         # root asks for), so the root reserves the dearer kind; every other
-        # decomposer's children are executors.
+        # decomposer's children are priced as executors. D4 (review): a
+        # generation-1 decomposer may now plan decomposer children too; this
+        # pre-spawn estimate still assumes an executor (left as is so the
+        # calibrated energy model is unchanged -- _admit_spawn_batch prices
+        # the real batch, decomposer children included, at spawn time).
         return "decomposer" if res.kind == "root" else "executor"
 
     def _unspawned_children_reservation(self, res: TaskReservation) -> float:

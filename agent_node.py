@@ -127,6 +127,30 @@ def role_may_use_tools(role):
     return role != "decomposer"
 
 
+# D4 (TRAINING_SPEC.md §6.3): deeper decomposition. A decomposer at
+# generation <= MAX_DECOMPOSER_GENERATION may give a child the role
+# "decomposer" (root 0 -> decomposer 1 -> decomposer 2 -> executors 3); a
+# deeper one spawns executors only. Before D4 only the root could.
+MAX_DECOMPOSER_GENERATION = 1
+# No agent is created deeper than this. A TASK TOO LARGE conversion turns an
+# executor at generation g into a decomposer at g whose children sit at g + 1,
+# so it is offered (prompt) and allowed (orchestrator) only while
+# g + 1 <= MAX_AGENT_GENERATION. Before D4 conversions could nest without end.
+MAX_AGENT_GENERATION = 3
+
+
+def may_spawn_decomposers(generation):
+    """Single source of truth for D4, read by the decomposer prompt rule and
+    Orchestrator._enforce_child_role so the two cannot disagree."""
+    return generation <= MAX_DECOMPOSER_GENERATION
+
+
+def may_convert_to_decomposer(generation):
+    """Whether an executor at `generation` may DIE with TASK TOO LARGE and be
+    re-planned as a decomposer (its children would sit one level deeper)."""
+    return generation + 1 <= MAX_AGENT_GENERATION
+
+
 # Per-role ceiling on think()'s generation, module level for the same reason
 # role_may_use_tools is: more than one place reads it. Changing it changes what
 # an attempt costs, so the orchestrator's RESERVE_* figures need re-fitting
@@ -1053,6 +1077,26 @@ class Agent:
                     "Use \"label\" on every chunk so later chunks can "
                     "reference it by name in their own \"dependencies\".\n"
                 )
+            elif may_spawn_decomposers(self.generation):
+                # D4. A mid-level decomposer may nest one more decomposer, but
+                # only for a piece that is itself several pieces of work --
+                # over-decomposing single pieces is the failure run 24 showed.
+                tier_rule = (
+                    f"You are a MID-LEVEL decomposer (generation "
+                    f"{self.generation}). Break down ONLY your own task -- "
+                    "never the whole request again. SPAWN one child per "
+                    "separate piece of your task. Give a piece the role "
+                    "\"executor\" when one agent can answer it directly (one "
+                    "calculation, one decision, one list). Give it the role "
+                    "\"decomposer\" only when that piece is itself several "
+                    "separate pieces of work. Make each executor's task "
+                    "GRANULAR -- small enough that it should take an executor "
+                    "no more "
+                    + ("than 2-3 think cycles to "
+                       if tools_blocked else
+                       "than 2-3 think cycles and at most one TOOL call to ") +
+                    "finish -- never a whole sub-project.\n"
+                )
             else:
                 tier_rule = (
                     "You are a NON-ROOT decomposer. SPAWN ONLY \"executor\" "
@@ -1087,7 +1131,9 @@ class Agent:
                "one pass") +
             " -- reserve this DIE for when the "
             "task is genuinely several tasks wearing one description.\n"
-        ) if self.role == "executor" else ""
+            # D4: not offered at the depth cap, where the orchestrator
+            # refuses the conversion (may_convert_to_decomposer).
+        ) if self.role == "executor" and may_convert_to_decomposer(self.generation) else ""
         return (
             ("IMPORTANT: the constraints listed below apply to the PROJECT "
              "as a whole -- not every constraint necessarily applies to "
