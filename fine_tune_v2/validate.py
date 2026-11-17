@@ -220,8 +220,12 @@ def v3_arithmetic(response):
 # ---------------------------------------------------------------------- V4 / V5
 
 def v4_answer(response, answer_text):
-    """The solver's answer, as printed, appears in an answer row's REPORT."""
-    if answer_text and response.startswith("ACTION: REPORT") and answer_text not in response:
+    """The solver's answer, as printed, appears in an answer row's REPORT
+    (thousands separators aside: the program prints 30720, the REPORT writes
+    30,720 in the house style)."""
+    whole = re.compile(rf"(?<![\d.]){re.escape(answer_text or '')}(?![\d]|\.\d)")
+    if (answer_text and response.startswith("ACTION: REPORT") and answer_text not in response
+            and not whole.search(re.sub(r"(?<=\d),(?=\d{3})", "", response))):
         return f"V4 solver answer {answer_text} not in the REPORT"
     return None
 

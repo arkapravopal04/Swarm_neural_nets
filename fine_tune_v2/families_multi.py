@@ -198,6 +198,27 @@ GROUP_TYPES = [
 TRANSPORT = [("coach", "train"), ("minibus", "train"), ("bus", "ferry"), ("hired van", "rail")]
 
 
+def estimate_leaf(label, text, keywords, given, ests, expr, cap, sentences):
+    """An E4 part: a cost resting on estimates, worked by run_code (not in the
+    head) and reported against the request's limit. `given` are the request's
+    figures and `ests` the labelled estimates, both (name, value); `expr`
+    combines them; `sentences` are the after-tool REPORT's phrasings, formatted
+    with total / cap / the estimate names. Returns (Part, total)."""
+    env = dict(given + ests)
+    total = eval(expr, {"__builtins__": {}}, env)  # digits, names and operators only
+    code = SHOW_HELPER + "".join(f"{n} = {v}\n" for n, v in given) \
+        + "".join(f"{n} = {v}  # estimated\n" for n, v in ests) + f"show({expr})"
+    fmt = dict(env, total=comma(total), cap=comma(cap))
+    part = Part(label, text, keywords=keywords, estimate=True, code=code, printed=fnum(total),
+                after_tool=sentences.format(**fmt), report=None)
+    return part, total
+
+
+def _cap_above(rng, total):
+    """A limit the estimated cost stays under: 10-30% headroom, whole thousands."""
+    return -(-int(total * rng.choice([1.1, 1.2, 1.3])) // 1000) * 1000
+
+
 def _requirement_lines(pairs):
     return [f"{label} = {value}." for label, value in pairs]
 
@@ -223,7 +244,6 @@ def trip_budget(rng, p):
     est = max(100, (cap // people) // 10 * 10 - 20)
     day_cost = est * people
     assert day_cost < cap, (day_cost, cap)
-    meals_total = day_cost * days
     budget = rng.choice([120000, 150000, 160000, 200000, 220000])
     intros = [
         "A {org} is taking {m} {members} and {l} {leaders} on a {d}-day trip with a budget of {b} rupees.",
@@ -247,10 +267,15 @@ def trip_budget(rng, p):
                             f"{comma(pp * mem_n)} rupees.",
                             f"The output counts only the {mem_n} {members}; the {lead_n} {leaders} travel too, "
                             f"so the {pp_t} is priced for {people} people."))
-    meals = Part("meals", m_txt[0].upper() + m_txt[1:] + ".", estimate=True, keywords=("meal", "day"),
-                 report=(f"Meals at about {est} rupees per person per day (estimated) cost {est} x {people} = "
-                         f"{comma(day_cost)} rupees a day. That is under the {comma(cap)} rupee daily limit, and over "
-                         f"{days} days meals come to {comma(meals_total)} rupees."))
+    meals, _ = estimate_leaf(
+        "meals", m_txt[0].upper() + m_txt[1:] + ".", ("meal", "day"),
+        [(members.replace(" ", "_"), mem_n), (leaders.replace(" ", "_"), lead_n)],
+        [("rupees_per_person_per_day", est)],
+        f"({members.replace(' ', '_')} + {leaders.replace(' ', '_')}) * rupees_per_person_per_day", cap,
+        pick(rng, ["Meals cost about {total} rupees a day, under the {cap} rupee daily limit, at about "
+                   "{rupees_per_person_per_day} rupees per person per day (estimated).",
+                   "Meals come to about {total} rupees a day at about {rupees_per_person_per_day} rupees per "
+                   "person per day (estimated), under the {cap} rupee limit."]))
     groups = Part("groups", g_txt[0].upper() + g_txt[1:] + ".", keywords=("group",),
                   report=(f"Make {lead_n} groups of {per_group} {members}, one {leader} each: {mem_n} / {lead_n} = "
                           f"{per_group}. Every {member} is in exactly one group."),
@@ -292,9 +317,20 @@ def event_terminal(rng, p):
     c_txt = f"cost the catering at {cater_pp} rupees per guest"
     d_txt = f"include decorations at {comma(decor)} rupees"
     k_txt = "check that the total stays within the budget"
+    drinks_each, drink_cost = rng.choice([2, 3]), rng.choice([40, 50, 60, 80])
+    drinks_cap = _cap_above(rng, guests * drinks_each * drink_cost)
+    w_txt = f"budget welcome drinks separately so they stay under {comma(drinks_cap)} rupees"
     art = "an" if evt[0] in "aeiou" else "a"
     request = intros[p % len(intros)].format(e=evt, g=guests, b=comma(budget), art=art, Art=art.capitalize())
-    request += f" {v_txt[0].upper() + v_txt[1:]}, {c_txt}, {d_txt}, and {k_txt}."
+    request += f" {v_txt[0].upper() + v_txt[1:]}, {c_txt}, {d_txt}, {k_txt}, and {w_txt}."
+    wp, _ = estimate_leaf(
+        "drinks", w_txt[0].upper() + w_txt[1:] + ".", ("drink",),
+        [("guests", guests)], [("drinks_per_guest", drinks_each), ("rupees_per_drink", drink_cost)],
+        "guests * drinks_per_guest * rupees_per_drink", drinks_cap,
+        pick(rng, ["Welcome drinks cost about {total} rupees, under the {cap} limit, at about {drinks_per_guest} "
+                   "drinks per guest and {rupees_per_drink} rupees a drink (estimated).",
+                   "Welcome drinks come to about {total} rupees at about {rupees_per_drink} rupees a drink and "
+                   "{drinks_per_guest} drinks per guest (estimated), under the {cap} limit."]))
     vp = Part("venue", v_txt[0].upper() + v_txt[1:] + ".", keywords=("hall", "venue"),
               report=(f"Choose {venue_name}: {comma(venue)} rupees, since {hall_pp} x {guests} = {comma(pp_total)} "
                       f"against {comma(hall_flat)} flat."))
@@ -309,8 +345,9 @@ def event_terminal(rng, p):
               report=(f"The total is {comma(venue)} + {comma(cater)} = {comma(venue + cater)}, and "
                       f"{comma(venue + cater)} + {comma(decor)} = {comma(total)} rupees, {verdict} rupees."))
     reqs = _requirement_lines([("Total budget", f"{comma(budget)} rupees"), ("Guests", str(guests)),
-                               ("Catering", f"{cater_pp} rupees per guest"), ("Decorations", f"{comma(decor)} rupees")])
-    return Multi("event_terminal", "Finance & Quantitative Analysis", request, [vp, cp, dp, kp], reqs,
+                               ("Catering", f"{cater_pp} rupees per guest"), ("Decorations", f"{comma(decor)} rupees"),
+                               ("Welcome drinks", f"under {comma(drinks_cap)} rupees")])
+    return Multi("event_terminal", "Finance & Quantitative Analysis", request, [vp, cp, dp, kp, wp], reqs,
                  figures=dict(total=total))
 
 
@@ -361,10 +398,21 @@ def office_move(rng, p):
         "The {t} ({n} people) moves to a new office next month.",
         "A new office is ready for our {t} of {n} people.",
     ]
+    crates_each, crate_cost = rng.choice([2, 3]), rng.choice([80, 100, 120, 150])
+    crate_cap = _cap_above(rng, n * crates_each * crate_cost)
     p_txt = "pack and label the equipment"
     s_txt = f"set up the new office by drawing a seating plan for {n} people at tables of {k} and preparing a network checklist"
+    b_txt = f"budget packing crates so they stay under {comma(crate_cap)} rupees"
     c_txt = "send clients the new address"
-    request = intros[p % len(intros)].format(t=team, n=n) + f" Please {p_txt}, {s_txt}, and {c_txt}."
+    request = intros[p % len(intros)].format(t=team, n=n) + f" Please {p_txt}, {s_txt}, {b_txt}, and {c_txt}."
+    crates, _ = estimate_leaf(
+        "crates", b_txt[0].upper() + b_txt[1:] + ".", ("crate",),
+        [("people", n)], [("crates_per_person", crates_each), ("rupees_per_crate", crate_cost)],
+        "people * crates_per_person * rupees_per_crate", crate_cap,
+        pick(rng, ["Crates cost about {total} rupees, under the {cap} limit, at about {crates_per_person} crates "
+                   "per person and {rupees_per_crate} rupees a crate (estimated).",
+                   "Packing crates come to about {total} rupees at about {rupees_per_crate} rupees a crate and "
+                   "{crates_per_person} crates per person (estimated), under the {cap} limit."]))
     seat = Part("seating", f"Draw a seating plan for {n} people at tables of {k}.", keywords=("seat", "table"),
                 report=(f"Use {tables} tables of {k}: {n} / {k} rounds up to {tables}. "
                         f"Seat each team together and leave the spare seats at the last table."
@@ -377,8 +425,9 @@ def office_move(rng, p):
                  keywords=("office", "seat", "network"))
     pack = Part("packing", "Pack and label the equipment.", keywords=("pack", "label"), report=pick(rng, PACKING))
     notify = Part("clients", "Send clients the new address.", keywords=("client", "address"), report=pick(rng, NOTIFY))
-    reqs = _requirement_lines([("Team size", f"{n} people"), ("Table size", f"{k} people per table")])
-    return Multi("office_move", "Professional Communications", request, [pack, setup, notify], reqs,
+    reqs = _requirement_lines([("Team size", f"{n} people"), ("Table size", f"{k} people per table"),
+                               ("Crates", f"under {comma(crate_cap)} rupees")])
+    return Multi("office_move", "Professional Communications", request, [pack, setup, crates, notify], reqs,
                  figures=dict(n=n, k=k))
 
 
@@ -571,11 +620,14 @@ def conference_logistics(rng, p):
               report=f"Print {badges} badges: {attendees} attendees + {speakers} speakers = {badges}.")
     rp = Part("rooms", "Split the attendees equally across the rooms.", keywords=("room",),
               report=f"Put {per_room} attendees in each room: {attendees} / {rooms} = {per_room}.")
-    cp = Part("coffee", f"Budget coffee so each day stays under {comma(coffee_cap)} rupees.", estimate=True,
-              keywords=("coffee",),
-              report=(f"Coffee costs about {comma(coffee_day)} rupees a day, under the {comma(coffee_cap)} limit. "
-                      f"That assumes about {cup} rupees a cup (estimated) and 2 cups each: {cup} x 2 = {cup * 2} per "
-                      f"person, and {cup * 2} x {badges} = {comma(coffee_day)}."))
+    cp, _ = estimate_leaf(
+        "coffee", f"Budget coffee so each day stays under {comma(coffee_cap)} rupees.", ("coffee",),
+        [("attendees", attendees), ("speakers", speakers)], [("cups_each", est_cups), ("rupees_per_cup", cup)],
+        "(attendees + speakers) * cups_each * rupees_per_cup", coffee_cap,
+        pick(rng, ["Coffee costs about {total} rupees a day, under the {cap} limit. That assumes about "
+                   "{rupees_per_cup} rupees a cup and {cups_each} cups each (estimated).",
+                   "Coffee comes to about {total} rupees a day at about {rupees_per_cup} rupees a cup and "
+                   "{cups_each} cups each (estimated), under the {cap} limit."]))
     wp = Part("welcome", "Write the welcome message.", keywords=("welcome",), report=pick(rng, WELCOME))
     reqs = _requirement_lines([("Attendees", str(attendees)), ("Speakers", str(speakers)),
                                ("Rooms", str(rooms)), ("Daily coffee cost", f"under {comma(coffee_cap)} rupees")])
@@ -599,9 +651,20 @@ def maintenance_plan(rng, p):
         "The {pl} has {t} technicians to service its {m} machines.",
         "Service is due on {m} machines at the {pl}, shared by {t} technicians.",
     ]
+    litres_each, litre_cost = rng.choice([2, 3, 4]), rng.choice([250, 300, 400])
+    supply_cap = _cap_above(rng, machines * litres_each * litre_cost)
     request = intros[p % len(intros)].format(pl=plant, m=machines, t=techs)
     request += (f" Each machine needs one spare part at {comma(part_cost)} rupees. Please split the machines equally "
-                f"among the technicians, cost the spare parts, and write the downtime notice for staff.")
+                f"among the technicians, cost the spare parts, budget cleaning fluid so it stays under "
+                f"{comma(supply_cap)} rupees, and write the downtime notice for staff.")
+    fluid, _ = estimate_leaf(
+        "fluid", f"Budget cleaning fluid so it stays under {comma(supply_cap)} rupees.", ("fluid", "cleaning"),
+        [("machines", machines)], [("litres_per_machine", litres_each), ("rupees_per_litre", litre_cost)],
+        "machines * litres_per_machine * rupees_per_litre", supply_cap,
+        pick(rng, ["Cleaning fluid costs about {total} rupees, under the {cap} limit, at about {litres_per_machine} "
+                   "litres per machine and {rupees_per_litre} rupees a litre (estimated).",
+                   "Cleaning fluid comes to about {total} rupees at about {rupees_per_litre} rupees a litre and "
+                   "{litres_per_machine} litres per machine (estimated), under the {cap} limit."]))
     sp = Part("split", "Split the machines equally among the technicians.", keywords=("technician",),
               report=f"Give each technician {each} machines: {machines} / {techs} = {each}.")
     cp = Part("parts", "Cost the spare parts.", keywords=("part",),
@@ -609,8 +672,9 @@ def maintenance_plan(rng, p):
     dp = Part("notice", "Write the downtime notice for staff.", keywords=("notice", "downtime"),
               report=pick(rng, DOWNTIME))
     reqs = _requirement_lines([("Machines", str(machines)), ("Technicians", str(techs)),
-                               ("Spare part", f"{comma(part_cost)} rupees per machine")])
-    return Multi("maintenance_plan", "Mechanical Engineering", request, [sp, cp, dp], reqs,
+                               ("Spare part", f"{comma(part_cost)} rupees per machine"),
+                               ("Cleaning fluid", f"under {comma(supply_cap)} rupees")])
+    return Multi("maintenance_plan", "Mechanical Engineering", request, [sp, cp, fluid, dp], reqs,
                  figures=dict(parts_total=parts_total))
 
 

@@ -324,10 +324,13 @@ def multi_rows(m, sid, rng):
                       dependencies=_deps_for(p, parts))
             th = exec_thought(rng, p.text, _figs(p.text) or _figs(m.request))
             if p.code:
-                C("E2", State(**st, thought=th), r_tool(p.code), printed=p.printed, tool_domain=m.domain)
-                C("E3", State(**st, tool_calls=[ToolCall("run_code", {"status": "success",
+                # An estimate part is worked the same way (program, then the
+                # report of its printed value), but both steps are E4 rows.
+                first, after = ("E4", "E4") if p.estimate else ("E2", "E3")
+                C(first, State(**st, thought=th), r_tool(p.code), printed=p.printed, tool_domain=m.domain)
+                C(after, State(**st, tool_calls=[ToolCall("run_code", {"status": "success",
                                                                        "data": p.printed + "\n"})],
-                              earlier_choices=[r_tool(p.code)]), r_report(p.after_tool))
+                              earlier_choices=[r_tool(p.code)]), r_report(p.after_tool), printed=p.printed)
                 continue
             C("E4" if p.estimate else "E1", State(**st, thought=th), r_report(p.report))
             if p.wrong:

@@ -49,7 +49,7 @@ HELD_OUT = {"gamblers_ruin", "rc_charge", "dose_calc", "inclusion_exclusion", "c
 
 # Train minimums per class (spec §7.1). N2 has one train family that nests
 # (product_launch), so its quota is reduced until a second exists.
-QUOTA = {"E1": 260, "E2": 220, "E3": 220, "E4": 70, "E5": 50, "E6": 130, "E7": 60, "E8": 60, "E9": 80,
+QUOTA = {"E1": 260, "E2": 220, "E3": 220, "E4": 140, "E5": 50, "E6": 130, "E7": 60, "E8": 60, "E9": 80,
          "R4": 120, "R1": 150, "R2": 140, "R3": 120, "R5": 40, "N2": 40, "N1": 100,
          "U1": 150, "U2": 90, "U3": 30}
 DEV_FRACTION = 0.14

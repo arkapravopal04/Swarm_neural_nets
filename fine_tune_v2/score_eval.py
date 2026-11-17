@@ -287,6 +287,40 @@ def printed_ok(out, kind, key):
     return bool(vals) and any(_same(vals[-1], k) for k in keys)
 
 
+def estimate_first_step_ok(row, action, payload, arith_error):
+    """An E4 row before any tool: the estimates are the model's own, so there
+    is no single right total. A program must run, print a figure, and use the
+    request's own inputs (the gold program's non-estimate values, e.g. the
+    head count's parts). A direct REPORT instead needs a labelled estimate,
+    arithmetic that holds, and those inputs worked into it."""
+    gold_code = json.loads(_payload(row["response"]))["args"]["code_string"]
+    given = {n: float(v) for n, v in re.findall(r"^(\w+) = ([\d.]+)\s*$", gold_code, re.M)}
+    # Either every input as written, or a group of them already combined
+    # ("people = 246" for attendees + speakers).
+    options = [list(given.values())]
+    m = re.search(r"show\((.*)\)\s*$", gold_code, re.S)
+    for grp in re.findall(r"\(([^()]*)\)", m.group(1) if m else ""):
+        names = re.findall(r"[A-Za-z_]\w*", grp)
+        if names and all(n in given for n in names):
+            options.append([eval(grp, {"__builtins__": {}}, given)]
+                           + [v for n, v in given.items() if n not in names])
+
+    def has_inputs(found):
+        return any(all(any(_same(u, v) for u in found) for v in opt) for opt in options)
+
+    if action == "TOOL":
+        code = payload["args"].get("code_string", "") if payload.get("tool_name") == "run_code" else ""
+        ok, out = run_program(code, row["domain"]) if code else (False, "")
+        used = [float(x.replace("_", "")) for x in re.findall(r"(?<![\w.])\d[\d_]*(?:\.\d+)?", code)]
+        printed = list(tu.figure_values(out))
+        # The last value printed must be a total it worked out, not an input echoed back.
+        inputs = {v for opt in options for v in opt}
+        return (ok and bool(printed) and not any(_same(printed[-1], v) for v in inputs)
+                and has_inputs(used))
+    text = str(payload)
+    return bool(tu.hedged_figure_values(text)) and not arith_error and has_inputs(list(tu.figure_values(text)))
+
+
 def _words(text):
     return {w for w in re.findall(r"[a-z0-9]+", str(text).lower()) if w not in _STOP and len(w) > 2}
 
@@ -350,7 +384,7 @@ def score_row(row, gen, tok):
     rec["valid"] = valid
 
     acceptable = {g_action}
-    if cls in REPORT_OR_TOOL and g_action in ("REPORT", "TOOL"):
+    if (cls in REPORT_OR_TOOL and g_action in ("REPORT", "TOOL")) or (cls == "E4" and g_action == "TOOL"):
         acceptable = {"REPORT", "TOOL"}
     if cls == "U2":
         acceptable = {"SPAWN", "REPORT"}
@@ -365,22 +399,15 @@ def score_row(row, gen, tok):
 
     is_answer_row = cls in ANSWER_CLASSES and g_action in ("REPORT", "TOOL")
     if is_answer_row:
-        kind, key = (None, None) if cls == "E4" else answer_key(row)
+        kind, key = answer_key(row)
         if not (rec["action_ok"] and valid):
             rec["answer_correct"] = False
+        elif cls == "E4" and g_action == "TOOL":
+            rec["answer_correct"] = estimate_first_step_ok(row, action, payload, rec["arith_error"])
         elif cls == "E4":
-            # An estimate row has no single right total, so: a labelled
-            # estimate, arithmetic that holds, and every figure the gold works
-            # out from the request alone (a head count, not the estimate).
-            given = prompt_sources(row["prompt"])
-            # Small counts ("2 cups each") are working, not results: skipped,
-            # as V2 skips them.
-            need = [e["value"] for e in tu.classify_figures(given, _payload(gold))
-                    if e["class"] == tu.FIGURE_DERIVABLE and abs(e["value"]) > 10]
-            have = list(tu.figure_values(str(payload)))
-            rec["answer_correct"] = (action == "REPORT" and bool(tu.hedged_figure_values(str(payload)))
-                                     and not rec["arith_error"]
-                                     and all(any(_same(h, n) for h in have) for n in need))
+            # After the program ran: report its printed total, as an estimate.
+            rec["answer_correct"] = (kind is not None and answer_ok(str(payload), kind, key)
+                                     and bool(tu.hedged_figure_values(str(payload))))
         elif kind is not None:
             if action == "REPORT":
                 rec["answer_correct"] = answer_ok(str(payload), kind, key)

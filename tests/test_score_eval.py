@@ -1,5 +1,6 @@
 """fine_tune_v2/score_eval.py: gold rows score correct, broken outputs do not."""
 import json
+import re
 import os
 import sys
 
@@ -13,11 +14,32 @@ pytestmark = pytest.mark.skipif(not (os.path.isdir(TOK_DIR) and os.path.exists(D
                                 reason="needs the local Qwen3 tokenizer and v2 dev data")
 
 
+def _gold_action(r):
+    return r["response"].split("\n", 1)[0].split(":", 1)[1].strip()
+
+
+# Rows are found by what they are, not by id (a data rebuild renumbers ids).
+PICK = {
+    "E1": lambda r: r["class"] == "E1" and r["family"] == "staged_circuit" and "The current is" in r["response"],
+    "E4tool": lambda r: r["class"] == "E4" and r["family"] == "conference_logistics" and _gold_action(r) == "TOOL",
+    "E4report": lambda r: r["class"] == "E4" and r["family"] == "conference_logistics" and _gold_action(r) == "REPORT",
+    "E2": lambda r: r["class"] == "E2" and r["family"] == "dice_until_sum",
+    "R2": lambda r: r["class"] == "R2" and r["family"] == "event_terminal",
+    "N2": lambda r: r["class"] == "N2" and r["family"] == "product_launch",
+    "N1": lambda r: r["class"] == "N1" and r["family"] == "product_launch" and r["generation"] == 2,
+    "E5": lambda r: r["class"] == "E5" and r["family"] == "office_move",
+    "U2": lambda r: r["class"] == "U2" and _gold_action(r) == "SPAWN",
+    "U1": lambda r: r["class"] == "U1" and r["family"] == "conference_logistics",
+}
+
+
 @pytest.fixture(scope="module")
 def env():
     import score_eval as S
     tok = S.load_tok()
     rows = {r["id"]: r for r in S.read_jsonl(DEV)}
+    for alias, pred in PICK.items():  # rows["E1"] is the first row that is an E1 circuit row, etc.
+        rows[alias] = next(r for r in list(rows.values()) if pred(r))
     return S, tok, rows
 
 
@@ -30,18 +52,11 @@ def _gold(env, rid):
     return env[2][rid]["response"]
 
 
-E1 = "v2-E1-staged_circuit-10005-1200"
-E4 = "v2-E4-conference_logistics-10008-444"
-E2 = "v2-E2-dice_until_sum-10002-43"
-R2 = "v2-R2-event_terminal-10001-554"
-N2 = "v2-N2-product_launch-10002-999"
-N1 = "v2-N1-product_launch-10005-1071"
-E5 = "v2-E5-office_move-10005-899"
-U2 = "v2-U2-data_migration-10000-450"
+E1, E4, E4R, E2, R2, N2, N1, E5, U2 = "E1", "E4tool", "E4report", "E2", "R2", "N2", "N1", "E5", "U2"
 
 
 def test_gold_is_correct(env):
-    for rid in (E1, E4, E2, R2, N2, N1, E5, U2):
+    for rid in (E1, E4, E4R, E2, R2, N2, N1, E5, U2, "U1"):
         rec = _score(env, rid, _gold(env, rid))
         assert rec["row_correct"], (rid, rec)
 
@@ -57,9 +72,8 @@ def test_invented_figure_fails(env):
     text = ("ACTION: REPORT\nPAYLOAD: Coffee costs about 38,400 rupees a day, under the 50,000 limit. "
             "That assumes about 100 rupees a cup (estimated) and 2 cups each: 100 x 2 = 200 per person, "
             "and 200 x 192 = 38,400.")
-    rec = _score(env, E4, text)
-    assert not rec["row_correct"]
-    assert rec["invented"] or not rec["answer_correct"]
+    rec = _score(env, E4R, text)
+    assert not rec["row_correct"] and not rec["answer_correct"]
 
 
 def test_no_action_line_is_invalid(env):
@@ -86,7 +100,10 @@ def test_report_with_the_right_value_is_accepted_for_a_tool_row(env):
 
 
 def test_tool_with_the_right_value_is_accepted_for_a_report_row(env):
-    text = 'ACTION: TOOL\nPAYLOAD: {"tool_name": "run_code", "args": {"code_string": "print(230 / 230)"}}'
+    S, tok, rows = env
+    kind, key = S.answer_key(rows[E1])
+    value = key[0] if kind == "values" else key
+    text = 'ACTION: TOOL\nPAYLOAD: ' + json.dumps({"tool_name": "run_code", "args": {"code_string": f"print({value})"}})
     rec = _score(env, E1, text)
     assert rec["action_ok"] and rec["answer_correct"] and rec["row_correct"]
 
@@ -134,7 +151,9 @@ def test_task_too_large_needs_its_prefix(env):
 
 
 def test_u2_accepts_a_plain_report(env):
-    rec = _score(env, U2, "ACTION: REPORT\nPAYLOAD: The rollback plan is still missing; the other parts are done.")
+    S, tok, rows = env
+    missing = json.loads(S._payload(_gold(env, U2)))["subtasks"][0]["task"].rstrip(".").lower()
+    rec = _score(env, U2, f"ACTION: REPORT\nPAYLOAD: One part is still missing: {missing}. The other parts are done.")
     assert rec["action_ok"] and rec["row_correct"]
 
 
@@ -156,8 +175,7 @@ def test_gates_bootstrap_detects_a_clear_gain(tmp_path):
     assert out["G1"] and out["diff"][1] > 0
 
 
-E3 = "v2-E3-loop_count-10002-181"
-U1 = "v2-U1-conference_logistics-10008-439"
+U1 = "U1"
 
 
 def test_wrong_value_with_the_key_mid_sentence_fails(env):
@@ -221,3 +239,65 @@ def test_report_cap_is_not_a_stop(env):
     long = "ACTION: REPORT\nPAYLOAD: The current is 1 A. " + "It flows steadily. " * 120
     rec = _score(env, E1, long, eos=False)
     assert rec["stopped"] is False
+
+
+def _tool(code):
+    return "ACTION: TOOL\nPAYLOAD: " + json.dumps({"tool_name": "run_code", "args": {"code_string": code}})
+
+
+def test_estimate_program_must_use_the_requests_inputs(env):
+    S, tok, rows = env
+    gold_code = json.loads(S._payload(_gold(env, E4)))["args"]["code_string"]
+    # Its own estimates (different cup price) are fine...
+    own = gold_code.replace("rupees_per_cup = ", "rupees_per_cup = 1 + ")
+    assert _score(env, E4, _tool(own))["row_correct"]
+    # ...dropping the speakers from the head count is not.
+    no_speakers = re.sub(r"attendees \+ speakers", "attendees", gold_code)
+    no_speakers = re.sub(r"^speakers = .*$", "", no_speakers, flags=re.M)
+    assert not _score(env, E4, _tool(no_speakers))["answer_correct"]
+    assert not _score(env, E4, _tool("print(undefined_name)"))["answer_correct"]
+
+
+def test_estimate_report_after_the_tool_quotes_the_printed_total(env):
+    S, tok, rows = env
+    rec = _score(env, E4R, _gold(env, E4R))
+    assert rec["row_correct"]
+    # The total stated as a plain fact, with no estimate behind it.
+    total = S.tu.split_sentences(S._payload(_gold(env, E4R)))[0].replace("about ", "")
+    total = re.sub(r",? at about .*?\(estimated\)", "", total)
+    assert not S.tu.hedged_figure_values(total)
+    assert not _score(env, E4R, "ACTION: REPORT\nPAYLOAD: " + total)["answer_correct"]
+
+
+def test_estimate_program_may_add_up_the_head_count_first(env):
+    S, tok, rows = env
+    gold_code = json.loads(S._payload(_gold(env, E4)))["args"]["code_string"]
+    att = int(re.search(r"^attendees = (\d+)", gold_code, re.M).group(1))
+    spk = int(re.search(r"^speakers = (\d+)", gold_code, re.M).group(1))
+    code = f"people = {att + spk}\ncost = 90  # estimate per cup\nprint(people * 2 * cost)"
+    assert _score(env, E4, _tool(code))["answer_correct"]
+
+
+def test_both_estimate_phrasings_carry_the_total_as_the_answer():
+    import random
+    import families_multi as FM
+    import score_eval as S
+    seen = set()
+    for name in ("conference_logistics", "office_move", "maintenance_plan", "event_terminal", "trip_budget"):
+        for i in range(40):
+            m = FM.FAMILIES[name](random.Random(f"v2-{name}-{i}"), i)
+            for part in m.leaves():
+                if part.estimate:
+                    total = float(part.printed)
+                    assert S.answer_ok(part.after_tool, "value", total), (name, i, part.after_tool)
+                    seen.add(part.after_tool.split(" ", 2)[1])
+    assert len(seen) >= 2  # both phrasings occurred
+
+
+
+def test_estimate_program_must_print_a_total_not_an_input(env):
+    S, tok, rows = env
+    gold_code = json.loads(S._payload(_gold(env, E4)))["args"]["code_string"]
+    att = int(re.search(r"^attendees = (\d+)", gold_code, re.M).group(1))
+    spk = int(re.search(r"^speakers = (\d+)", gold_code, re.M).group(1))
+    assert not _score(env, E4, _tool(f"print({att + spk})"))["answer_correct"]
