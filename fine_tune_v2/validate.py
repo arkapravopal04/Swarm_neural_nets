@@ -49,8 +49,10 @@ class _GoldModel:
         self.prompt_text = self.tok.decode(input_ids[0])
         seq = input_ids
         crit = stopping_criteria or StoppingCriteriaList([])
+        self.consumed = 0  # tokens fed before the criteria stopped it
         for t in self.ids:
             seq = torch.cat([seq, torch.tensor([[t]])], dim=1)
+            self.consumed += 1
             res = crit(seq, None)
             if bool(res) if isinstance(res, bool) else bool(res.all()):
                 break
@@ -159,8 +161,12 @@ def _sources(state):
 def v2_figures(state, response, estimate_ok=False):
     if not response.startswith("ACTION: REPORT"):
         return None
-    text = response.split("PAYLOAD:", 1)[1].strip()
-    source = _sources(state)
+    return v2_figures_text(_sources(state), response.split("PAYLOAD:", 1)[1].strip(), estimate_ok)
+
+
+def v2_figures_text(source, text, estimate_ok=False):
+    """V2 on a REPORT payload against a source text (the evaluation harness
+    passes the prompt's content, which holds the same sources)."""
     first = tu.classify_figures(source, text)
     passed = {e["value"] for e in first if e["class"] != tu.FIGURE_NEITHER}
     for _ in range(2):  # Orchestrator._ungrounded_figures' chain passes

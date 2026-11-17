@@ -18,19 +18,20 @@ import time
 READY_MARKER = "trainable params"
 
 
-def _pump(name, proc, ready, sink):
+def _pump(name, proc, ready, sink, marker):
     for line in proc.stdout:
         sink(f"[{name}] {line}")
-        if READY_MARKER in line:
+        if marker in line:
             ready.set()
     ready.set()  # exited (or stdout closed) before the marker: do not block the next job
 
 
-def run_jobs(jobs, stagger_timeout=1800, sink=None):
+def run_jobs(jobs, stagger_timeout=1800, sink=None, ready_marker=READY_MARKER):
     """jobs: [{"name", "cmd": [...], "gpu": int}] -> {name: exit code}.
 
-    Starts job i+1 when job i is ready (model loaded) or gone, or after
-    stagger_timeout seconds; waits for all; returns their exit codes."""
+    Starts job i+1 when job i is ready (its output contains `ready_marker`,
+    printed once the model is loaded) or gone, or after stagger_timeout
+    seconds; waits for all; returns their exit codes."""
     sink = sink or (lambda s: print(s, end="", flush=True))
     procs, threads = [], []
     for i, job in enumerate(jobs):
@@ -39,7 +40,7 @@ def run_jobs(jobs, stagger_timeout=1800, sink=None):
         proc = subprocess.Popen(job["cmd"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1, env=env)
         ready = threading.Event()
-        t = threading.Thread(target=_pump, args=(job["name"], proc, ready, sink), daemon=True)
+        t = threading.Thread(target=_pump, args=(job["name"], proc, ready, sink, ready_marker), daemon=True)
         t.start()
         procs.append((job["name"], proc))
         threads.append(t)
