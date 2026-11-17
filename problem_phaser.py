@@ -1,5 +1,6 @@
 import re
 import torch
+import serving
 import numpy as np
 from sentence_transformers import SentenceTransformer
 from text_utils import (
@@ -76,6 +77,20 @@ class Problem_Phaser:
     # keyword emitted more than once, so there is no token here that a
     # stronger penalty can break by discouraging its repeat.
     REPETITION_PENALTY = 1.3
+
+    def _inputs(self, prompt):
+        """generate() inputs: the raw prompt (legacy), or the v2 chat turn (W1)."""
+        if serving.is_v2():
+            return serving.encode(self.tokeniser, prompt, self.device)
+        return self.tokeniser(prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
+
+    def _penalties(self):
+        """Legacy: the prompt-wide penalties every call here was tuned with.
+        v2: none (they cost the request's own figures, probe 4), and an
+        explicit stop on both end-of-turn ids."""
+        if serving.is_v2():
+            return {"eos_token_id": serving.stop_ids(self.tokeniser)}
+        return {"repetition_penalty": self.REPETITION_PENALTY, "no_repeat_ngram_size": 4}
 
     def __init__(self, model, tokeniser, embed_model=None, reword_software_vocabulary=True):
         self.llm = model
@@ -354,9 +369,9 @@ GIVEN TEXT:
 
 Output:"""
 
-        with torch.no_grad():
-            inputs = self.tokeniser(goal_prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
-            prompt_length = inputs.input_ids.shape[1]
+        with torch.no_grad(), serving.adapter_off(self.llm):
+            inputs = self._inputs(goal_prompt)
+            prompt_length = inputs["input_ids"].shape[1]
             
             # Sampled, not greedy. Greedy decoding on this prompt drops
             # into the highest-probability continuation of an instruction
@@ -370,7 +385,7 @@ Output:"""
                     do_sample=True, temperature=0.7, top_p=0.9,
                     pad_token_id=self.tokeniser.eos_token_id,
                     stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
-                    repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
+                    **self._penalties(),
                 )
                 return self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
 
@@ -512,15 +527,15 @@ GIVEN TEXT:
 
 Output:"""
 
-        with torch.no_grad():
-            inputs = self.tokeniser(background_info, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
-            prompt_length = inputs.input_ids.shape[1]
+        with torch.no_grad(), serving.adapter_off(self.llm):
+            inputs = self._inputs(background_info)
+            prompt_length = inputs["input_ids"].shape[1]
             
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=100, min_new_tokens=2, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
                 stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
-                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
+                **self._penalties(),
             )
             context_sentence = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             context_sentence = self._sanitize_generation(context_sentence)
@@ -576,9 +591,9 @@ GIVEN TEXT:
 Output:
 """
 
-        with torch.no_grad():
-            inputs = self.tokeniser(requirement_prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
-            prompt_length = inputs.input_ids.shape[1]
+        with torch.no_grad(), serving.adapter_off(self.llm):
+            inputs = self._inputs(requirement_prompt)
+            prompt_length = inputs["input_ids"].shape[1]
 
             def extract(sampled):
                 outputs = self.llm.generate(
@@ -587,7 +602,7 @@ Output:
                     **({"temperature": 0.7, "top_p": 0.9} if sampled else {}),
                     pad_token_id=self.tokeniser.eos_token_id,
                     stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
-                    repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
+                    **self._penalties(),
                 )
                 req_output = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
                 req_output = self._sanitize_generation(req_output)
@@ -715,14 +730,14 @@ GIVEN TEXT:
 
 Output:"""
 
-        with torch.no_grad():
-            inputs = self.tokeniser(domain_prompt, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
-            prompt_length = inputs.input_ids.shape[1]
+        with torch.no_grad(), serving.adapter_off(self.llm):
+            inputs = self._inputs(domain_prompt)
+            prompt_length = inputs["input_ids"].shape[1]
             outputs = self.llm.generate(
                 **inputs, max_new_tokens=60, min_new_tokens=5, do_sample=False,
                 pad_token_id=self.tokeniser.eos_token_id,
                 stop_strings=self.STOP_STRINGS, tokenizer=self.tokeniser,
-                repetition_penalty=self.REPETITION_PENALTY, no_repeat_ngram_size=4,
+                **self._penalties(),
             )
             domain_str = self.tokeniser.decode(outputs[0][prompt_length:], skip_special_tokens=True).strip()
             

@@ -38,6 +38,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from sentence_transformers import SentenceTransformer
 from peft import PeftModel
 
+import serving
+
 from colony_state import ColonyState
 from task_graph import TaskGraph
 from event_queue import Messenger
@@ -51,6 +53,31 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HUGGINGFACE_HUB_DISABLE_UPDATE_CHECK", "1")
 
 MODEL_NAME = "Qwen/Qwen3-4B"
+BASE_REVISION = os.environ.get("HIVE_BASE_REVISION") or None
+
+
+def _check_serving_profile(adapter_path, tokeniser):
+    """S7: an adapter trained for v2 ships serving.json. Say so plainly when
+    this run serves it differently from how it was trained."""
+    path = os.path.join(adapter_path, "serving.json")
+    if not os.path.exists(path):
+        return
+    import json
+    with open(path, encoding="utf-8") as f:
+        prof = json.load(f)
+    if (prof.get("HIVE_SERVING") == "v2") != serving.is_v2():
+        print(f"[SERVING] WARNING: adapter was trained for HIVE_SERVING={prof.get('HIVE_SERVING')}, "
+              f"this run serves {'v2' if serving.is_v2() else 'legacy'}.")
+    if prof.get("base_revision") != BASE_REVISION:
+        print(f"[SERVING] WARNING: adapter base revision {prof.get('base_revision')} != {BASE_REVISION}.")
+    if prof.get("chat_template_sha256") not in (None, serving.chat_template_sha256(tokeniser)):
+        print("[SERVING] WARNING: chat template differs from the one the adapter was trained with.")
+    here = serving.prompt_builder_hash()
+    if prof.get("prompt_builder_hash") not in (None, here):
+        # Coarse: a whole-file hash, so any edit to these files changes it,
+        # not only an edit to a prompt string.
+        print(f"[SERVING] NOTE: prompt-builder files hash {here}, the adapter's data was built at "
+              f"{prof.get('prompt_builder_hash')}. If a prompt string changed since, re-render and retrain.")
 LOCAL_MODEL_DIR = "/kaggle/working/qwen3-4b-local"
 
 # The LoRA adapter ships in the repo under adapter/. HIVE_ADAPTER_PATH
@@ -220,18 +247,32 @@ def build_llm_call_fn(model, tokeniser):
     return llm_call_fn
 
 
-def build_orchestrator() -> Orchestrator:
-    print(f"Loading model: {MODEL_NAME} ...")
-    tokeniser = AutoTokenizer.from_pretrained(MODEL_NAME)
+def load_model(adapter_path=None):
+    """Base model + tokenizer (+ adapter), as this run serves them. Shared by
+    build_orchestrator() and hive_kaggle.ipynb so both load the same way.
+    An adapter_path of "none" loads no adapter (the base arm)."""
+    adapter_path = adapter_path or ADAPTER_PATH
+    # S5: the base revision the adapter was trained on (HIVE_BASE_REVISION);
+    # unset loads the hub's current one, as before.
+    rev = {"revision": BASE_REVISION} if BASE_REVISION else {}
+    print(f"Loading model: {MODEL_NAME} {BASE_REVISION or '(latest)'} | serving: "
+          f"{'v2' if serving.is_v2() else 'legacy'} ...")
+    tokeniser = AutoTokenizer.from_pretrained(MODEL_NAME, **rev)
     if tokeniser.pad_token_id is None:
         tokeniser.pad_token = tokeniser.eos_token
 
     base_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.float16, device_map="auto"
+        MODEL_NAME, torch_dtype=torch.float16, device_map="auto", **rev
     )
 
-    print(f"Loading LoRA adapter: {ADAPTER_PATH} ...")
-    model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
+    if adapter_path.lower() == "none":  # the base arm: no adapter at all
+        print("No LoRA adapter (adapter path 'none').")
+        model = base_model
+        model.hive_no_adapter = True  # serving.adapter_off: nothing to disable, on purpose
+    else:
+        print(f"Loading LoRA adapter: {adapter_path} ...")
+        model = PeftModel.from_pretrained(base_model, adapter_path)
+        _check_serving_profile(adapter_path, tokeniser)
     model.eval()
 
     if hasattr(model, "hf_device_map"):
@@ -241,16 +282,32 @@ def build_orchestrator() -> Orchestrator:
             print("[DEVICE MAP] WARNING: some layers offloaded to CPU -- "
                   "this will make per-token generation very slow.")
     _report_vram("after model + adapter load")
+    return model, tokeniser
+
+
+def build_call_fns(model, tokeniser):
+    """(judge_fn, synth_fn). Legacy: one shared closure, as before. v2: the
+    judge rules greedily with its "VERDICT:" as the assistant's first words;
+    the synthesizer stays sampled; both with the adapter off."""
+    if serving.is_v2():
+        return (serving.call_fn(model, tokeniser, greedy=True, prefill=Judge.VERDICT_PREFILL),
+                serving.call_fn(model, tokeniser))
+    shared = build_llm_call_fn(model, tokeniser)
+    return shared, shared
+
+
+def build_orchestrator() -> Orchestrator:
+    model, tokeniser = load_model()
 
     print(f"Loading shared embedder: {EMBED_MODEL_NAME} ...")
     shared_embedder = SentenceTransformer(EMBED_MODEL_NAME)
 
-    llm_call_fn = build_llm_call_fn(model, tokeniser)
+    judge_fn, synth_fn = build_call_fns(model, tokeniser)
 
     phaser = Problem_Phaser(model, tokeniser, embed_model=shared_embedder)
-    judge = Judge(llm_call_fn=llm_call_fn)
+    judge = Judge(llm_call_fn=judge_fn)
     memory_store = MemoryStore(ghost_persist_path=GHOST_PERSIST_PATH, embed_model=shared_embedder)
-    synthesizer = Synthesizer(llm_call_fn=llm_call_fn)
+    synthesizer = Synthesizer(llm_call_fn=synth_fn)
 
     # Real fallback, not 0 -- initialize_colony() overwrites this with the
     # phaser's computed colony_budget, but if parse_problem/estimate_complexity

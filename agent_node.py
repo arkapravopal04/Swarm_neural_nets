@@ -30,6 +30,7 @@ from text_utils import (
 )
 # PATCH 51 (review): the residue rule shared with is_exemplar_echo.
 from text_utils import EXEMPLAR_ONLY_MAX_EXTRA_WORDS, normalize_words
+import serving
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList
 import ast
@@ -1677,7 +1678,10 @@ Your next action:"""
         hit_degenerate = False
         generated_chunk = ""
 
-        with torch.no_grad():
+        # W1: under v2 every think() forward pass runs with the adapter off
+        # (it was trained only for decide()), so the KV cache is built under
+        # one adapter state across all cycles.
+        with torch.no_grad(), serving.adapter_off(self.model):
             for step in range(max_tokens):
                 if self._total_generated >= self.MAX_TOTAL_THINK_TOKENS:
                     hit_token_ceiling = True
@@ -1901,7 +1905,10 @@ Your next action:"""
             requirements = self.requirements or []
 
         prompt = self._build_prompt(available_roles, available_tools, requirements)
-        inputs = self.tokeniser(prompt , return_tensors = "pt").to(self.model.device)
+        if serving.is_v2():  # W1: the chat turn the v2 adapter was trained on
+            inputs = serving.encode(self.tokeniser, prompt, self.model.device)
+        else:
+            inputs = self.tokeniser(prompt , return_tensors = "pt").to(self.model.device)
         prompt_len = inputs["input_ids"].shape[1]
 
         # N3: stop the moment a complete ACTION:/PAYLOAD: block exists,
@@ -1947,6 +1954,12 @@ Your next action:"""
                 # _dedupe_repeated_sentences instead of by narrowing the
                 # vocabulary the model is allowed to spell correctly.
             )
+            if serving.is_v2():
+                # W1 (S2, S3): no prompt-wide penalty -- it pushed the model
+                # off the request's own figures -- and an explicit stop on
+                # both end-of-turn ids.
+                del gen_kwargs["repetition_penalty"]
+                gen_kwargs["eos_token_id"] = serving.stop_ids(self.tokeniser)
             with torch.no_grad():
                 outputs = self.model.generate(**inputs, **gen_kwargs)
             generated_tokens = outputs[0][prompt_len:]

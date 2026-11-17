@@ -72,13 +72,9 @@ def git_commit():
 
 
 def prompt_builder_hash():
-    """S6: a hash over the runtime sources that shape prompts. Coarse (whole
-    files) until W1 adds the runtime's own string-level hash."""
-    h = hashlib.sha256()
-    for f in ("agent_node.py", "orchestrator.py", "text_utils.py"):
-        with open(os.path.join(ROOT, f), "rb") as fh:
-            h.update(fh.read())
-    return h.hexdigest()[:12]
+    """S6: the runtime's prompt-builder hash (serving.prompt_builder_hash, the
+    one main.py checks an adapter's serving.json against)."""
+    return serving.prompt_builder_hash(ROOT)
 
 
 def load_embedder():

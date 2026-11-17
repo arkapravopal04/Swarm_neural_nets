@@ -142,8 +142,9 @@ If a loop guard proves necessary after measurement, it is a logits processor
 over generated tokens only.
 
 S3. **Stops.** The base `generation_config` already supplies `<|im_end|>` and
-`<|endoftext|>`; v2 passes both explicitly and a test proves a stop on each,
-with `pad_token_id` as the runtime sets it. `_ActionPayloadStop` stays as the
+`<|endoftext|>`; v2 passes both explicitly (tests assert both ids reach every
+v2 `generate()` call; stopping on them is transformers' own behaviour), with
+`pad_token_id` as the runtime sets it. `_ActionPayloadStop` stays as the
 second stop, measured from the rendered prompt length.
 
 S4. **Sampling and caps.** `decide()` keeps the measured production sampling:
