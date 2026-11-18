@@ -4,6 +4,7 @@ fine_tuned_params_v1/
 
 # v2 locked test: sealed until the TRAINING_SPEC section 10 decision, never pushed
 fine_tune_v2/locked/
+fine_tune_v2/locked.zip
 
 # Probe 4 results: model answers on benchmark dev items and their grades --
 # graded against private keys, kept local like reasoning_benchmark/
