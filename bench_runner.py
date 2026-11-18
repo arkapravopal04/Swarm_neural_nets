@@ -155,6 +155,12 @@ def _summary(item, orch, status, seconds, peak_mb, error=None):
         "root_gate": counts.get("root_gate_accepted", 0),
         "arith_dispute": counts.get("tier3_arith_dispute", 0),
         "live_agents_at_end": len(getattr(orch, "live_agents", {}) or {}),
+        # P1: how the root split the request (1 = a single question passed
+        # down whole, R4), and which roles it asked for -- over all of the
+        # root's attempts, so read it with root_respawns.
+        "root_children": [getattr(t, "required_role", None) for t in (root.tasks.values() if root else ())
+                          if getattr(t, "parent_task_id", None) == orch.root_task_id],
+        "root_respawns": (getattr(orch, "respawn_counts", {}) or {}).get(getattr(orch, "root_task_id", None), 0),
     }
 
 

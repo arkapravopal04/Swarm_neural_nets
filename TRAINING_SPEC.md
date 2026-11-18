@@ -80,10 +80,10 @@ adapter is trained only in the empty-think regime and is off in that mode — D7
 
 | ID | What | Why it blocks |
 |---|---|---|
-| P0 | Decide single-question routing (FINISH_PLAN M2 item 1): phaser tier S → one executor, or root decides (R4). | Sets R4's size and whether decomposition rows ever see tier 1–4 items. |
+| P0 | Decide single-question routing (FINISH_PLAN M2 item 1): phaser tier S → one executor, or root decides (R4). | Sets R4's size and whether decomposition rows ever see tier 1–4 items. **Decided 2026-11-17: root decides (R4)** — on the dev check v2 passed R4 at 1.00 vs base 0.06, so a routing classifier would add a misroute risk for no gain. P1 measures it and G6 confirms end accuracy; routing in code is the fallback if the root still over-decomposes there. Caveat: R4 rows set the root task to the raw request, while the runtime's root task is the phaser goal (a paraphrase; the raw text is only in THE REQUEST block), so the dev 1.00 is optimistic. P1 is the real check: count the root's SPAWN children with the phaser goal as its task. |
 | P1 | Re-run probe 4 `decide` with the root at generation 0, through the S1 helper. | Root behaviour under chat is unmeasured. |
 | P2 | Measure the executor path on dev-40 for `chat+base`: thinking off vs thinking on, with the runtime's caps (think 128, REPORT 200) and with raised caps. 3 samples per item. | G4/G6 baselines; decides D7. |
-| P3 | Judge prompt rewrite (asks whether figures and arithmetic are right), served on base, greedy; re-run the probe 4 judge cases plus ≥12 more. | G5/G6 run through the judge. |
+| P3 | Judge prompt rewrite (asks whether figures and arithmetic are right), served on base, greedy; re-run the probe 4 judge cases plus ≥12 more. | G5/G6 run through the judge. **Built 2026-11-17 behind HIVE_SERVING=v2** (Judge.V2_CRITERIA, leading-verdict parse, fail closed; served greedy with the adapter off by W1). The judge-case re-run still needs a GPU session. |
 | P4 | Decisions D1–D8 (§13). | **Done 2026-11-12.** |
 | P5 | D4 runtime change (§6.3) landed and tested. | It changes the decomposer prompts the data is rendered from (S6 hash), so it lands before W2 renders anything. |
 

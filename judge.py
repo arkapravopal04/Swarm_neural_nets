@@ -30,6 +30,7 @@ keeps judge decoupled from any specific embedding backend.
 
 import re
 import numpy as np
+import serving
 from text_utils import dedupe_and_cap as _dedupe_and_cap
 
 
@@ -84,6 +85,22 @@ class Judge:
     # deep_critique's prompt ends with this, so the ruling is the first word
     # of the completion instead of whatever preamble the model opens with.
     VERDICT_PREFILL = "VERDICT:"
+
+    # P3 (HIVE_SERVING=v2). The legacy criteria asked about engagement,
+    # calibration and topic, never whether the answer is right, so the
+    # probe-4 judge accepted every wrong REPORT. Correctness comes first.
+    V2_CRITERIA = (
+        "Judge on correctness first:\n"
+        "- is every figure in the OUTPUT right? Each must be given in the subtask, "
+        "the request or the results it builds on, or follow from those by arithmetic the OUTPUT shows "
+        "or a tool printed. Recompute the arithmetic you can see, unless a note below "
+        "says code already checked it. A wrong result, or a figure for the wrong "
+        "quantity (for example counting only some of the people), is a reject.\n"
+        "- does it answer the subtask that was asked, in the form asked, with no part "
+        "left out?\n"
+        "- is it on-topic for the subtask, not a tangent or a restatement of the "
+        "question?\n"
+    )
 
     # A line the model starts after its ruling that is not critique: an
     # invented few-shot sample ("Example:", "Example 2:") or another
@@ -248,7 +265,7 @@ class Judge:
                       ungrounded_figures=None, figures_follow=False,
                       derivations_checked=None, request_labels=None,
                       tool_output=None, code_note=None,
-                      labelled_estimates=None) -> dict:
+                      labelled_estimates=None, built_on=None) -> dict:
         """
         Full LLM call. Only invoked when an agent is attempting to promote
         its result to its parent -- the most expensive tier, reserved for
@@ -294,13 +311,14 @@ class Judge:
             "You are the judge for an AI agent colony. You will be shown a "
             "subtask and the OUTPUT an agent produced for it, then critique "
             "that output -- and only that output.\n\n"
-            "Judge specifically on:\n"
-            "- did the agent actually engage with the subtask, or quietly "
-            "collapse it into something simpler?\n"
-            "- is its confidence calibrated -- does how sure it sounds match "
-            "how accurate it actually is?\n"
-            "- is the output on-topic for the subtask, not a tangent or a "
-            "restatement of the question?\n"
+            + (self.V2_CRITERIA if serving.is_v2() else
+               "Judge specifically on:\n"
+               "- did the agent actually engage with the subtask, or quietly "
+               "collapse it into something simpler?\n"
+               "- is its confidence calibrated -- does how sure it sounds match "
+               "how accurate it actually is?\n"
+               "- is the output on-topic for the subtask, not a tangent or a "
+               "restatement of the question?\n")
             # PATCH 8: the fourth question, and the only one that can see
             # outside the subtask. Every run-4 drift verdict was an accept
             # because the critique's whole frame of reference was
@@ -319,6 +337,12 @@ class Judge:
                f"was NOT asked to do all of this): {project_goal}\n\n"
                if project_goal else "")
             + f"SUBTASK: {subtask_spec}\n\n"
+            # P3 (v2): the criteria let a figure come from the results the
+            # output builds on, so the critique has to see them -- a roll-up
+            # is otherwise judged blind to its own children.
+            + ("RESULTS THIS OUTPUT BUILDS ON (already accepted):\n"
+               + "".join(f"- {r}\n" for r in built_on) + "\n"
+               if built_on and serving.is_v2() else "")
             # PATCH 62. The run already knows which figures came from
             # nowhere; the critique read prose and accepted invented ones.
             + (f"FIGURES TO CHECK: the OUTPUT states {', '.join(loose)}, which "
@@ -390,13 +414,24 @@ class Judge:
         verdict = "reject"  # fail closed: still the default if nothing below matches
         matched = False
 
-        # No trailing \b here, as before: "VERDICT: accepted" is an accept.
-        match = re.search(r"verdict\s*:\s*(accept|reject)", response, re.IGNORECASE)
-        if match is None:
-            match = re.search(r"\b(accept|reject)\b", response, re.IGNORECASE)
-        if match is not None:
-            verdict = match.group(1).lower()
+        if serving.is_v2():
+            # P3 / S9: the prefill makes the ruling the first word, so only a
+            # leading "VERDICT: accept|reject" counts; anything else stays a
+            # reject. The fallbacks below could read "I would not accept
+            # this" as an accept.
+            # Bold or quoted rulings ("**accept**", "'accept'") still count.
+            match = re.match(r"\s*verdict\s*:[\s*'\"_`]*(accept|reject)", response, re.IGNORECASE)
+            verdict = match.group(1).lower() if match else "reject"
             matched = True
+
+        # No trailing \b here, as before: "VERDICT: accepted" is an accept.
+        if not matched:
+            match = re.search(r"verdict\s*:\s*(accept|reject)", response, re.IGNORECASE)
+            if match is None:
+                match = re.search(r"\b(accept|reject)\b", response, re.IGNORECASE)
+            if match is not None:
+                verdict = match.group(1).lower()
+                matched = True
 
         if not matched:
             # Allow whitespace between every letter of each word.
@@ -461,10 +496,12 @@ class Judge:
         tool_output=None,
         critique_check=None,
         labelled_estimates=None,
+        built_on=None,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
-        tiers into one verdict.
+        tiers into one verdict. `built_on` (v2 only): the accepted results this
+        output builds on, shown to the critique.
 
         PATCH 71. critique_check(reason) -> note or None. A tier-3 reject
         whose ground it finds checkably false is critiqued once more with
@@ -608,7 +645,8 @@ class Judge:
         optional = {"ungrounded_figures": figures, "figures_follow": figures_follow,
                     "derivations_checked": derivations_checked,
                     "request_labels": request_labels, "tool_output": tool_output,
-                    "labelled_estimates": list(labelled_estimates or [])}
+                    "labelled_estimates": list(labelled_estimates or []),
+                    "built_on": list(built_on or [])}
         optional = {k: v for k, v in optional.items() if v}
         critique = self.deep_critique(output, getattr(agent, "task", None),
                                       project_goal=project_goal, **optional)

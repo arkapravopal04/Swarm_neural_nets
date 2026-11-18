@@ -18,6 +18,8 @@ import re
 import statistics
 import traceback
 
+import serving
+
 import numpy as np
 from dataclasses import dataclass, replace
 from typing import Optional, Dict, Any, List
@@ -231,7 +233,13 @@ class Orchestrator:
                  model=None, tokeniser=None, embed_model=None,
                  budget_override: Optional[int] = None,
                  framing_levers=FRAMING_LEVERS,
-                 energy_trace_path: Optional[str] = None):
+                 energy_trace_path: Optional[str] = None,
+                 root_role: str = "decomposer"):
+        if root_role not in ("decomposer", "executor"):
+            raise ValueError(f"root_role must be 'decomposer' or 'executor', not {root_role!r}")
+        # "executor" answers the request with one executor and its tools, no
+        # decomposition: the executor path TRAINING_SPEC gate G4 measures.
+        self.root_role = root_role
         self.colony = colony_state
         # Which software-framing interventions act this run: "reword"
         # (plain wording for code-coded subtask vocabulary) and/or "block"
@@ -842,7 +850,7 @@ class Orchestrator:
         root_node = TaskNode(
             task_id=self.root_task_id,
             description=goal_text,
-            required_role="decomposer",
+            required_role=self.root_role,
             requirements=spec.get("requirement", []),
         )
         self.task_graph.add_task(root_node)
@@ -854,7 +862,7 @@ class Orchestrator:
         assert self.task_graph.tasks[self.root_task_id].description == goal_text
 
         print(f"Colony initialized. Bootstrapping root task: {self.root_task_id}")
-        if (self.spawn_agent(role="decomposer", task_id=self.root_task_id) is None
+        if (self.spawn_agent(role=self.root_role, task_id=self.root_task_id) is None
                 and "admission_root_refused" in self.colony.verdict_counts):
             # Nothing smaller than root + one decomposer + one executor can
             # answer anything. Closed now rather than left pending, which
@@ -1473,6 +1481,20 @@ class Orchestrator:
 
     # PATCH 62. At most this many figures go into one critique prompt.
     MAX_UNGROUNDED_FIGURES = 8
+
+    def _built_on_results(self, task_id, excerpt=600):
+        """The accepted results a task builds on -- its dependencies and its
+        own children, as _ungrounded_figures reads them -- one line
+        each: "<their task>: <their result>"."""
+        task = self.task_graph.tasks.get(task_id)
+        deps = set(getattr(task, "dependencies", None) or ())
+        out = []
+        for tid, t in self.task_graph.tasks.items():
+            if (tid != task_id and getattr(t, "status", None) == 2 and getattr(t, "result", None) is not None
+                    and (tid in deps or getattr(t, "parent_task_id", None) == task_id)):
+                text = " ".join(str(t.result).split())
+                out.append(f"{t.description}: {text[:excerpt]}{'...' if len(text) > excerpt else ''}")
+        return out
 
     def _ungrounded_figures(self, result, task_id, estimates_out=None):
         """PATCH 62. Figures `result` states that are neither in the request,
@@ -4209,7 +4231,9 @@ class Orchestrator:
             # A code output is bypassed for the same reason a very short
             # answer already is: the score would not mean anything.
             looks_like_code = self._looks_like_code(result)
-            skip_tier2 = (not is_root) and (
+            # An executor root answers like any executor, so it is exempt the
+            # same way (a short "2300 W" scores low against the whole question).
+            skip_tier2 = (not is_root or self.root_role == "executor") and (
                 word_count <= self.SHORT_ANSWER_WORD_THRESHOLD or looks_like_code
             )
             print(f"  [judge-bypass-check] word_count={word_count} "
@@ -4289,6 +4313,8 @@ class Orchestrator:
                                                            agent_id, task_id),
                 critique_check=((lambda reason: self._critique_unfounded(reason, result))
                                 if supplies_data else None),
+                # P3 (v2): what the output builds on, shown to the critique.
+                **({"built_on": self._built_on_results(task_id)} if serving.is_v2() else {}),
             )
 
             # PATCH 71. A reject whose ground code found false, critiqued once more.
@@ -4583,7 +4609,12 @@ class Orchestrator:
         # Root completion check
         if task_id == self.root_task_id:
             print("Root task completed! Triggering Synthesizer...")
-            if self.synthesizer is not None:
+            if self.root_role == "executor":
+                # G4's executor path: the root answered in person and has no
+                # children for the synthesizer to combine -- its REPORT is
+                # the answer.
+                final_answer = result
+            elif self.synthesizer is not None:
                 goal_text = self._synthesis_problem_text()
                 try:
                     final_answer = self.synthesizer.run(
@@ -4717,7 +4748,10 @@ class Orchestrator:
             dead = self.colony.get_agent(agent_id)
             dead_generation = (dead.generation if dead is not None
                                else self._task_depth(task_id))
-            if not may_convert_to_decomposer(dead_generation):
+            # An executor root (G4) is not converted either: it would turn
+            # the executor path into a full colony.
+            executor_root = self.root_role == "executor" and task_id == self.root_task_id
+            if executor_root or not may_convert_to_decomposer(dead_generation):
                 # D4. Converting here would put the decomposer's children past
                 # MAX_AGENT_GENERATION. The prompt does not offer TASK TOO
                 # LARGE at this depth, so this is the safety net: respawn an
@@ -4725,10 +4759,15 @@ class Orchestrator:
                 too_deep = True
                 if dead is not None:
                     dead.fail_reason = (
+                        "Previous attempt said the task was too large, but this "
+                        "task is answered by one executor and is not split. "
+                        "Answer it directly in one pass."
+                        if executor_root else
                         "Previous attempt said the task was too large, but the "
                         "colony is already at its maximum depth and cannot split "
                         "it further. Answer the task directly in one pass.")
-                self.colony.record_verdict("depth_conversion_refused")
+                self.colony.record_verdict("executor_root_conversion_refused" if executor_root
+                                           else "depth_conversion_refused")
                 print(f"  [depth] {agent_id} (generation {dead_generation}) said "
                       f"TASK TOO LARGE at the depth cap -- respawning as an "
                       f"executor, not converting.")
@@ -6443,6 +6482,13 @@ class Orchestrator:
                     synthesized = partial_synthesis = True
                 except Exception as e:
                     print(f"Warning: failed synthesizing partial result: {e}")
+
+        if not best_result and self.root_role == "executor":
+            # G4: an executor root never accepted -- its last REPORT as written,
+            # without the abandonment banner (a grader would read the banner's
+            # attempt count as the answer). The summary's root_status says it
+            # was not accepted.
+            best_result = getattr(self, "last_partial_result", {}).get(self.root_task_id)
 
         if not best_result and root_task:
             best_result = getattr(root_task, 'result', None)

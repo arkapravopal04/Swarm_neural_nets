@@ -99,7 +99,8 @@ def test_task_too_large_is_offered_only_above_the_depth_cap():
         agent = _agent("executor", gen)
         prompt = agent._build_prompt(available_tools=["run_code"], requirements=[])
         seed = agent._build_thinking_seed(requirements=[], available_tools=["run_code"])
-        expected = may_convert_to_decomposer(gen)
+        # Generation 0 executors are executor roots (gate G4), never converted.
+        expected = gen >= 1 and may_convert_to_decomposer(gen)
         assert ("TASK TOO LARGE" in prompt) is expected, gen
         assert ("TASK TOO LARGE" in seed) is expected, gen
 

@@ -1134,7 +1134,10 @@ class Agent:
             "task is genuinely several tasks wearing one description.\n"
             # D4: not offered at the depth cap, where the orchestrator
             # refuses the conversion (may_convert_to_decomposer).
-        ) if self.role == "executor" and may_convert_to_decomposer(self.generation) else ""
+        # Generation 0 is an executor ROOT (Orchestrator root_role="executor",
+        # gate G4): it answers in one pass and is never converted.
+        ) if (self.role == "executor" and self.generation >= 1
+              and may_convert_to_decomposer(self.generation)) else ""
         return (
             ("IMPORTANT: the constraints listed below apply to the PROJECT "
              "as a whole -- not every constraint necessarily applies to "
