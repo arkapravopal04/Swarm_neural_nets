@@ -507,6 +507,9 @@ class Agent:
         self.model = model
         self.thought_process = ""
         self.last_tool_result = None
+        # The args of the call behind last_tool_result, set by the
+        # orchestrator with the result (v2: the critique checks its inputs).
+        self.last_tool_args = None
         # FIX (retry loop): a single-slot `last_tool_call` only ever caught a
         # call identical to the *immediately* preceding one, and compared the
         # args byte-for-byte. Both holes fired together in practice: an agent

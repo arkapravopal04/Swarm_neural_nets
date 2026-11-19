@@ -172,8 +172,45 @@ def test_v2_report_wiring_reads_the_live_agents_tool_output(monkeypatch):
     orch.spec = {"raw_text": T3_01, "supplies_data": True}
     agent = orch.live_agents[orch.task_graph.tasks[orch.root_task_id].agent_id]
     agent.last_tool_result = "[TOOL RESULT - run_code]: SUCCESS: 3.2"
+    agent.last_tool_args = {"code_string": "print(3.2)"}
     agent.report("The minimum function value is 3.2.")
     orch._route_events(orch.messenger.drain())
     assert prompts, "the REPORT never reached the critique"
     assert "FIGURES TO CHECK" not in prompts[-1]
     assert "CODE THE AGENT RAN PRINTED: SUCCESS: 3.2" in prompts[-1]
+    assert "THAT CODE:\nprint(3.2)" in prompts[-1]
+
+
+def test_a_failed_call_shows_no_code(monkeypatch):
+    orch, agent = _executor_root()
+    agent.last_tool_result = "[TOOL RESULT - run_code]: ERROR (script_crash): CRASH VERDICT: x"
+    agent.last_tool_args = {"code_string": "print(1/0)"}
+    assert orch._tool_code_for_critique(agent) is None
+
+
+def _tool_event(agent_id, code):
+    from event_queue import Event
+    ev = Event(type="tool_request", from_agent=agent_id)
+    ev.payload.update({"agent_id": agent_id, "tool_name": "run_code", "args": {"code_string": code}})
+    return ev
+
+
+def test_the_code_is_recorded_with_its_result_not_at_dispatch(monkeypatch):
+    import orchestrator as orch_mod
+    orch, agent = _executor_root()
+    monkeypatch.setattr(orch_mod.ToolRegistry, "execute",
+                        staticmethod(lambda *a, **k: {"status": "success", "output": "0.24"}))
+    orch.handle_tool_request(_tool_event(agent.agent_id, "print(F(3, 5) * F(2, 5))"))
+    assert agent.last_tool_args == {"code_string": "print(F(3, 5) * F(2, 5))"}
+    # Reviewer case: a corrected call the energy ceiling skips never ran, so
+    # the critique must keep seeing the code that printed 0.24.
+    monkeypatch.setattr(orch, "_tool_round_would_cross_ceiling", lambda *a: True)
+    orch.handle_tool_request(_tool_event(agent.agent_id, "print(F(3, 5) * F(2, 4))"))
+    assert agent.last_tool_args == {"code_string": "print(F(3, 5) * F(2, 5))"}
+
+
+def test_a_call_without_code_shows_no_code():
+    orch, agent = _executor_root()
+    agent.last_tool_result = "[TOOL RESULT - verify_math]: SUCCESS: True"
+    agent.last_tool_args = {"expression": "2 + 2 = 4", "mode": "computational"}
+    assert orch._tool_code_for_critique(agent) is None

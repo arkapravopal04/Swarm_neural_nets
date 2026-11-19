@@ -270,7 +270,7 @@ class Judge:
                       ungrounded_figures=None, figures_follow=False,
                       derivations_checked=None, request_labels=None,
                       tool_output=None, code_note=None,
-                      labelled_estimates=None, built_on=None) -> dict:
+                      labelled_estimates=None, built_on=None, tool_code=None) -> dict:
         """
         Full LLM call. Only invoked when an agent is attempting to promote
         its result to its parent -- the most expensive tier, reserved for
@@ -379,6 +379,12 @@ class Judge:
                if derivations_checked or (figures_follow and not figures) else "")
             + (f"CODE THE AGENT RAN PRINTED: {tool_output} (computed; inputs not "
                "checked)\n\n" if tool_output else "")
+            # v2 (gate run T4-01): the code itself, so its inputs can be checked.
+            + ("THAT CODE:\n" + str(tool_code) + "\nCheck the code's inputs against "
+               "the figures the request gives. Reject if one is entered wrongly (for "
+               "example 3 where the request says 3/5) or the code computes a different "
+               "quantity than the subtask asks for.\n\n"
+               if tool_output and tool_code and serving.is_v2() else "")
             + "=== BEGIN OUTPUT (verbatim, produced by the agent being judged) ===\n"
             f"{output}\n"
             "=== END OUTPUT ===\n\n"
@@ -502,6 +508,7 @@ class Judge:
         critique_check=None,
         labelled_estimates=None,
         built_on=None,
+        tool_code=None,
     ) -> dict:
         """
         The single entry point the orchestrator calls. Aggregates all three
@@ -651,7 +658,7 @@ class Judge:
                     "derivations_checked": derivations_checked,
                     "request_labels": request_labels, "tool_output": tool_output,
                     "labelled_estimates": list(labelled_estimates or []),
-                    "built_on": list(built_on or [])}
+                    "built_on": list(built_on or []), "tool_code": tool_code}
         optional = {k: v for k, v in optional.items() if v}
         critique = self.deep_critique(output, getattr(agent, "task", None),
                                       project_goal=project_goal, **optional)

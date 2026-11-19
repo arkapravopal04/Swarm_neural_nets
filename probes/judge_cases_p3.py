@@ -1,4 +1,4 @@
-"""P3: twelve more tier-3 judge cases (TRAINING_SPEC §2 P3 asks for >= 12 on top
+"""P3: fourteen more tier-3 judge cases (TRAINING_SPEC §2 P3 asks for >= 12 on top
 of probe 4's), each with one clear ruling. Run by colony_gates_kaggle.ipynb's
 `judge` RUN next to probes/probe4_serving.JUDGE_CASES. `built_on` is what
 the output builds on (accepted child or dependency results); `labelled_estimates`
@@ -53,4 +53,15 @@ JUDGE_CASES_P3 = [
                    "Budget coffee: Coffee costs about 49,200 rupees a day, under the 50,000 limit."],
          output=("Print 250 badges. Put 60 attendees in each of the 4 rooms. Coffee costs about 49,200 rupees "
                  "a day, under the 50,000 limit.")),
+    # Gate run T4-01: a printout is only as right as the code's inputs.
+    dict(id="code-right", expect="accept",
+         task="A bag has 3 red and 2 blue balls. Two are drawn without replacement. Find P(both red).",
+         tool_output="0.3",
+         tool_code="from fractions import Fraction as F\nprint(float(F(3, 5) * F(2, 4)))",
+         output="The probability that both are red is 0.3."),
+    dict(id="code-wrong-input", expect="reject",
+         task="A bag has 3 red and 2 blue balls. Two are drawn without replacement. Find P(both red).",
+         tool_output="0.24",  # second draw used 2/5, not 2/4: the drawn ball is not put back
+         tool_code="from fractions import Fraction as F\nprint(float(F(3, 5) * F(2, 5)))",
+         output="The probability that both are red is 0.24."),
 ]

@@ -4325,8 +4325,12 @@ class Orchestrator:
                                                            agent_id, task_id),
                 critique_check=((lambda reason: self._critique_unfounded(reason, result))
                                 if supplies_data else None),
-                # P3 (v2): what the output builds on, shown to the critique.
-                **({"built_on": self._built_on_results(task_id)} if serving.is_v2() else {}),
+                # P3 (v2): what the output builds on, shown to the critique,
+                # and the code behind a printout (gate run T4-01 shipped a
+                # printed 706 from code that set p, q = 3, 5 for 3/5, 2/5).
+                **({"built_on": self._built_on_results(task_id),
+                    "tool_code": self._tool_code_for_critique(tool_holder)}
+                   if serving.is_v2() else {}),
             )
 
             # PATCH 71. A reject whose ground code found false, critiqued once more.
@@ -5652,6 +5656,10 @@ class Orchestrator:
 
         live_agent = self.live_agents.get(agent_id)
         if live_agent is not None:
+            # Set with the result, not at dispatch: a call the energy ceiling
+            # skips above never ran, so its code must not sit beside the
+            # earlier printout the critique sees.
+            live_agent.last_tool_args = args
             live_agent.receive_tool_result(tool_name, summary, success)
 
         self.messenger.push_event(
@@ -6593,6 +6601,21 @@ class Orchestrator:
         if not text or self._TOOL_ERROR_RE.search(text):
             return None
         return text
+
+    TOOL_CODE_CRITIQUE_CHARS = 1500
+
+    def _tool_code_for_critique(self, agent_node):
+        """v2: the code of the call behind the agent's last successful
+        printout, capped, or None (no printout, a failed call, or not code)."""
+        if not self._clean_tool_output(agent_node):
+            return None
+        args = getattr(agent_node, "last_tool_args", None)
+        code = args.get("code_string") if isinstance(args, dict) else None
+        if not isinstance(code, str) or not code.strip():
+            return None
+        code = code.strip()
+        cap = self.TOOL_CODE_CRITIQUE_CHARS
+        return code if len(code) <= cap else code[:cap].rstrip() + "\n..."
 
     def _tool_output_for_critique(self, agent_node, result, agent_id, task_id):
         """PATCH 71. The agent's last tool result without its "[TOOL RESULT -

@@ -80,3 +80,25 @@ def test_v2_critique_sees_what_the_output_builds_on(v2):
 
 def test_legacy_critique_ignores_built_on(legacy):
     assert "RESULTS THIS OUTPUT BUILDS ON" not in _prompt_with_built_on()
+
+
+def _prompt_with_code():
+    seen = {}
+
+    def llm_call_fn(prompt):
+        seen["prompt"] = prompt
+        return " reject"
+    Judge(llm_call_fn=llm_call_fn).deep_critique(
+        "The probability is 0.24.", "Find P(both red), drawn without replacement.",
+        tool_output="0.24", tool_code="print(float(F(3, 5) * F(2, 5)))")
+    return seen["prompt"]
+
+
+def test_v2_critique_sees_the_code_behind_a_printout(v2):
+    prompt = _prompt_with_code()
+    assert "THAT CODE:\nprint(float(F(3, 5) * F(2, 5)))" in prompt
+    assert "Check the code's inputs against the figures the request gives" in prompt
+
+
+def test_legacy_critique_does_not_show_the_code(legacy):
+    assert "THAT CODE:" not in _prompt_with_code()
