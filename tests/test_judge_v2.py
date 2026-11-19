@@ -102,3 +102,9 @@ def test_v2_critique_sees_the_code_behind_a_printout(v2):
 
 def test_legacy_critique_does_not_show_the_code(legacy):
     assert "THAT CODE:" not in _prompt_with_code()
+
+
+def test_v2_criteria_accept_a_bare_right_answer(v2):
+    # Judge run 1 rejected a right 0.3 only because "the explanation is missing".
+    _, prompt = _run(" accept")
+    assert "do not reject it for leaving out its working" in prompt

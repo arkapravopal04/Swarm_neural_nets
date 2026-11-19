@@ -100,6 +100,10 @@ class Judge:
         "left out?\n"
         "- is it on-topic for the subtask, not a tangent or a restatement of the "
         "question?\n"
+        # Judge run 1: a right 0.3 was rejected only for "the explanation is
+        # missing"; the v2 adapter is trained to give the answer alone.
+        "A short OUTPUT that states the right result is complete: do not reject it "
+        "for leaving out its working or an explanation.\n"
     )
 
     # A line the model starts after its ruling that is not critique: an
