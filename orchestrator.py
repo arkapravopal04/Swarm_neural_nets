@@ -4274,8 +4274,13 @@ class Orchestrator:
                 except Exception:
                     derivations = []
             estimates = []  # PATCH 77: filled by _ungrounded_figures
+            # The tool result lives on the LIVE agent; agent_node is the
+            # colony's registry record, which never has one (gate run T3-01:
+            # the printout reached neither the grounding nor the critique).
+            live_agent = self.live_agents.get(agent_id)
+            tool_holder = live_agent if live_agent is not None else agent_node
             figures = self._ungrounded_figures(result, task_id, estimates_out=estimates,
-                                               tool_output=self._clean_tool_output(agent_node))
+                                               tool_output=self._clean_tool_output(tool_holder))
             figures_follow = (figures == [] and supplies_data and not estimates
                               and any(v > 10 for v in figure_values(str(result))))
             verdict = ({"verdict": "warn", "tier": 2, "resubmission": True,
@@ -4316,7 +4321,7 @@ class Orchestrator:
                 derivations_checked=derivations or None,
                 request_labels=request_labels,
                 # Evaluated only when decide is actually called.
-                tool_output=self._tool_output_for_critique(agent_node, result,
+                tool_output=self._tool_output_for_critique(tool_holder, result,
                                                            agent_id, task_id),
                 critique_check=((lambda reason: self._critique_unfounded(reason, result))
                                 if supplies_data else None),

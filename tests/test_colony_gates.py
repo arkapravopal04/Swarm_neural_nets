@@ -157,3 +157,23 @@ def test_v2_a_failed_tool_call_grounds_nothing(monkeypatch):
 
 def test_legacy_still_keeps_tool_output_out_of_the_grounding(monkeypatch):
     assert _t3_01(monkeypatch, None, "[TOOL RESULT - run_code]: SUCCESS: 3.2") == ["3.2"]
+
+
+def test_v2_report_wiring_reads_the_live_agents_tool_output(monkeypatch):
+    # The orchestrator must take the printout from the LIVE agent: the colony's
+    # registry record has no last_tool_result (gate run T3-01, second try).
+    monkeypatch.setenv("HIVE_SERVING", "v2")
+    from judge import Judge
+    prompts = []
+    orch = _orch(root_role="executor", synthesizer=_NoChildrenSynth(), model=object(),
+                 tokeniser=object(),
+                 judge=Judge(llm_call_fn=lambda p: prompts.append(p) or " accept"))
+    orch.initialize_colony(T3_01)
+    orch.spec = {"raw_text": T3_01, "supplies_data": True}
+    agent = orch.live_agents[orch.task_graph.tasks[orch.root_task_id].agent_id]
+    agent.last_tool_result = "[TOOL RESULT - run_code]: SUCCESS: 3.2"
+    agent.report("The minimum function value is 3.2.")
+    orch._route_events(orch.messenger.drain())
+    assert prompts, "the REPORT never reached the critique"
+    assert "FIGURES TO CHECK" not in prompts[-1]
+    assert "CODE THE AGENT RAN PRINTED: SUCCESS: 3.2" in prompts[-1]
