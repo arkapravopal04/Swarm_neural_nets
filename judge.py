@@ -257,8 +257,13 @@ class Judge:
                     "ruling on the OUTPUT. " + stated
                     + "On these steps, reject only if an operand is the wrong "
                     "quantity for the subtask.\n\n")
+        # v2: a figure may also be grounded only by the agent's own code output,
+        # whose inputs nothing checked -- say so rather than call it checked.
+        where = ("in the request, the results it builds on, or the printout of code the agent "
+                 "ran (its inputs not checked)" if serving.is_v2()
+                 else "in the request or the results it builds on")
         return ("FIGURES CHECKED: an automatic check found every figure in the OUTPUT "
-                "in the request or the results it builds on. " + stated + "Still reject if a figure stands for "
+                f"{where}. " + stated + "Still reject if a figure stands for "
                 "the wrong quantity or the reasoning is wrong.\n\n")
 
     def deep_critique(self, output, subtask_spec, project_goal=None,

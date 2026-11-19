@@ -125,3 +125,35 @@ def test_an_abandoned_executor_root_returns_its_last_report_without_the_banner()
     orch.task_graph.tasks[orch.root_task_id].result = "[ABANDONED after 4 attempt(s) -- attempt cap.]"
     answer = str(orch.terminate())
     assert "The power is 2300 W." in answer and "ABANDONED" not in answer
+
+
+T3_01 = ("Minimize f(x,y) = (x-2)^2 + 4(y-1)^2 subject to x+y = 1 and x,y >= 0. Return the "
+         "minimum function value, not the minimizing coordinates.")
+
+
+def _t3_01(monkeypatch, serving_mode, tool_result):
+    if serving_mode:
+        monkeypatch.setenv("HIVE_SERVING", serving_mode)
+    else:
+        monkeypatch.delenv("HIVE_SERVING", raising=False)
+    orch = _orch()
+    orch.spec = {"raw_text": T3_01, "supplies_data": True}
+    orch.task_graph.add_task(TaskNode(task_id="q", description=T3_01, agent_id="a", status=1))
+    node = SimpleNamespace(last_tool_result=tool_result)
+    return orch._ungrounded_figures("The minimum function value is 3.2.", "q",
+                                    tool_output=orch._clean_tool_output(node))
+
+
+def test_v2_a_figure_the_agents_own_code_printed_is_grounded(monkeypatch):
+    # Gate run T3-01: scipy printed 3.2, the REPORT said 3.2, and it was listed
+    # as "from nowhere" three times.
+    assert _t3_01(monkeypatch, "v2", "[TOOL RESULT - run_code]: SUCCESS: 3.2") == []
+
+
+def test_v2_a_failed_tool_call_grounds_nothing(monkeypatch):
+    crash = "[TOOL RESULT - run_code]: ERROR (script_crash): CRASH VERDICT: TypeError: 3.2"
+    assert _t3_01(monkeypatch, "v2", crash) == ["3.2"]
+
+
+def test_legacy_still_keeps_tool_output_out_of_the_grounding(monkeypatch):
+    assert _t3_01(monkeypatch, None, "[TOOL RESULT - run_code]: SUCCESS: 3.2") == ["3.2"]

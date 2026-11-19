@@ -1496,7 +1496,7 @@ class Orchestrator:
                 out.append(f"{t.description}: {text[:excerpt]}{'...' if len(text) > excerpt else ''}")
         return out
 
-    def _ungrounded_figures(self, result, task_id, estimates_out=None):
+    def _ungrounded_figures(self, result, task_id, estimates_out=None, tool_output=None):
         """PATCH 62. Figures `result` states that are neither in the request,
         the task's own description or an accepted result, nor simple
         arithmetic on theirs -- the ledger's "neither" class, until now
@@ -1519,6 +1519,12 @@ class Orchestrator:
                   if tid != task_id and getattr(t, "status", None) == 2
                   and getattr(t, "result", None) is not None
                   and (tid in deps or getattr(t, "parent_task_id", None) == task_id)]
+        # v2: the agent's own successful tool output is a source, as in the
+        # adapter's training and eval data (TOOL, then REPORT the printed
+        # figure). Gate run T3-01 rejected a printed, correct 3.2 three times
+        # as "from nowhere". The critique still sees the output, inputs unchecked.
+        if tool_output and serving.is_v2():
+            parts.append(str(tool_output))
         try:
             from text_utils import (classify_figures, FIGURE_DERIVABLE, FIGURE_NEITHER,
                                     _one_op_match, compact_figure, hedged_figure_values,
@@ -4256,7 +4262,7 @@ class Orchestrator:
             # every figure checked out (run 22's critique rejected a correct
             # "15,000 / 50 = 300 per person" as an arithmetic error).
             # PATCH 71. Request labels for the checked arithmetic, and the
-            # agent's last tool output -- shown, never added to the grounding.
+            # agent's last tool output -- shown; under v2 also a grounding source.
             supplies_data = bool((self.spec or {}).get("supplies_data"))
             labels = (request_figure_labels((self.spec or {}).get("raw_text") or "")
                       if supplies_data else {})
@@ -4268,7 +4274,8 @@ class Orchestrator:
                 except Exception:
                     derivations = []
             estimates = []  # PATCH 77: filled by _ungrounded_figures
-            figures = self._ungrounded_figures(result, task_id, estimates_out=estimates)
+            figures = self._ungrounded_figures(result, task_id, estimates_out=estimates,
+                                               tool_output=self._clean_tool_output(agent_node))
             figures_follow = (figures == [] and supplies_data and not estimates
                               and any(v > 10 for v in figure_values(str(result))))
             verdict = ({"verdict": "warn", "tier": 2, "resubmission": True,
@@ -6569,17 +6576,26 @@ class Orchestrator:
     _TOOL_ERROR_RE = re.compile(
         r"^ERROR\b|Traceback \(most recent call last\)|CRASH VERDICT|\b\w+(?:Error|Exception):")
 
-    def _tool_output_for_critique(self, agent_node, result, agent_id, task_id):
-        """PATCH 71. The agent's last tool result without its "[TOOL RESULT -
-        x]:" tag, capped, or None. Measure-only "[tool-mismatch]" print when
-        it states a figure over 10 and the REPORT states none of its figures
-        (run 24's run_code printed "Train cost: 45000"; the REPORT said 40,500)."""
+    def _clean_tool_output(self, agent_node):
+        """The agent's last tool result without its "[TOOL RESULT - x]:" tag,
+        not cut to the critique's 200 characters (the agent already caps it,
+        PATCH 49), or None when there is none or the call failed."""
         raw = getattr(agent_node, "last_tool_result", None)
         if not raw:
             return None
         text = re.sub(r"^\[TOOL RESULT - [^\]]*\]:\s*", "", str(raw)).strip()
         # A failed call printed nothing worth showing as computed output.
         if not text or self._TOOL_ERROR_RE.search(text):
+            return None
+        return text
+
+    def _tool_output_for_critique(self, agent_node, result, agent_id, task_id):
+        """PATCH 71. The agent's last tool result without its "[TOOL RESULT -
+        x]:" tag, capped, or None. Measure-only "[tool-mismatch]" print when
+        it states a figure over 10 and the REPORT states none of its figures
+        (run 24's run_code printed "Train cost: 45000"; the REPORT said 40,500)."""
+        text = self._clean_tool_output(agent_node)
+        if not text:
             return None
         printed = set(figure_values(text))
         if any(v > 10 for v in printed) and not printed & set(figure_values(str(result))):
