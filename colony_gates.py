@@ -3,12 +3,15 @@ colony_gates.py -- score the colony gate runs locally (TRAINING_SPEC §10:
 G4, G5, G6; §2: P1, P3). Runs come from colony_gates_kaggle.ipynb; grading
 uses hive_grader.py against the private keys in reasoning_benchmark/.
 
-    python colony_gates.py time  gates/time-v2.1-s0
-    python colony_gates.py g6    --arm gates/g6-v2.1-s0 gates/g6-v2.1-s1 [--baseline probe_results/answers_think_keyfix.jsonl]
+    python colony_gates.py time  gates/time-v2.1-s0-think
+    python colony_gates.py g6    --arm gates/g6-v2.1-s0-think [--baseline probe_results/answers_think_keyfix.jsonl]
     python colony_gates.py g4    --arm gates/g4-v2.1-s0 --base gates/g4-base-s0
-    python colony_gates.py g5    gates/g5-v2.1-s0
-    python colony_gates.py p1    gates/g6-v2.1-s0 ...
+    python colony_gates.py g5    gates/g5-v2.1-s0-think
+    python colony_gates.py p1    gates/g6-v2.1-s0-think ...
     python colony_gates.py judge gates/judge-v2.1-s0
+
+time, g6 and g5 run with the thinker (THINK_FIRST.md), so their folders end
+in -think; g4 and judge run without it.
 
 G6 compares the colony with ONE plain call of the base model on the same
 items -- by default probe 4's thinking-on single call with the answer key
@@ -36,6 +39,11 @@ def scores(answers_path, ids=None):
     responses = read_jsonl(answers_path)
     if ids is not None:
         responses = [r for r in responses if r["id"] in ids]
+    return grade(responses)
+
+
+def grade(responses):
+    """{item id: score} for [{"id", "answer", "unit"}] rows."""
     items = hive_grader.grade_all(hive_grader.load_problems(), responses, strict=False,
                                   only_answered_splits=True, quiet=True)
     return {i["id"]: float(i["score"] or 0) for i in items if i["id"] in {r["id"] for r in responses}}
@@ -56,7 +64,13 @@ def per_item_mean(dirs):
     return {k: sum(v) / len(v) for k, v in acc.items()}
 
 
+SINGLE_CALL_RUN = "probe_results/bench_think.jsonl"   # probe 4's plain call: seconds per item
+
+
 def cmd_time(a):
+    single = {}
+    if Path(SINGLE_CALL_RUN).exists():
+        single = {r["id"]: r for r in read_jsonl(SINGLE_CALL_RUN) if "id" in r}
     for d in a.dirs:
         rows = read_jsonl(Path(d) / "summary.jsonl")
         secs = [r["seconds"] for r in rows]
@@ -65,7 +79,20 @@ def cmd_time(a):
         for r in rows:
             print(f"  {r['id']}: {r['seconds'] / 60:.1f} min, root children {r['root_children']}, "
                   f"tier-3 accept/reject {r['tier3_accept']}/{r['tier3_reject']}, abandoned {r['abandoned']}")
+            if r.get("thinker_seconds") is not None:
+                # THINK_N rule: keep n=3 only if a batch of 3 costs <= 1.5x one plain call.
+                one = single.get(r["id"], {}).get("seconds")
+                print(f"    thinker n={r.get('thinker_n')}: {r['thinker_seconds']:.0f} s"
+                      + (f" = {r['thinker_seconds'] / one:.2f}x one plain call (keep n=3 if <= 1.5x)" if one else "")
+                      + f", tokens {r.get('thinker_tokens')}, capped {r.get('thinker_capped')}, "
+                        f"answers {r.get('thinker_answers')}, settled by the {r['resolved_by']}, "
+                        f"peak {r.get('peak_vram_mb')} MB")
         n = statistics.mean(secs)
+        if any(r.get("resolved_by") for r in rows):
+            # g4 runs without the thinker: no projection for it from this run.
+            print(f"  -> think first, per seed: G6 (20 items) ~{20 * n / 3600:.1f} h; "
+                  f"G5 (3 runs) ~{3 * n / 3600:.1f} h")
+            continue
         print(f"  -> G6 (20 items x 2 seeds): ~{40 * n / 3600:.1f} h; G4 (40 items): ~{40 * n / 3600:.1f} h "
               f"(an executor root that keeps being rejected costs up to 4 attempts); G5 (3 runs): ~{3 * n / 3600:.1f} h")
 
@@ -82,6 +109,45 @@ def cmd_g6(a):
     for i in ids:
         print(f"  {i}: colony {colony[i]:.2f}  single {base[i]:.0f}")
     print(f"G6 colony >= single call: {'PASS' if c >= b else 'FAIL'}")
+    for d in a.arm:
+        think_first_split(d)
+
+
+def think_first_split(d):
+    """THINK_FIRST.md gate: the score split by who settled each item, and --
+    on the items that reached the colony -- the colony's answer against the
+    thinker's own best answer (compute-matched, paired). Silent for a run
+    without a thinker."""
+    rows = [r for r in read_jsonl(Path(d) / "summary.jsonl") if r.get("resolved_by")]
+    if not rows:
+        return
+    answers = {r["id"]: r for r in read_jsonl(Path(d) / "answers.jsonl")}
+    got = grade([answers[r["id"]] for r in rows if r["id"] in answers])
+    print(f"\n{d}: think first")
+    for who in ("thinker", "colony"):
+        ids = [r["id"] for r in rows if r["resolved_by"] == who]
+        print(f"  settled by the {who}: {sum(got.get(i, 0) for i in ids):.0f} / {len(ids)} right")
+    # A thinker that raised has no answer of its own: grading its missing
+    # fallback as 0 would tilt the comparison toward the colony.
+    crashed = [r["id"] for r in rows if r.get("thinker_error")]
+    if crashed:
+        print(f"  thinker raised on {crashed}: left out of the comparison below")
+    colony_rows = [r for r in rows if r["resolved_by"] == "colony" and not r.get("thinker_error")]
+    if not colony_rows:
+        return
+    fallback = grade([{"id": r["id"], "answer": r.get("fallback_answer"),
+                       "unit": answers.get(r["id"], {}).get("unit")} for r in colony_rows])
+    c = sum(got.get(r["id"], 0) for r in colony_rows)
+    f = sum(fallback.get(r["id"], 0) for r in colony_rows)
+    print(f"  colony path ({len(colony_rows)} items): colony {c:.0f} vs the thinker's own best "
+          f"answer {f:.0f} (paired; directional at this size)")
+    for r in colony_rows:
+        print(f"    {r['id']}: colony {got.get(r['id'], 0):.0f}  thinker {fallback.get(r['id'], 0):.0f}  "
+              f"answers {r.get('thinker_answers')} capped {r.get('thinker_capped')} "
+              f"plan from {r.get('plan_source')}")
+    print("  reading rule (fixed before the run): colony below the thinker -> Phase 2 sends these "
+          "items to the thinker's answer; at or above -> Phase 2 invests in the colony path. "
+          f"Here: {'colony below' if c < f else 'colony at or above'}")
 
 
 def cmd_g4(a):
@@ -131,7 +197,8 @@ def cmd_p1(a):
     """P1: how the root split each request. A tier 1-4 item is one question:
     one executor child (R4) is the trained behaviour."""
     for d in a.dirs:
-        rows = read_jsonl(Path(d) / "summary.jsonl")
+        # Items the thinker settled never built a colony: no split to count.
+        rows = [r for r in read_jsonl(Path(d) / "summary.jsonl") if r.get("resolved_by") != "thinker"]
         one = sum(1 for r in rows if r.get("root_children") == ["executor"])
         print(f"{d}: {one}/{len(rows)} items passed down whole as one executor")
         for r in rows:

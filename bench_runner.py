@@ -161,6 +161,27 @@ def _summary(item, orch, status, seconds, peak_mb, error=None):
         "root_children": [getattr(t, "required_role", None) for t in (root.tasks.values() if root else ())
                           if getattr(t, "parent_task_id", None) == orch.root_task_id],
         "root_respawns": (getattr(orch, "respawn_counts", {}) or {}).get(getattr(orch, "root_task_id", None), 0),
+        **_thinker_fields(orch),
+    }
+
+
+def _thinker_fields(orch):
+    """THINK_FIRST.md P4: who settled the item, and the thinker's own best
+    answer (the gate's compute-matched baseline). Empty without a thinker."""
+    result = getattr(orch, "thinker_result", None)
+    if result is None:
+        return {}
+    runs = result.get("runs") or []
+    return {
+        "resolved_by": getattr(orch, "resolved_by", None),
+        "thinker_error": result.get("error"),
+        "thinker_seconds": result.get("seconds"),
+        "thinker_n": result.get("n"),
+        "thinker_answers": [r.get("answer") for r in runs],
+        "thinker_capped": [r.get("capped") for r in runs],
+        "thinker_tokens": [r.get("tokens") for r in runs],
+        "fallback_answer": result.get("fallback_line"),
+        "plan_source": result.get("plan_source"),
     }
 
 
@@ -222,6 +243,9 @@ def run_bench(make_colony, items, out_dir, fixtures_root=None, manifest=None, se
         _append(answers_path, {"id": item["id"], "answer": None if answer is None else str(answer),
                                "unit": item.get("unit")})
         _append(summary_path, row)
+        if getattr(orch, "thinker_result", None):
+            # THINK_FIRST.md P4: the full thinker runs, Watch Tower data later.
+            _append(out / "thinker.jsonl", {"id": item["id"], **orch.thinker_result})
         written.append(row)
         print(f"[bench] {item['id']}: {status} in {row['seconds']}s "
               f"(root status {row['root_status']}, abandoned {row['abandoned']}).")

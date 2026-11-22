@@ -40,6 +40,9 @@ class AgentNode:
     # constraints paraphrase it, and a paraphrase can lose or bend a figure
     # ("12 plots" -> "12 gardens", 9,000 -> 9,067); the request cannot.
     request_text: str | None = None
+    # THINK_FIRST.md P3. The thinker's best PLAN, on every agent when the
+    # colony runs after a thinker that did not settle the request.
+    shared_plan: str | None = None
 
 
 class ColonyState:

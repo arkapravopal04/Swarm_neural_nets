@@ -783,6 +783,11 @@ class Agent:
         return getattr(self.node, "request_text", None)
 
     @property
+    def shared_plan(self):
+        """THINK_FIRST.md P3. The thinker's best plan, or None."""
+        return getattr(self.node, "shared_plan", None)
+
+    @property
     def parent_id(self):
         return self.node.parent_id
 
@@ -1230,6 +1235,24 @@ class Agent:
             "there. Your task below is the part of it you answer.\n\n"
         )
 
+    def _shared_plan_str(self):
+        """
+        THINK_FIRST.md P3. The thinker's plan, as background in the think()
+        seed only -- never in a decide() prompt: the adapter was trained
+        without it, and a 6-step plan in a decomposer's decide() invites a
+        6-way split. Its runs disagreed on the answer (or the colony would
+        not be running), so it is labelled as possibly wrong.
+        """
+        plan = self.shared_plan
+        if not plan:
+            return ""
+        return (
+            "SHARED PLAN (from a first full solve of the request -- it may "
+            "contain mistakes; background only, your task above is the only "
+            "thing you answer):\n"
+            f"{plan}\n\n"
+        )
+
     _EARLIER_ATTEMPTS_HEADER = (
         "[EARLIER ATTEMPTS AT THIS TASK FAILED -- do not repeat these]\n")
     # PATCH 55 (review): per-reason ceiling, same figure ColonyState uses
@@ -1363,7 +1386,8 @@ class Agent:
             f"You are an AI agent in a colony of agents working together to solve problems.\n"
             f"Your Role: {self.role}\n"
             f"{role_constraint_str}{self._request_str()}Your Task: {self.task}\n\n"
-            f"{requirements_str}{tools_str}{actions_str}{ghost_str}{fail_str}{tool_result_str}"
+            f"{requirements_str}{self._shared_plan_str()}{tools_str}{actions_str}"
+            f"{ghost_str}{fail_str}{tool_result_str}"
             f"Think through how to approach this task."
         )
 

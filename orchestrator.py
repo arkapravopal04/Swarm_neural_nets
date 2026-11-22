@@ -234,7 +234,8 @@ class Orchestrator:
                  budget_override: Optional[int] = None,
                  framing_levers=FRAMING_LEVERS,
                  energy_trace_path: Optional[str] = None,
-                 root_role: str = "decomposer"):
+                 root_role: str = "decomposer",
+                 thinker=None, think_plan: bool = True):
         if root_role not in ("decomposer", "executor"):
             raise ValueError(f"root_role must be 'decomposer' or 'executor', not {root_role!r}")
         # "executor" answers the request with one executor and its tools, no
@@ -405,6 +406,15 @@ class Orchestrator:
         # Where terminate() appends this run's per-task energy records (one
         # JSON line per run), the data RESERVE_* is re-fitted from. None = off.
         self.energy_trace_path = energy_trace_path
+
+        # THINK_FIRST.md. A thinker solves the whole request before the
+        # colony starts; None = off (every run before it). shared_plan is its
+        # best PLAN, shown in every agent's think() seed when think_plan.
+        self.thinker = thinker
+        self.think_plan = think_plan
+        self.thinker_result: Optional[Dict[str, Any]] = None
+        self.resolved_by: Optional[str] = None
+        self.shared_plan: Optional[str] = None
 
         # Live Agent objects (the think/decide/execute reasoning wrapper),
         # keyed by agent_id. Distinct from ColonyState.agents, which only
@@ -985,6 +995,8 @@ class Orchestrator:
             goal_referent=getattr(task_node, "goal_referent", None),
             # PATCH 29. Every agent, whatever its role or attempt.
             request_text=self._request_text(),
+            # THINK_FIRST.md P3: background in the think() seed only.
+            shared_plan=self.shared_plan,
         )
 
         self.colony.register_agent(new_agent)
@@ -6797,6 +6809,32 @@ class Orchestrator:
             f"mentioned was not reached.]\n\n{answer}"
         )
 
+    def _think_first(self, problem_spec: str) -> Optional[str]:
+        """THINK_FIRST.md P2. The agreed ANSWER line when the thinker's runs
+        agree (the colony is then never built), else None: the colony runs,
+        with the thinker's plan as shared background. A thinker that raises
+        (an OOM, say) falls through to the colony with no plan -- an item
+        recorded as an error would be skipped for good on resume."""
+        self.resolved_by = "colony"
+        try:
+            result = self.thinker.solve(problem_spec)
+        except Exception as e:
+            print(f"[think-first] thinker failed ({type(e).__name__}: {e}); "
+                  f"the colony runs without a plan.")
+            self.thinker_result = {"error": f"{type(e).__name__}: {e}"}
+            return None
+        self.thinker_result = result
+        runs = result.get("runs") or []
+        print(f"[think-first] {len(runs)} run(s) in {result.get('seconds')} s, answers "
+              f"{[r.get('answer') for r in runs]}, capped {[r.get('capped') for r in runs]}; "
+              f"agreed: {result.get('answer_line')!r}; plan from: {result.get('plan_source')}")
+        if result.get("answer_line"):
+            self.resolved_by = "thinker"
+            return result["answer_line"]
+        if self.think_plan:
+            self.shared_plan = result.get("plan")
+        return None
+
     def run(self, problem_spec: str) -> Any:
         """
         1. Bootstraps the root node space with initial specifications.
@@ -6804,6 +6842,12 @@ class Orchestrator:
         3. Terminates the cycle and retrieves results.
         """
         self.running = True
+        if self.thinker is not None:
+            answer = self._think_first(problem_spec)
+            if answer is not None:
+                # No colony was built: nothing to terminate().
+                self.running = False
+                return answer
         self.initialize_colony(problem_spec)
 
         while self.running:

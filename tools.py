@@ -166,7 +166,7 @@ def _assert_within_root(path: str, root: str) -> str:
     return resolved
 
 
-# Hard cap on the base timeout for run_code. Previously an agent-supplied
+# Hard cap on the base timeout for run_code. Previously an agent-supplied help
 # timeout flowed unvalidated into subprocess.communicate(timeout=...): a
 # huge value (10**6, 10**9, ...) multiplied by the domain scale into an
 # effectively unbounded wall-clock budget -- one runaway script ran for
