@@ -92,12 +92,17 @@ def test_solve():
     assert out["answer_line"] == "ANSWER: B" and [r["answer"] for r in out["runs"]] == ["B", "b", "A"]
 
 
-def test_settle_off_and_n1_never_end_the_run():
+def test_settle_off_never_ends_the_run():
     # G5: two school runs ending "ANSWER: 40,000 rupees" must not replace the plan.
     out = Thinker(settle=False, generate_fn=lambda p, n: [run("40,000 rupees")] * 3).solve("school")
     assert out["answer_line"] is None and out["plan"]
-    out = Thinker(n=1, generate_fn=lambda p, n: [run("2")]).solve("q")
+
+
+def test_a_single_run_settles_only_when_it_finished_uncapped():
+    assert Thinker(n=1, generate_fn=lambda p, n: [run("2")]).solve("q")["answer_line"] == "ANSWER: 2"
+    out = Thinker(n=1, generate_fn=lambda p, n: [run("2", capped=True)]).solve("q")
     assert out["answer_line"] is None and out["fallback_line"] == "ANSWER: 2"
+    assert Thinker(n=1, generate_fn=lambda p, n: [run("about five")]).solve("q")["answer_line"] is None
 
 
 class _Tok:
@@ -116,7 +121,10 @@ class _Tok:
 
 
 class _Model:
-    """Row 0 answers and stops (then pads); row 1 is capped mid-thought."""
+    """Row 0 answers and stops (then pads). Row 1 is capped mid-thought; its
+    closure writes a plan but no answer (the 2026-11-23 time run), so it is
+    then made to answer. Row 2 is capped after closing its thinking, with a
+    plan and no answer: it is made to answer directly."""
     device = "cpu"
 
     def __init__(self):
@@ -133,16 +141,27 @@ class _Model:
         prompt = input_ids[0].tolist()
         if kw.get("num_return_sequences"):
             done = enc("<think>a</think>\nANSWER: 7") + [1, 0, 0]
-            return torch.tensor([prompt + done, prompt + enc("<think>" + "b" * (len(done) - 7))])
-        return torch.tensor([prompt + enc("ANSWER: 7") + [1]])
+            closed = "<think>a</think>\nPLAN:\n1. x"
+            return torch.tensor([prompt + done, prompt + enc("<think>" + "b" * (len(done) - 7)),
+                                 prompt + enc(closed + "y" * (len(done) - len(closed)))])
+        so_far = "".join(chr(i - 10) for i in prompt if i >= 10)
+        if so_far.endswith(thinker.FORCE_ANSWER_TEXT):
+            if thinker.CLOSE_TEXT in so_far:  # the forced answer builds on the closure
+                assert so_far.endswith(thinker.CLOSE_TEXT + "1. Count the states.\n" + thinker.FORCE_ANSWER_TEXT)
+            reply = " 7"
+        else:
+            reply = "1. Count the states.\n"
+        return torch.tensor([prompt + enc(reply) + [1]])
 
 
 def test_generate_closes_a_capped_run_with_the_adapter_off(monkeypatch):
     monkeypatch.setenv("HIVE_SERVING", "v2")
     monkeypatch.setattr(thinker.serving, "render", lambda tok, prompt, thinking: [ord("Q") + 10])
     model = _Model()
-    runs = Thinker(model, _Tok(), n=2)._generate("Q", 2)
-    assert [r["capped"] for r in runs] == [False, True]
-    assert [thinker.answer_value(r["text"]) for r in runs] == ["7", "7"]  # row 1 closed, then answered
+    runs = Thinker(model, _Tok(), n=3)._generate("Q", 3)
+    assert [r["capped"] for r in runs] == [False, True, True]
+    assert [thinker.answer_value(r["text"]) for r in runs] == ["7", "7", "7"]
+    assert thinker.plan_text(runs[1]["text"]) == "1. Count the states."
     assert model.adapter_off and model.calls[0]["eos_token_id"] == [1, 0]
-    assert model.calls[1]["do_sample"] is False
+    # one batch, then row 1: closure + forced answer, row 2: forced answer only
+    assert len(model.calls) == 4 and all(c["do_sample"] is False for c in model.calls[1:])

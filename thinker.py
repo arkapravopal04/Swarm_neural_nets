@@ -7,7 +7,9 @@ n times in one batch. Each run ends with PLAN: and a last ANSWER: line.
 
 If >= 2 ANSWER lines agree -- numbers with their units, or option letters,
 never prose -- and at least one of the agreeing runs finished uncapped, that
-line is the answer and the colony never starts. Otherwise the colony runs,
+line is the answer and the colony never starts. With n=1 (the default since
+the time run: 3 batched runs cost 2.1-2.4x one) the single run settles when
+it finished uncapped with a number or letter. Otherwise the colony runs,
 with the best PLAN as background in its agents' think() seeds, and the
 thinker's own best line is kept as the fallback the gate compares against.
 
@@ -31,6 +33,12 @@ CHOICE_MARK = "Answer with the letter of the correct option."
 PLAN_MAX_CHARS = 600
 AGREE_REL_TOL = 1e-3      # a consensus bar only; the answer key still grades
 CLOSE_TOKENS = 400        # a capped run gets this many greedy tokens to answer
+# Time run 2026-11-23: a bare "</think>" closure wrote a long write-up and
+# never reached PLAN:/ANSWER:. So the closure starts the plan itself, and a
+# run still without an ANSWER line is made to give one.
+CLOSE_TEXT = "\n</think>\n\nPLAN:\n"
+FORCE_ANSWER_TEXT = "\nANSWER:"
+ANSWER_TOKENS = 40
 
 _ANSWER_RE = re.compile(r"^[ \t>*#]*ANSWER[ \t*]*:[ \t*]*(.*?)[ \t*]*$", re.M | re.I)
 _PLAN_RE = re.compile(r"^[ \t>*#]*PLAN[ \t*]*:(.*?)(?=^[ \t>*#]*ANSWER[ \t*]*:|\Z)",
@@ -144,7 +152,12 @@ def decide(runs, choice_item):
                default=[])
     best_uncapped = [i for i in best if not runs[i]["capped"]]
 
-    agreed_run = best_uncapped[0] if len(best) >= 2 and best_uncapped else None
+    # n >= 2: at least two agree, one of them uncapped. n == 1 (time run
+    # 2026-11-23: a batch of 3 cost 2.1-2.4x one call): the lone run settles
+    # if it finished uncapped with a number or letter -- the plain call's own
+    # behaviour on items it can finish.
+    settles = len(best) >= 2 or len(runs) == 1
+    agreed_run = best_uncapped[0] if settles and best_uncapped else None
 
     # Fallback (the gate's thinker-only answer): plurality, else the first
     # uncapped run with an ANSWER line, else the first ANSWER line at all.
@@ -220,16 +233,31 @@ class Thinker:
                 capped = end is None
                 used = new if capped else new[:end]
                 text = tok.decode(used, skip_special_tokens=False)
-                if capped and "</think>" not in text:
-                    # Like probe 4's chat_once: close the thinking and let it answer.
-                    tail = tok("\n</think>\n\n", return_tensors="pt", add_special_tokens=False
-                               )["input_ids"].to(row.device)
-                    ids2 = torch.cat([row.unsqueeze(0), tail], dim=1)
-                    out2 = model.generate(input_ids=ids2, attention_mask=torch.ones_like(ids2),
-                                          max_new_tokens=CLOSE_TOKENS, do_sample=False,
-                                          eos_token_id=stops, pad_token_id=pad)
-                    text += "\n</think>\n\n" + tok.decode(out2[0, ids2.shape[1]:], skip_special_tokens=False)
+                if capped:
+                    # A capped row ran to max_new_tokens, so it carries no padding.
+                    seq = row.unsqueeze(0)
+                    if "</think>" not in text:
+                        seq, more = self._continue(seq, CLOSE_TEXT, CLOSE_TOKENS, stops, pad)
+                        text += CLOSE_TEXT + more
+                    if not answer_value(text):   # none, or an empty "ANSWER:" at the closure's end
+                        seq, more = self._continue(seq, FORCE_ANSWER_TEXT, ANSWER_TOKENS, stops, pad)
+                        text += FORCE_ANSWER_TEXT + more
                 for sp in ("<|im_end|>", "<|endoftext|>"):
                     text = text.replace(sp, "")
                 runs.append({"text": text, "capped": capped, "tokens": len(used)})
         return runs
+
+    def _continue(self, seq, text, max_new_tokens, stops, pad):
+        """Append `text` to the sequence and continue it greedily. Returns the
+        extended sequence and the decoded continuation, cut at a stop token."""
+        import torch
+        tail = self.tokeniser(text, return_tensors="pt", add_special_tokens=False
+                              )["input_ids"].to(seq.device)
+        ids = torch.cat([seq, tail], dim=1)
+        out = self.model.generate(input_ids=ids, attention_mask=torch.ones_like(ids),
+                                  max_new_tokens=max_new_tokens, do_sample=False,
+                                  eos_token_id=stops, pad_token_id=pad)
+        new = out[0, ids.shape[1]:].tolist()
+        new = new[:next((k for k, t in enumerate(new) if t in stops), len(new))]
+        cont = torch.tensor([new], dtype=ids.dtype, device=ids.device)
+        return torch.cat([ids, cont], dim=1), self.tokeniser.decode(new, skip_special_tokens=False)

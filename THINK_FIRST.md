@@ -6,6 +6,25 @@ tests/test_think_first.py). The design was approved by two reviewers; the code
 by a third after fixes (boxed answers vote, no absolute tolerance, two
 unconvertible units never agree). Not yet run on Kaggle.
 
+## Time run 2026-11-23 and what changed
+
+On 2 T4 items with n=3, all 6 thinker runs hit the 4096-token cap. The
+`</think>` closure then wrote a long write-up and never reached `PLAN:` or
+`ANSWER:`, so the thinker produced no answer, no plan and no fallback. The
+batch of 3 cost 2.1-2.4x one plain call (the rule was 1.5x). Peak VRAM was
+10.4 GB. The colony scored 0/2; the plain call scored 1/2.
+
+Changes:
+- **The closure starts the plan itself** (`</think>\n\nPLAN:\n`, 400 greedy
+  tokens). A run still without an `ANSWER:` line then gets `ANSWER:` written in
+  and 40 greedy tokens to finish it.
+- **n=1 is the default.** A single run settles the item when it finished uncapped
+  with a number or a letter, which is the plain call's own behaviour on items it
+  can finish. A capped run never settles: it goes to the colony with its plan,
+  and its forced answer is the fallback.
+- One g6 seed: about 7 min of thinking per item, plus the colony on items that
+  don't settle, roughly 5 h.
+
 ## Why
 
 G6 seed 0 failed: the colony scored 4/20, a single plain call scored 12/20. The
