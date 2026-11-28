@@ -72,6 +72,20 @@ for idx in (kv.pick_last(mem_a, 16), kv.pick_top(writer, 16, lo=kv.SINKS), kv.pi
     toks, _ = kv.decode(model, rs, b, max_new=5, stop_ids=[])
     if not (cut.slots <= 20 and cut.next_pos == 60 and rs.next_pos == cut.slots and len(toks) == 5):
         fails.append("cut")
+# join: b re-stamped after a must equal one pass where b's rows cannot see a
+mem_b, _, _ = kv.run(model, b, logits=None)
+j = kv.join(model, mem_a, mem_b)
+_, lj, _ = kv.run(model, b, j, logits="all")
+ids = torch.cat([a, b, b], 1)
+allow = torch.tril(torch.ones(80, 80, dtype=torch.bool))
+allow[60:70, :60] = False
+with torch.no_grad():
+    ref = model(input_ids=ids, position_ids=torch.arange(80)[None],
+                attention_mask=torch.zeros(1, 1, 80, 80).masked_fill(~allow, float("-inf"))).logits[:, 70:]
+d_j = float((lj - ref).abs().max())
+print(f"join vs b-blind-to-a reference: max diff {d_j:.2e}")
+if d_j > 1e-4 or j.pos.tolist() != list(range(70)) or j.next_pos != 70:
+    fails.append("join")
 assert mem_a.slots == n0 and mem_a.next_pos == 60, "a Memory was mutated"
 g1, _ = kv.decode(model, None, a, max_new=6, stop_ids=[])
 g2, m2 = kv.decode(model, mem_a, b, max_new=6, stop_ids=[g1[0]] if g1 else [])

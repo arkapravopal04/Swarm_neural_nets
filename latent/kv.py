@@ -200,6 +200,16 @@ def restamp(model, mem, start=0):
     return Memory(build_cache(pairs), new_pos, start + n)
 
 
+def join(model, a, b):
+    """a's slots, then b's re-stamped to continue from a.next_pos. b was built
+    without seeing a, so its keys/values carry no cross-links to a (no repair).
+    b is renumbered contiguously (any gaps in b close up); a's positions are kept."""
+    b = restamp(model, b, start=a.next_pos)
+    pairs = [(torch.cat([ka, kb], 2), torch.cat([va, vb], 2))
+             for (ka, va), (kb, vb) in zip(cache_layers(a.cache), cache_layers(b.cache))]
+    return Memory(build_cache(pairs), torch.cat([a.pos, b.pos.to(a.pos.device)]), b.next_pos)
+
+
 # --- scoring ------------------------------------------------------------------
 
 @torch.no_grad()

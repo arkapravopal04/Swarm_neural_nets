@@ -6,7 +6,8 @@ Thinker test, answer task: grades every answers_<arm>.jsonl on its own items, si
 Thinker test, verify task: grades the thinker's own answers, then scores every
 verdicts_<arm>.jsonl against them (caught = WRONG on a wrong answer, kept = CORRECT
 on a right one).
-Value test: re-prints the value_rows.jsonl summary. Gate / mismatch: prints the json files.
+Value test: re-prints the value_rows.jsonl summary. Chain test: re-prints the
+chain_rows.jsonl summary. Gate / mismatch: prints the json files.
 """
 import glob
 import json
@@ -82,6 +83,12 @@ def main(out):
         rows = [json.loads(l) for l in open(vpath, encoding="utf-8") if l.strip()]
         print("\nvalue test (exact-value reuse rate)")
         value_test.summarize(rows, None, value_test.make_pairs())
+
+    cpath = os.path.join(out, "chain_rows.jsonl")
+    if os.path.exists(cpath):
+        import chain_test
+        print("\nchain and join test (exact-value reuse rate)")
+        chain_test.summarize([json.loads(l) for l in open(cpath, encoding="utf-8") if l.strip()])
 
     for name in ("checks.json", "mismatch.json"):
         p = os.path.join(out, name)

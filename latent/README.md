@@ -163,6 +163,26 @@ Run 2 changes:
   scored locally against whether that answer is right (caught / kept).
 - The gate and the mismatch check save `checks.json` / `mismatch.json`.
 
+## Run 2 → run 3: chains and joins
+
+Run 2 (`adapters/latent_r26`): gate exact on the real model; `reader_256` 1.00 on
+the value test (23% of slots); pooling hurt (`reader_128_p2` 0.03), so it stays
+off; thinker test: memory 12, full text 14 (13 counting only replies that wrote
+ANSWER: — T4-10 was graded from a capped reply), PLAN 5; memory verifiers never
+said WRONG (0/8 caught).
+
+Run 3 (`chain_test.py`, `RUN_CHAIN`) tests the two shapes the hive needs. Each item
+pairs two note sets: A holds V, B holds W. C asks for V, then for W.
+- Chain A → B → C: `seq_full` (no cuts), `chain_b` (hop 1 cut by B's own notes —
+  B doesn't care about V — hop 2 by C's question), `chain_b1` (hop 1 only: splits
+  hop-1 from hop-2 loss), `chain_q` (both hops by C's question).
+- Join A + B → C: `join_indep` (whole memories side by side; B never saw A, no
+  repair; B's own sinks land mid-sequence), `join_reader` (each cut by C's question
+  to 128, 256 in all), `join_text` (both pasted as text).
+`seq_full` is also what a fully repaired join would be. Read `join_reader` (128
+per side) against run 2's `reader_128` (0.67), not against 1.00. `kv.join(model, a, b)`
+re-stamps b to continue after a.
+
 ## Not in this round
 
 - Fewer layers (KVComm): each layer would keep a different number of slots,
