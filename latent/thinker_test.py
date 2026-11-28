@@ -15,9 +15,18 @@ import time
 G6_IDS = ["T3-01", "T3-02", "T3-04", "T3-06", "T3-07", "T3-08", "T3-10", "T3-11",
           "T3-13", "T3-14", "T4-01", "T4-02", "T4-03", "T4-04", "T4-06", "T4-07",
           "T4-09", "T4-10", "T4-11", "T4-13"]
-ARMS = ["none", "plan_text", "think_text", "mem_full", "reader_512", "last_512",
-        "reader_512_orig"]
-MEM_ARMS = {"mem_full", "reader_512", "last_512", "reader_512_orig"}
+# Run 2. Two tasks over the same five contexts:
+#   answer  -- solve the item (run 1's task; budget raised so text arms can finish)
+#   v_*     -- verify: given the thinker's final answer, say whether it is right.
+#              New work, not recall: graded against whether that answer really is.
+# Run 1's arms (reader_512, last_512, reader_512_orig) still work if passed in.
+ARMS = ["none", "plan_text", "think_text", "mem_full", "reader_512_p2",
+        "v_none", "v_plan_text", "v_think_text", "v_mem_full", "v_reader_512_p2"]
+MEM_ARMS = {"mem_full", "reader_512", "last_512", "reader_512_orig", "reader_512_p2"}
+
+
+def base_arm(arm):
+    return arm[2:] if arm.startswith("v_") else arm
 
 # Copied from thinker.py.
 INSTRUCTION = (
@@ -33,10 +42,14 @@ _PLAN_RE = re.compile(r"^[ \t>*#]*PLAN[ \t*]*:(.*?)(?=^[ \t>*#]*ANSWER[ \t*]*:|\
                       re.M | re.I | re.S)
 
 THINK_MAX = 4096
-EXEC_MAX = 400
+EXEC_MAX = 1200     # run 1 used 400: text arms re-derived the problem and ran out before ANSWER:
+VERIFY_MAX = 600
 KEEP_N = 512
 FINISH = ("\n\nFinish with a last line ANSWER: followed by only the final value with its "
           "unit, or only the option letter.")
+VERIFY = ("\n\nThe earlier answer was: {ans}\nCheck whether it is correct. Finish with a last "
+          "line VERDICT: CORRECT or VERDICT: WRONG.")
+_VERDICT_RE = re.compile(r"VERDICT[ \t*]*[:\-][ \t*]*(CORRECT|INCORRECT|WRONG)", re.I)
 JOIN = "\n</think>\n<|im_end|>\n"
 
 
@@ -102,16 +115,33 @@ def parse_answer(reply):
     return (found[-1].strip(), True) if found else (reply.strip(), False)
 
 
-def executor_turn(item, arm, thinking="", plan=""):
-    if arm == "none":
+def parse_verdict(reply):
+    found = _VERDICT_RE.findall(reply)
+    if not found:
+        return None
+    v = found[-1].upper()
+    return "WRONG" if v == "INCORRECT" else v
+
+
+def thinker_answer(text):
+    """The thinker's final ANSWER line (after </think>), '' if none."""
+    after = text.split("</think>", 1)[1] if "</think>" in text else ""
+    found = _ANSWER_RE.findall(after)
+    return found[-1].strip() if found else ""
+
+
+def executor_turn(item, arm, thinking="", plan="", answer=""):
+    base = base_arm(arm)
+    if base == "none":
         ctx = ""
-    elif arm == "plan_text":
+    elif base == "plan_text":
         ctx = f"A first solve of this problem planned:\n{plan}\n\n"
-    elif arm == "think_text":
+    elif base == "think_text":
         ctx = f"Earlier reasoning on this problem:\n{thinking}\n\n"
     else:
         ctx = "Use your earlier reasoning above.\n\n"
-    content = ctx + item["text"].rstrip() + FINISH
+    tail = VERIFY.format(ans=answer or "NONE") if arm.startswith("v_") else FINISH
+    content = ctx + item["text"].rstrip() + tail
     return f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
@@ -186,12 +216,14 @@ def build_thinker_memory(model, tok, item, thinking):
 def cut_memory(model, mem, lo, arm, b_ids):
     import torch
     import kv
+    arm = base_arm(arm)
     if arm == "mem_full":
         idx = torch.arange(lo, mem.slots, device=mem.pos.device)
     elif arm == "last_512":
         idx = kv.pick_last(mem, KEEP_N, lo=lo)
-    else:  # reader_512, reader_512_orig
-        idx = kv.pick_top(kv.reader_scores(model, mem, b_ids), KEEP_N, lo=lo)
+    else:  # reader_512, reader_512_orig, reader_512_p2
+        pool = 2 if arm.endswith("_p2") else 0
+        idx = kv.pick_top(kv.reader_scores(model, mem, b_ids), KEEP_N, lo=lo, pool=pool)
     cut = kv.keep(mem, idx)
     return cut if arm == "reader_512_orig" else kv.restamp(model, cut, start=0)
 
@@ -214,48 +246,60 @@ def run_thinker_test(model, tok, items, traces, out_dir, arms=None):
         if not todo:
             continue
         mem = lo = None
-        if any(a in MEM_ARMS for a in todo):
+        if any(base_arm(a) in MEM_ARMS for a in todo):
             with torch.inference_mode(), adapter_off(model):
                 mem, lo = build_thinker_memory(model, tok, item, thinking)
+        t_ans = thinker_answer(tr["text"])
         for arm in todo:
             t0 = time.time()
-            turn = executor_turn(item, arm, thinking, plan)
+            verify = arm.startswith("v_")
+            budget = VERIFY_MAX if verify else EXEC_MAX
+            turn = executor_turn(item, arm, thinking, plan, t_ans)
             with torch.inference_mode(), adapter_off(model):
-                if arm in MEM_ARMS:
+                if base_arm(arm) in MEM_ARMS:
                     b_ids = _ids(tok, JOIN + turn, model)
                     cut = cut_memory(model, mem, lo, arm, b_ids)
                     kept = cut.slots
-                    new, _ = kv.decode(model, cut, b_ids, EXEC_MAX, stops)
+                    new, _ = kv.decode(model, cut, b_ids, budget, stops)
                 else:
                     kept = 0
-                    new, _ = kv.decode(model, None, _ids(tok, turn, model), EXEC_MAX, stops)
+                    new, _ = kv.decode(model, None, _ids(tok, turn, model), budget, stops)
             reply = tok.decode(new, skip_special_tokens=True)
-            answer, found = parse_answer(reply)
             secs = round(time.time() - t0, 1)
-            _append(os.path.join(out_dir, f"answers_{arm}.jsonl"),
-                    {"id": iid, "answer": answer, "unit": item.get("unit")})
-            _append(rows_path, {"id": iid, "arm": arm, "reply": reply, "answer": answer,
-                                "answer_found": found, "kept_slots": kept,
-                                "thinker_slots": (mem.slots - lo) if mem is not None else None,
-                                "plan_chars": len(plan), "seconds": secs,
-                                "trace_capped": bool(tr.get("capped"))})
-            print(f"{iid} {arm:16s} kept={kept:5d} {secs:6.1f}s  ANSWER: {answer[:60]!r}")
+            row = {"id": iid, "arm": arm, "task": "verify" if verify else "answer", "reply": reply,
+                   "kept_slots": kept, "thinker_slots": (mem.slots - lo) if mem is not None else None,
+                   "plan_chars": len(plan), "seconds": secs, "tokens": len(new),
+                   "trace_capped": bool(tr.get("capped"))}
+            if verify:
+                verdict = parse_verdict(reply)
+                _append(os.path.join(out_dir, f"verdicts_{arm}.jsonl"),
+                        {"id": iid, "verdict": verdict, "thinker_answer": t_ans})
+                row.update(verdict=verdict, answer_found=verdict is not None, thinker_answer=t_ans)
+                shown = f"VERDICT: {verdict}"
+            else:
+                answer, found = parse_answer(reply)
+                _append(os.path.join(out_dir, f"answers_{arm}.jsonl"),
+                        {"id": iid, "answer": answer, "unit": item.get("unit")})
+                row.update(answer=answer, answer_found=found)
+                shown = f"ANSWER: {answer[:60]!r}"
+            _append(rows_path, row)
+            print(f"{iid} {arm:18s} kept={kept:5d} {secs:6.1f}s  {shown}")
         del mem
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     rows = [r for r in _read_jsonl(rows_path) if r["id"] in {i["id"] for i in items}]
-    print(f"\n{'arm':16s} {'rows':>5s} {'answered':>9s} {'mean s':>7s}")
+    print(f"\n{'arm':18s} {'rows':>5s} {'finished':>9s} {'mean s':>7s}")
     for arm in arms:
         rs = [r for r in rows if r["arm"] == arm]
         if rs:
-            print(f"{arm:16s} {len(rs):5d} {sum(r['answer_found'] for r in rs):9d} "
+            print(f"{arm:18s} {len(rs):5d} {sum(r['answer_found'] for r in rs):9d} "
                   f"{sum(r['seconds'] for r in rs) / len(rs):7.1f}")
     print("\nGrade locally: python latent/score_local.py <unzipped latent_out>")
     return rows
 
 
-def mismatch_check(model, tok, items, traces, n=3):
+def mismatch_check(model, tok, items, traces, n=3, out_dir=None):
     """KL of the executor (adapter on) reading a thinker memory built adapter-off
     vs adapter-on (mem_full arm)."""
     import torch
@@ -285,6 +329,9 @@ def mismatch_check(model, tok, items, traces, n=3):
         print(f"{r['id']:8s} {r['slots']:6d} {r['mean_kl']:10.4g} {r['max_kl']:10.4g}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    if out_dir:
+        with open(os.path.join(out_dir, "mismatch.json"), "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=1)
     return out
 
 

@@ -1,7 +1,9 @@
 """Value test: A works out a value in its notes, B must reuse it.
 
-Arms: note400 / text_full (B reads text), mem_full (B reads A's whole memory),
-and last / writer / reader cuts of A's memory. See README.md, "Value test".
+Run 1's arms (run1_arms): note400 / text_full (B reads text), mem_full (B reads
+A's whole memory), and last / writer / reader cuts of A's memory. Run 2's arms
+(default_arms): reader cuts with and without neighbour pooling, at 128 and 256.
+See README.md, "Value test" and "Run 1 → run 2".
 """
 import json
 import os
@@ -102,7 +104,7 @@ def make_pairs(seed=0):
 
 # ---------------------------------------------------------------- arms and scoring
 
-def default_arms():
+def run1_arms():
     arms = [dict(name="note400", kind="text"), dict(name="text_full", kind="text"),
             dict(name="mem_full", kind="mem", sel=None)]
     for n in (32, 128):
@@ -111,6 +113,16 @@ def default_arms():
     for sel in ("last", "writer", "reader"):
         arms.append(dict(name=f"{sel}_128_orig", kind="mem", sel=sel, n=128, restamp=False))
     return arms
+
+
+def default_arms():
+    """Run 2: run 1 settled writer (0.00), the 32-slot arms (0.00) and numbering
+    (orig ~ restamp). Open: does pooling fix reader's digit loss, and what does 256 buy."""
+    m = lambda name, sel, n, pool=0: dict(name=name, kind="mem", sel=sel, n=n, restamp=True, pool=pool)
+    return [dict(name="mem_full", kind="mem", sel=None),
+            m("reader_128", "reader", 128), m("reader_128_p2", "reader", 128, 2),
+            m("reader_128_p4", "reader", 128, 4), m("reader_256", "reader", 256),
+            m("reader_256_p2", "reader", 256, 2), m("last_256", "last", 256)]
 
 
 A_HEAD = "<|im_start|>user\nWork through the calculations for this design review.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -180,7 +192,7 @@ def run_value_test(model, tok, out_dir, arms=None, pairs=None):
                             if arm["sel"] == "reader" and reader is None:
                                 reader = kv.reader_scores(model, a_mem, b_mem_ids)
                             s = writer if arm["sel"] == "writer" else reader
-                            idx = kv.pick_top(s, arm["n"], lo=lo)
+                            idx = kv.pick_top(s, arm["n"], lo=lo, pool=arm.get("pool", 0))
                         mem = kv.keep(a_mem, idx)
                         if arm["restamp"]:
                             mem = kv.restamp(model, mem, start=0)
@@ -199,6 +211,8 @@ def run_value_test(model, tok, out_dir, arms=None, pairs=None):
 
 def summarize(rows, arms, pairs):
     ids = {p["id"] for p in pairs}
+    if arms is None:  # every arm present in the rows, in first-seen order
+        arms = [dict(name=a) for a in dict.fromkeys(r["arm"] for r in rows)]
     summary = {}
     print(f"{'arm':<16}{'all':>7}{'early':>7}{'middle':>8}{'late':>7}{'kept':>8}{'n':>5}")
     for arm in arms:

@@ -143,6 +143,26 @@ kl(logits_p, logits_q) -> FloatTensor      # per-row KL(p||q) of float32 logits
 (`...self_attn.q_norm` per layer, `...rotary_emb` with `inv_freq`), so the same
 code works on the bare model and the PEFT wrapper.
 
+## Run 1 → run 2
+
+Run 1 (`adapters/latent_r25`): full memory lossless on both tests; `reader_128`
+keeps 0.67 of values from 11.5% of the memory; `writer_*` and every 32-slot arm
+score 0; original vs re-stamped numbering ~equal. Reader misses are often
+truncated numbers (`0.045` for `0.0454`): Qwen tokenises digit by digit. Thinker
+test: `mem_full` 12/20 = the thinker's own answers, but text arms ran out of the
+400-token budget, and memory executors only restate the thinker's conclusion.
+
+Run 2 changes:
+- `pick_top(..., pool=p)`: scores max-pooled over ±p slots before top-N, so a
+  chosen token pulls in its neighbours (SnapKV's smoothing step).
+- Value arms: `mem_full`, `reader_128` (+ `_p2`, `_p4`), `reader_256` (+ `_p2`),
+  `last_256`. Run 1's arms are `value_test.run1_arms()`.
+- Thinker test: executor budget 400 → 1200. Arms `none`, `plan_text`,
+  `think_text`, `mem_full`, `reader_512_p2`, each also as a **verify** task
+  (`v_*`): given the thinker's final answer, end with `VERDICT: CORRECT|WRONG`;
+  scored locally against whether that answer is right (caught / kept).
+- The gate and the mismatch check save `checks.json` / `mismatch.json`.
+
 ## Not in this round
 
 - Fewer layers (KVComm): each layer would keep a different number of slots,

@@ -232,8 +232,15 @@ def pick_last(mem, n, lo=0):
     return torch.arange(max(lo, mem.slots - n), mem.slots)
 
 
-def pick_top(s, n, lo=0):
-    sub = s[lo:]
+def pick_top(s, n, lo=0, pool=0):
+    """Top-n slots >= lo by score. pool > 0 max-pools scores over +-pool slots first
+    (SnapKV-style), so a chosen token pulls in its neighbours: Qwen splits numbers
+    into single digits, and run 1 kept '0.045' of '0.0454'."""
+    sub = s[lo:].float()
+    if pool > 0 and sub.numel():
+        pooled = torch.nn.functional.max_pool1d(sub[None, None], 2 * pool + 1, stride=1,
+                                                padding=pool)[0, 0]
+        sub = pooled + 1e-6 * sub            # break plateau ties toward the real peak
     top = torch.topk(sub, min(n, sub.numel())).indices + lo
     return torch.sort(top.cpu()).values
 
