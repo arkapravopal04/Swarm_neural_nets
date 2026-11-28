@@ -220,7 +220,8 @@ def cmd_judge(a):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sys.stdout.reconfigure(errors="replace")   # model answers carry "≈" etc.; Windows consoles are cp1252
+    ap =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("time", "g5", "p1", "judge"):
         sub.add_parser(name).add_argument("dirs", nargs="+")
